@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bitget EMA Bot</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #0f1117; color: #e6edf3; }
+    h1, h2 { margin-top: 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+    .label { color: #8b949e; font-size: 12px; text-transform: uppercase; }
+    .value { font-size: 20px; font-weight: 600; margin-top: 4px; }
+    .green { color: #3fb950; }
+    .red { color: #f85149; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #30363d; text-align: left; }
+    th { color: #8b949e; font-size: 12px; text-transform: uppercase; }
+    form { display: flex; gap: 8px; margin-top: 12px; }
+    input, button { padding: 8px 12px; border-radius: 6px; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; }
+    button { background: #238636; border-color: #238636; cursor: pointer; }
+    button:hover { background: #2ea043; }
+    .meta { color: #8b949e; font-size: 13px; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <h1>Bitget EMA Trend Bot</h1>
+  <p class="meta">Last updated: {{ status.last_updated or '—' }}</p>
+
+  <div class="card" style="margin-bottom: 24px;">
+    <h2>Settings</h2>
+    <form action="/settings/symbol" method="post">
+      <input type="text" name="symbol" value="{{ symbol }}" placeholder="SUIUSDT" required>
+      <button type="submit">Change Symbol</button>
+    </form>
+    <p class="meta">Margin: {{ status.margin_mode }} | Leverage: {{ status.leverage }}x</p>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="label">Symbol / Trend</div>
+      <div class="value">{{ status.symbol }} — {{ status.trend or '—' }}</div>
+    </div>
+    <div class="card">
+      <div class="label">Last Candle</div>
+      <div class="value {% if status.candle_color == 'green' %}green{% elif status.candle_color == 'red' %}red{% endif %}">
+        {{ status.candle_color|upper or '—' }}
+      </div>
+    </div>
+    <div class="card">
+      <div class="label">Position</div>
+      <div class="value">
+        {% if status.position_side %}
+          {{ status.position_side|upper }} {{ "%.4f"|format(status.position_size) }}
+          {% if status.avg_entry %}@ {{ "%.4f"|format(status.avg_entry) }}{% endif %}
+        {% else %}
+          None
+        {% endif %}
+      </div>
+    </div>
+    <div class="card">
+      <div class="label">Balance</div>
+      <div class="value">{{ "%.2f"|format(status.balance_equity) }} USDT</div>
+      <div class="meta">Available: {{ "%.2f"|format(status.balance_available) }}</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom: 24px;">
+    <h2>EMA (5m)</h2>
+    <p>EMA20={{ "%.4f"|format(status.ema20) }} | EMA50={{ "%.4f"|format(status.ema50) }} | EMA100={{ "%.4f"|format(status.ema100) }} | EMA200={{ "%.4f"|format(status.ema200) }}</p>
+    <p>Last close: {{ "%.4f"|format(status.last_close) }}</p>
+    <h3>Pending Orders</h3>
+    {% if status.pending_orders %}
+    <table>
+      <thead><tr><th>Side</th><th>Price</th><th>Size</th><th>Order ID</th></tr></thead>
+      <tbody>
+        {% for o in status.pending_orders %}
+        <tr>
+          <td>{{ o.side }}</td>
+          <td>{{ o.price }}</td>
+          <td>{{ o.size }}</td>
+          <td>{{ o.order_id }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="meta">No pending limit orders</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Trade Cycles (P&amp;L Report)</h2>
+    {% if cycles %}
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th><th>Symbol</th><th>Side</th><th>Balance Open</th><th>Balance Close</th><th>PnL USDT</th><th>PnL %</th><th>Opened</th><th>Closed</th><th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in cycles %}
+        <tr>
+          <td>{{ c.id }}</td>
+          <td>{{ c.symbol }}</td>
+          <td>{{ c.side }}</td>
+          <td>{{ "%.2f"|format(c.balance_at_open or 0) }}</td>
+          <td>{{ "%.2f"|format(c.balance_at_close or 0) if c.balance_at_close else '—' }}</td>
+          <td class="{% if (c.pnl_usdt or 0) >= 0 %}green{% else %}red{% endif %}">
+            {{ "%.2f"|format(c.pnl_usdt or 0) if c.pnl_usdt is not none else '—' }}
+          </td>
+          <td class="{% if (c.pnl_pct or 0) >= 0 %}green{% else %}red{% endif %}">
+            {{ "%.2f"|format(c.pnl_pct or 0) if c.pnl_pct is not none else '—' }}%
+          </td>
+          <td>{{ c.opened_at or '—' }}</td>
+          <td>{{ c.closed_at or '—' }}</td>
+          <td>{{ c.status }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="meta">No trade cycles yet</p>
+    {% endif %}
+  </div>
+</body>
+</html>
