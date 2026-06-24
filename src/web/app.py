@@ -1,8 +1,6 @@
-from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
@@ -10,61 +8,60 @@ from src import database as db
 from src.bot_state import (
     get_account_balance,
     get_all_statuses,
-    remove_symbol_status,
     status_to_dict,
 )
-from src.config import LEVERAGE, MARGIN_MODE, OFI_SYMBOL, PROFIT_TARGET_PCT
+from src.config import PROFIT_TARGET_PCT
+from src.market_universe import get_last_refreshed, get_scan_stats
 from src.orderflow import live_state_to_dict
 from src.profit_target import reset_baseline_to_current_equity, trigger_manual_profit_take
-from src.trading import on_symbol_added, on_symbol_removed
 
-from src.web.calendar_build import build_profit_calendar
 from src.web.time_format import format_vn_time
-
-VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.filters["vn_time"] = format_vn_time
 
-app = FastAPI(title="Bitget EMA Bot Dashboard")
+app = FastAPI(title="Bitget Ichimoku Bot Dashboard")
 
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request) -> HTMLResponse:
-    symbols = db.get_symbols()
+    open_trades = db.get_open_ichimoku_trades()
     statuses = get_all_statuses()
-    account = get_account_balance()
-    symbol_statuses = [statuses[s] for s in symbols if s in statuses]
+    position_rows = []
+    for trade in open_trades:
+        symbol = trade["symbol"]
+        st = statuses.get(symbol)
+        position_rows.append(
+            {
+                "symbol": symbol,
+                "side": trade["side"],
+                "entry": float(trade["entry_price"]),
+                "stop_loss": float(trade["stop_price"]),
+                "tp1": float(trade["tp1_price"]),
+                "partial_taken": bool(trade["partial_taken"]),
+                "trigger": trade["trigger_type"] or "—",
+                "position_size": float(st.position_size)
+                if st and st.position_size
+                else float(trade["position_size"] or 0),
+                "on_exchange": st.on_exchange if st else True,
+                "is_tracked": True,
+                "last_updated": st.last_updated if st else trade["updated_at"],
+                "opened_at": trade["opened_at"],
+            }
+        )
 
-    today_vn = datetime.now(VN_TZ).date()
-    try:
-        cal_year = int(request.query_params.get("year", today_vn.year))
-        cal_month = int(request.query_params.get("month", today_vn.month))
-        if not (1 <= cal_month <= 12):
-            raise ValueError("invalid month")
-    except (TypeError, ValueError):
-        cal_year, cal_month = today_vn.year, today_vn.month
-
-    profit_takes = db.get_profit_takes(limit=200)
-    profit_calendar = build_profit_calendar(cal_year, cal_month, profit_takes)
-    for event in profit_calendar["month_events"]:
-        event["taken_at_vn"] = format_vn_time(str(event["taken_at"]))
-        trigger = str(event.get("trigger_type") or "target")
-        event["trigger_label"] = "Tự động" if trigger == "target" else "Thủ công"
+    checked, last_signal = get_scan_stats()
 
     return templates.TemplateResponse(
         request,
         "index.html",
         {
-            "symbols": symbols,
-            "symbol_statuses": symbol_statuses,
-            "account": account,
-            "margin_mode": MARGIN_MODE,
-            "leverage": LEVERAGE,
-            "profit_target_pct": PROFIT_TARGET_PCT,
-            "profit_calendar": profit_calendar,
-            "ofi_symbol": OFI_SYMBOL,
+            "position_rows": position_rows,
+            "tracked_count": len(position_rows),
+            "last_refreshed": get_last_refreshed(),
+            "last_scan_checked": checked,
+            "last_signal_symbol": last_signal,
         },
     )
 
@@ -103,6 +100,7 @@ def api_profit_takes() -> list[dict]:
 def api_status() -> dict:
     account = get_account_balance()
     statuses = get_all_statuses()
+    open_trades = db.get_open_ichimoku_trades()
     return {
         "account": {
             "available": account.available,
@@ -115,6 +113,24 @@ def api_status() -> dict:
             "profit_target_pct": account.profit_target_pct or PROFIT_TARGET_PCT,
             "baseline_updated_at": format_vn_time(account.baseline_updated_at),
         },
+        "open_trades": [
+            {
+                "symbol": row["symbol"],
+                "side": row["side"],
+                "entry_price": float(row["entry_price"]),
+                "stop_price": float(row["stop_price"]),
+                "tp1_price": float(row["tp1_price"]),
+                "partial_taken": bool(row["partial_taken"]),
+                "trigger_type": row["trigger_type"],
+                "position_size": float(row["position_size"] or 0),
+                "opened_at": format_vn_time(str(row["opened_at"])),
+                "updated_at": format_vn_time(str(row["updated_at"])),
+                "live": status_to_dict(statuses[row["symbol"]])
+                if row["symbol"] in statuses
+                else None,
+            }
+            for row in open_trades
+        ],
         "symbols": {
             sym: {
                 **status_to_dict(st),
@@ -127,28 +143,7 @@ def api_status() -> dict:
 
 @app.get("/api/symbols")
 def api_symbols() -> list[str]:
-    return db.get_symbols()
-
-
-@app.post("/api/symbols")
-def api_add_symbol(payload: dict) -> dict:
-    symbol = str(payload.get("symbol", "")).upper().strip()
-    if not symbol:
-        return {"ok": False, "error": "symbol required"}
-    added = db.add_symbol(symbol)
-    if added:
-        on_symbol_added(symbol)
-    return {"ok": True, "added": added, "symbols": db.get_symbols()}
-
-
-@app.delete("/api/symbols/{symbol}")
-def api_remove_symbol(symbol: str) -> dict:
-    symbol = symbol.upper().strip()
-    removed = db.remove_symbol(symbol)
-    if removed:
-        on_symbol_removed(symbol)
-        remove_symbol_status(symbol)
-    return {"ok": True, "removed": removed, "symbols": db.get_symbols()}
+    return [row["symbol"] for row in db.get_open_ichimoku_trades()]
 
 
 @app.post("/settings/profit-take/trigger")
@@ -178,20 +173,3 @@ def api_reset_baseline() -> dict:
         "baseline_equity": baseline,
         "baseline_updated_at": format_vn_time(db.get_baseline_updated_at()),
     }
-
-
-@app.post("/settings/symbols/add")
-def form_add_symbol(symbol: str = Form(...)) -> RedirectResponse:
-    symbol = symbol.upper().strip()
-    if symbol and db.add_symbol(symbol):
-        on_symbol_added(symbol)
-    return RedirectResponse(url="/", status_code=303)
-
-
-@app.post("/settings/symbols/remove")
-def form_remove_symbol(symbol: str = Form(...)) -> RedirectResponse:
-    symbol = symbol.upper().strip()
-    if symbol and db.remove_symbol(symbol):
-        on_symbol_removed(symbol)
-        remove_symbol_status(symbol)
-    return RedirectResponse(url="/", status_code=303)

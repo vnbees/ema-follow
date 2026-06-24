@@ -16,6 +16,21 @@ class BotStatus:
     sar_value: float = 0.0
     sar_position: str = ""
     sar_signal: str = ""
+    ichimoku_trend: str = ""
+    price_vs_kumo: str = ""
+    kumo_color: str = ""
+    kijun: float = 0.0
+    tenkan: float = 0.0
+    senkou_a: float = 0.0
+    senkou_b: float = 0.0
+    chikou_ok: bool = False
+    ichimoku_signal: str = ""
+    ichimoku_trigger: str = ""
+    stop_loss: float = 0.0
+    tp1_price: float = 0.0
+    partial_taken: bool = False
+    is_tracked: bool = False
+    on_exchange: bool = False
     ofi_buy_volume: float = 0.0
     ofi_sell_volume: float = 0.0
     ofi_volume_delta: float = 0.0
@@ -61,6 +76,21 @@ def _copy_status(status: BotStatus) -> BotStatus:
         sar_value=status.sar_value,
         sar_position=status.sar_position,
         sar_signal=status.sar_signal,
+        ichimoku_trend=status.ichimoku_trend,
+        price_vs_kumo=status.price_vs_kumo,
+        kumo_color=status.kumo_color,
+        kijun=status.kijun,
+        tenkan=status.tenkan,
+        senkou_a=status.senkou_a,
+        senkou_b=status.senkou_b,
+        chikou_ok=status.chikou_ok,
+        ichimoku_signal=status.ichimoku_signal,
+        ichimoku_trigger=status.ichimoku_trigger,
+        stop_loss=status.stop_loss,
+        tp1_price=status.tp1_price,
+        partial_taken=status.partial_taken,
+        is_tracked=status.is_tracked,
+        on_exchange=status.on_exchange,
         ofi_buy_volume=status.ofi_buy_volume,
         ofi_sell_volume=status.ofi_sell_volume,
         ofi_volume_delta=status.ofi_volume_delta,
@@ -125,6 +155,20 @@ def get_all_statuses() -> dict[str, BotStatus]:
         return {sym: _copy_status(st) for sym, st in _statuses.items()}
 
 
+def get_open_position_symbols() -> list[str]:
+    from src import database as db
+
+    return [row["symbol"] for row in db.get_open_ichimoku_trades()]
+
+
+def clear_stale_signal_statuses(managed_symbols: set[str]) -> None:
+    """Remove in-memory statuses for symbols that are not actively managed."""
+    with _lock:
+        to_remove = [sym for sym in _statuses if sym not in managed_symbols]
+        for sym in to_remove:
+            del _statuses[sym]
+
+
 def get_account_balance() -> AccountBalance:
     with _lock:
         return AccountBalance(
@@ -161,6 +205,21 @@ def status_to_dict(status: BotStatus) -> dict[str, Any]:
         "sar_value": status.sar_value,
         "sar_position": status.sar_position,
         "sar_signal": status.sar_signal,
+        "ichimoku_trend": status.ichimoku_trend,
+        "price_vs_kumo": status.price_vs_kumo,
+        "kumo_color": status.kumo_color,
+        "kijun": status.kijun,
+        "tenkan": status.tenkan,
+        "senkou_a": status.senkou_a,
+        "senkou_b": status.senkou_b,
+        "chikou_ok": status.chikou_ok,
+        "ichimoku_signal": status.ichimoku_signal,
+        "ichimoku_trigger": status.ichimoku_trigger,
+        "stop_loss": status.stop_loss,
+        "tp1_price": status.tp1_price,
+        "partial_taken": status.partial_taken,
+        "is_tracked": status.is_tracked,
+        "on_exchange": status.on_exchange,
         "ofi_buy_volume": status.ofi_buy_volume,
         "ofi_sell_volume": status.ofi_sell_volume,
         "ofi_volume_delta": status.ofi_volume_delta,

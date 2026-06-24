@@ -2,10 +2,11 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock
+import time
 
 from src.bitget_client import Candle
 from src.config import OFI_HISTORY_CANDLES, OFI_INTERVAL_MINUTES
-from src.orderflow.metrics import compute_ofi_bias
+from src.orderflow.metrics import compute_imbalance_pct, compute_ofi_bias
 
 
 @dataclass
@@ -30,6 +31,13 @@ class OrderFlowSnapshot:
     delta_spike_ratio: float = 0.0
     ofi_bias: str = "neutral"
     history_candles: int = 0
+    forming_buy_volume: float = 0.0
+    forming_sell_volume: float = 0.0
+    forming_imbalance_pct: float = 100.0
+    imbalance_pct: float = 100.0
+    delta_velocity: float = 0.0
+    candle_age_sec: float = 0.0
+    current_period_ms: int = 0
 
 
 @dataclass
@@ -37,6 +45,7 @@ class _SymbolState:
     current: CandleBucket = field(default_factory=CandleBucket)
     closed: deque[CandleBucket] = field(default_factory=lambda: deque(maxlen=OFI_HISTORY_CANDLES))
     last_closed_period_ms: int | None = None
+    delta_samples: deque[tuple[float, float]] = field(default_factory=lambda: deque(maxlen=30))
 
 
 _lock = Lock()
@@ -57,6 +66,17 @@ def _get_state(symbol: str) -> _SymbolState:
 
 def _normalize_side(side: str) -> str:
     return side.lower().strip()
+
+
+def _record_delta_sample(state: _SymbolState, current_delta: float) -> float:
+    now = time.time()
+    state.delta_samples.append((now, current_delta))
+    cutoff = now - 1.0
+    past_delta = current_delta
+    for ts, delta in state.delta_samples:
+        if ts <= cutoff:
+            past_delta = delta
+    return current_delta - past_delta
 
 
 def on_trade(symbol: str, side: str, size: float, ts_ms: int) -> None:
@@ -134,6 +154,7 @@ def close_bucket(symbol: str, closed_candle_ts_ms: int) -> None:
 
 def get_snapshot(symbol: str, candle: Candle | None = None) -> OrderFlowSnapshot:
     symbol = symbol.upper()
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
     with _lock:
         state = _get_state(symbol)
@@ -144,6 +165,8 @@ def get_snapshot(symbol: str, candle: Candle | None = None) -> OrderFlowSnapshot
         sell_volume = last_closed.sell_volume if last_closed else 0.0
         volume_delta = last_closed.volume_delta if last_closed else 0.0
         current_delta = current.volume_delta
+        forming_buy = current.buy_volume
+        forming_sell = current.sell_volume
 
         deltas = [abs(b.volume_delta) for b in state.closed if b.trade_count > 0]
         history_candles = len(deltas)
@@ -153,6 +176,13 @@ def get_snapshot(symbol: str, candle: Candle | None = None) -> OrderFlowSnapshot
             delta_spike_ratio = abs(last_closed.volume_delta) / avg_delta_10
         else:
             delta_spike_ratio = 0.0
+
+        delta_velocity = _record_delta_sample(state, current_delta)
+        period_ms = current.period_start_ms or _period_start_ms(now_ms)
+        candle_age_sec = max(0.0, (now_ms - period_ms) / 1000.0)
+
+    imbalance_pct = compute_imbalance_pct(buy_volume, sell_volume)
+    forming_imbalance_pct = compute_imbalance_pct(forming_buy, forming_sell)
 
     ofi_bias = "neutral"
     if candle is not None and last_closed is not None:
@@ -169,4 +199,11 @@ def get_snapshot(symbol: str, candle: Candle | None = None) -> OrderFlowSnapshot
         delta_spike_ratio=delta_spike_ratio,
         ofi_bias=ofi_bias,
         history_candles=history_candles,
+        forming_buy_volume=forming_buy,
+        forming_sell_volume=forming_sell,
+        forming_imbalance_pct=forming_imbalance_pct,
+        imbalance_pct=imbalance_pct,
+        delta_velocity=delta_velocity,
+        candle_age_sec=candle_age_sec,
+        current_period_ms=period_ms,
     )

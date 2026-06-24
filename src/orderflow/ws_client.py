@@ -13,6 +13,7 @@ from src.bitget_client import Candle
 from src.config import BITGET_WS_PUBLIC, OFI_REALTIME_REFRESH_SEC, OFI_SYMBOL, PRODUCT_TYPE_API
 from src.orderflow.aggregator import on_trade
 from src.orderflow.ofi_state import on_candle_snapshot, on_candle_update, refresh_live_from_trades, reset_ofi_session
+from src.orderflow.orderbook import on_book_message, reset_orderbook
 
 
 _loop: asyncio.AbstractEventLoop | None = None
@@ -31,6 +32,11 @@ def _subscribe_args() -> list[dict[str, str]]:
         {
             "instType": PRODUCT_TYPE_API,
             "channel": "candle1m",
+            "instId": OFI_SYMBOL,
+        },
+        {
+            "instType": PRODUCT_TYPE_API,
+            "channel": "books",
             "instId": OFI_SYMBOL,
         },
     ]
@@ -81,6 +87,11 @@ def _parse_trade_message(payload: dict[str, Any]) -> None:
         refresh_live_from_trades()
         return
 
+    if channel == "books":
+        on_book_message(payload)
+        refresh_live_from_trades()
+        return
+
     if channel == "candle1m":
         rows = payload.get("data") or []
         action = payload.get("action")
@@ -119,6 +130,7 @@ async def _run_ws_session() -> None:
             ) as ws:
                 logging.info("Order flow WS connected (%s 1m)", OFI_SYMBOL)
                 reset_ofi_session()
+                reset_orderbook()
                 await ws.send(json.dumps({"op": "subscribe", "args": _subscribe_args()}))
                 ping_task = asyncio.create_task(_ping_loop(ws))
 

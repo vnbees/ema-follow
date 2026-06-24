@@ -10,7 +10,19 @@ from src.bitget_client import (
 )
 from src.bot_state import get_account_balance, update_account_balance
 from src.config import PROFIT_TARGET_PCT, TRADING_ENABLED
+from src.ichimoku_positions import get_managed_symbols
+from src.market_universe import get_volume_ranked
 from src.trading import liquidate_all_and_reset
+
+
+def _symbols_for_pnl() -> list[str]:
+    symbols = get_managed_symbols()
+    if symbols:
+        return symbols
+    ranked = get_volume_ranked()
+    if ranked:
+        return [ranked[0][0]]
+    return ["BTCUSDT"]
 
 
 def _unrealized_pnl(equity: float, unrealized_usdt: float) -> tuple[float, float]:
@@ -167,9 +179,7 @@ def trigger_manual_profit_take() -> dict:
     """Liquidate all, reset baseline, log to calendar — same as auto target hit."""
     if not TRADING_ENABLED:
         return {"ok": False, "error": "trading disabled (TRADING_ENABLED=false)"}
-    symbols = db.get_symbols()
-    if not symbols:
-        return {"ok": False, "error": "watchlist empty"}
+    symbols = _symbols_for_pnl()
     if not has_credentials():
         return {"ok": False, "error": "missing API credentials"}
 
@@ -219,7 +229,7 @@ def trigger_manual_profit_take() -> dict:
 
 def reset_baseline_to_current_equity() -> float | None:
     """Set baseline to current account equity without liquidating."""
-    symbols = db.get_symbols()
+    symbols = _symbols_for_pnl()
     equity: float | None = None
     available = 0.0
     margin_coin = "USDT"

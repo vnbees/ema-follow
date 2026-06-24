@@ -32,7 +32,9 @@ from src.config import (
     SET_MARGIN_MODE_ENDPOINT,
     SET_POSITION_MODE_ENDPOINT,
     SINGLE_POSITION_ENDPOINT,
+    ALL_POSITIONS_ENDPOINT,
     SYMBOL,
+    TICKERS_ENDPOINT,
 )
 
 
@@ -191,6 +193,39 @@ def _round_down(value: float, decimals: int) -> float:
     return math.floor(value * factor) / factor
 
 
+def fetch_top_futures_by_volume(
+    limit: int | None = None,
+    product_type: str = PRODUCT_TYPE,
+) -> list[tuple[str, float]]:
+    """Return perpetual USDT-M symbols sorted by 24h usdtVolume descending."""
+    data = _public_get(
+        TICKERS_ENDPOINT,
+        {"productType": PRODUCT_TYPE_API if product_type == PRODUCT_TYPE else product_type},
+    )
+    if not isinstance(data, list):
+        raise BitgetClientError("Invalid tickers response")
+
+    ranked: list[tuple[str, float]] = []
+    for item in data:
+        symbol = str(item.get("symbol", "")).upper()
+        if not symbol.endswith("USDT") or "_" in symbol:
+            continue
+        if item.get("deliveryTime"):
+            continue
+        try:
+            volume = float(item.get("usdtVolume") or item.get("quoteVolume") or 0)
+        except (TypeError, ValueError):
+            volume = 0.0
+        if volume <= 0:
+            continue
+        ranked.append((symbol, volume))
+
+    ranked.sort(key=lambda row: row[1], reverse=True)
+    if limit is None:
+        return ranked
+    return ranked[:limit]
+
+
 def fetch_candles(
     symbol: str = SYMBOL,
     product_type: str = PRODUCT_TYPE,
@@ -339,6 +374,24 @@ def configure_symbol_trading(symbol: str) -> None:
     set_leverage(symbol)
 
 
+def _parse_position_row(symbol: str, data: dict) -> Position:
+    total = abs(float(data.get("total", 0) or 0))
+    if total <= 0:
+        return Position(symbol=symbol, side=None, size=0.0, avg_price=0.0)
+
+    hold_side = (data.get("holdSide") or "").lower()
+    side = "long" if hold_side == "long" else "short" if hold_side == "short" else None
+    if side is None:
+        side = "long" if float(data.get("total", 0)) > 0 else "short"
+
+    return Position(
+        symbol=symbol,
+        side=side,
+        size=total,
+        avg_price=float(data.get("openPriceAvg") or data.get("averageOpenPrice") or 0),
+    )
+
+
 def fetch_position(
     symbol: str,
     product_type: str = PRODUCT_TYPE_API,
@@ -360,21 +413,34 @@ def fetch_position(
             return Position(symbol=symbol, side=None, size=0.0, avg_price=0.0)
         data = data[0]
 
-    total = abs(float(data.get("total", 0) or 0))
-    if total <= 0:
-        return Position(symbol=symbol, side=None, size=0.0, avg_price=0.0)
+    return _parse_position_row(symbol, data)
 
-    hold_side = (data.get("holdSide") or "").lower()
-    side = "long" if hold_side == "long" else "short" if hold_side == "short" else None
-    if side is None:
-        side = "long" if float(data.get("total", 0)) > 0 else "short"
 
-    return Position(
-        symbol=symbol,
-        side=side,
-        size=total,
-        avg_price=float(data.get("openPriceAvg") or data.get("averageOpenPrice") or 0),
+def fetch_all_open_positions(
+    product_type: str = PRODUCT_TYPE_API,
+    margin_coin: str = MARGIN_COIN,
+) -> list[Position]:
+    data = _private_get(
+        ALL_POSITIONS_ENDPOINT,
+        {
+            "productType": product_type,
+            "marginCoin": margin_coin,
+        },
     )
+    if not data:
+        return []
+    if not isinstance(data, list):
+        data = [data]
+
+    positions: list[Position] = []
+    for row in data:
+        symbol = str(row.get("symbol", "")).upper()
+        if not symbol:
+            continue
+        pos = _parse_position_row(symbol, row)
+        if pos.size > 0 and pos.side:
+            positions.append(pos)
+    return positions
 
 
 def _parse_unrealized_pnl(data: dict, side: str | None, size: float, avg_price: float) -> float:
@@ -531,22 +597,34 @@ def place_market_order(
     product_type: str = PRODUCT_TYPE_API,
     margin_mode: str = MARGIN_MODE,
     margin_coin: str = MARGIN_COIN,
+    *,
+    reduce_only: bool = False,
 ) -> dict:
     client_oid = f"bot_{uuid.uuid4().hex[:16]}"
-    return _private_post(
-        PLACE_ORDER_ENDPOINT,
-        {
-            "symbol": symbol,
-            "productType": product_type,
-            "marginMode": margin_mode,
-            "marginCoin": margin_coin,
-            "size": size,
-            "side": side,
-            "orderType": "market",
-            "force": "ioc",
-            "clientOid": client_oid,
-        },
-    )
+    body: dict[str, str] = {
+        "symbol": symbol,
+        "productType": product_type,
+        "marginMode": margin_mode,
+        "marginCoin": margin_coin,
+        "size": size,
+        "side": side,
+        "orderType": "market",
+        "force": "ioc",
+        "clientOid": client_oid,
+    }
+    if reduce_only:
+        body["reduceOnly"] = "YES"
+    return _private_post(PLACE_ORDER_ENDPOINT, body)
+
+
+def format_size(size: float, spec: ContractSpec) -> str:
+    rounded = round(size, spec.volume_place)
+    if rounded < spec.min_trade_num:
+        rounded = spec.min_trade_num
+    if spec.volume_place == 0:
+        return str(int(rounded))
+    formatted = f"{rounded:.{spec.volume_place}f}".rstrip("0").rstrip(".")
+    return formatted or str(spec.min_trade_num)
 
 
 def close_positions(

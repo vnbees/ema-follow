@@ -77,6 +77,7 @@ def init_db() -> None:
         _migrate_entries_cycle_id(conn)
         _migrate_profit_takes(conn)
         _migrate_profit_take_trigger_type(conn)
+        _migrate_ichimoku_trades(conn)
 
 
 def _migrate_profit_take_trigger_type(conn: sqlite3.Connection) -> None:
@@ -466,6 +467,150 @@ def get_all_trade_cycles(limit: int = 100) -> list[sqlite3.Row]:
             """,
             (limit,),
         ).fetchall()
+
+
+def _migrate_ichimoku_trades(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ichimoku_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            entry_price REAL NOT NULL,
+            stop_price REAL NOT NULL,
+            risk_distance REAL NOT NULL,
+            tp1_price REAL NOT NULL,
+            partial_taken INTEGER NOT NULL DEFAULT 0,
+            trigger_type TEXT,
+            position_size REAL,
+            opened_at TEXT NOT NULL,
+            closed_at TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ichimoku_trades_open_symbol
+        ON ichimoku_trades(symbol) WHERE status = 'open'
+        """
+    )
+
+
+def insert_ichimoku_trade(
+    symbol: str,
+    side: str,
+    entry_price: float,
+    stop_price: float,
+    risk_distance: float,
+    tp1_price: float,
+    trigger_type: str = "",
+    position_size: float | None = None,
+) -> int:
+    now = _utc_now()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO ichimoku_trades (
+                symbol, side, status, entry_price, stop_price, risk_distance,
+                tp1_price, partial_taken, trigger_type, position_size,
+                opened_at, updated_at
+            )
+            VALUES (?, ?, 'open', ?, ?, ?, ?, 0, ?, ?, ?, ?)
+            """,
+            (
+                symbol.upper(),
+                side,
+                entry_price,
+                stop_price,
+                risk_distance,
+                tp1_price,
+                trigger_type,
+                position_size,
+                now,
+                now,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def update_ichimoku_trade(
+    symbol: str,
+    *,
+    entry_price: float | None = None,
+    stop_price: float | None = None,
+    risk_distance: float | None = None,
+    tp1_price: float | None = None,
+    partial_taken: bool | None = None,
+    position_size: float | None = None,
+) -> None:
+    fields: list[str] = []
+    values: list[object] = []
+    if entry_price is not None:
+        fields.append("entry_price = ?")
+        values.append(entry_price)
+    if stop_price is not None:
+        fields.append("stop_price = ?")
+        values.append(stop_price)
+    if risk_distance is not None:
+        fields.append("risk_distance = ?")
+        values.append(risk_distance)
+    if tp1_price is not None:
+        fields.append("tp1_price = ?")
+        values.append(tp1_price)
+    if partial_taken is not None:
+        fields.append("partial_taken = ?")
+        values.append(1 if partial_taken else 0)
+    if position_size is not None:
+        fields.append("position_size = ?")
+        values.append(position_size)
+    if not fields:
+        return
+    fields.append("updated_at = ?")
+    values.append(_utc_now())
+    values.append(symbol.upper())
+    with get_connection() as conn:
+        conn.execute(
+            f"UPDATE ichimoku_trades SET {', '.join(fields)} WHERE symbol = ? AND status = 'open'",
+            values,
+        )
+
+
+def close_ichimoku_trade(symbol: str) -> None:
+    now = _utc_now()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE ichimoku_trades
+            SET status = 'closed', closed_at = ?, updated_at = ?
+            WHERE symbol = ? AND status = 'open'
+            """,
+            (now, now, symbol.upper()),
+        )
+
+
+def get_open_ichimoku_trades() -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM ichimoku_trades
+            WHERE status = 'open'
+            ORDER BY opened_at ASC
+            """,
+        ).fetchall()
+
+
+def get_open_ichimoku_trade(symbol: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM ichimoku_trades
+            WHERE symbol = ? AND status = 'open'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (symbol.upper(),),
+        ).fetchone()
 
 
 @dataclass
