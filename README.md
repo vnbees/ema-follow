@@ -1,6 +1,6 @@
 # Bitget EMA Follow Trend Bot
 
-Bot trading futures Bitget theo trend EMA 20/50/100/200 trên nến 5m.
+Bot trading futures Bitget theo trend EMA 34/89/144/200 trên nến 5m.
 
 ## Phase 2
 
@@ -12,6 +12,7 @@ Bot trading futures Bitget theo trend EMA 20/50/100/200 trên nến 5m.
 - Margin **cross**, leverage **5x**
 - SQLite lưu lệnh, giá TB, trade cycles + P&L
 - Dashboard web: `http://localhost:8080`
+- **Multi-coin watchlist:** thêm/xóa coin trên dashboard, xem trạng thái từng coin
 
 ## Cài đặt
 
@@ -42,4 +43,4 @@ Log ghi ra console và `logs/bot.log`. Database tại `data/bot.db`.
 | `MARGIN_MODE` | crossed | Ký quỹ chéo |
 | `WEB_PORT` | 8080 | Port dashboard |
 
-Symbol có thể đổi trên dashboard hoặc qua `POST /api/settings/symbol`.
+Symbol có thể thêm/xóa trên dashboard (Watchlist) hoặc qua API `POST/DELETE /api/symbols`.

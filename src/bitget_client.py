@@ -268,7 +268,10 @@ def notional_to_size(notional_usdt: float, price: float, spec: ContractSpec) -> 
     step = 10 ** (-spec.volume_place)
     while size * price < spec.min_trade_usdt - 1e-9:
         size = _round_up(size + step, spec.volume_place)
-    return f"{size:.{spec.volume_place}f}".rstrip("0").rstrip(".") or str(spec.min_trade_num)
+    if spec.volume_place == 0:
+        return str(int(size))
+    formatted = f"{size:.{spec.volume_place}f}".rstrip("0").rstrip(".")
+    return formatted or str(spec.min_trade_num)
 
 
 def format_price(price: float, spec: ContractSpec) -> str:
@@ -374,6 +377,53 @@ def fetch_position(
     )
 
 
+def _parse_unrealized_pnl(data: dict, side: str | None, size: float, avg_price: float) -> float:
+    unrealized = float(data.get("unrealizedPL") or data.get("unrealizedPnl") or 0)
+    if unrealized != 0:
+        return unrealized
+    mark = float(data.get("markPrice") or 0)
+    if mark <= 0 or size <= 0 or not side or avg_price <= 0:
+        return 0.0
+    if side == "long":
+        return (mark - avg_price) * size
+    return (avg_price - mark) * size
+
+
+def fetch_total_unrealized_pnl(symbols: list[str]) -> tuple[float, int]:
+    """Return (sum unrealized USDT, number of open positions)."""
+    total = 0.0
+    open_count = 0
+    for symbol in symbols:
+        try:
+            data = _private_get(
+                SINGLE_POSITION_ENDPOINT,
+                {
+                    "symbol": symbol,
+                    "productType": PRODUCT_TYPE_API,
+                    "marginCoin": MARGIN_COIN,
+                },
+            )
+            if not data:
+                continue
+            if isinstance(data, list):
+                if not data:
+                    continue
+                data = data[0]
+            size = abs(float(data.get("total", 0) or 0))
+            if size <= 0:
+                continue
+            hold_side = (data.get("holdSide") or "").lower()
+            side = "long" if hold_side == "long" else "short" if hold_side == "short" else None
+            if side is None:
+                side = "long" if float(data.get("total", 0)) > 0 else "short"
+            avg_price = float(data.get("openPriceAvg") or data.get("averageOpenPrice") or 0)
+            total += _parse_unrealized_pnl(data, side, size, avg_price)
+            open_count += 1
+        except BitgetClientError:
+            continue
+    return total, open_count
+
+
 def fetch_pending_orders(
     symbol: str,
     product_type: str = PRODUCT_TYPE_API,
@@ -469,6 +519,31 @@ def place_limit_order(
             "side": side,
             "orderType": "limit",
             "force": "gtc",
+            "clientOid": client_oid,
+        },
+    )
+
+
+def place_market_order(
+    symbol: str,
+    side: str,
+    size: str,
+    product_type: str = PRODUCT_TYPE_API,
+    margin_mode: str = MARGIN_MODE,
+    margin_coin: str = MARGIN_COIN,
+) -> dict:
+    client_oid = f"bot_{uuid.uuid4().hex[:16]}"
+    return _private_post(
+        PLACE_ORDER_ENDPOINT,
+        {
+            "symbol": symbol,
+            "productType": product_type,
+            "marginMode": margin_mode,
+            "marginCoin": margin_coin,
+            "size": size,
+            "side": side,
+            "orderType": "market",
+            "force": "ioc",
             "clientOid": client_oid,
         },
     )

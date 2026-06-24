@@ -1,10 +1,10 @@
 from src.bitget_client import Candle
 
 
-def detect_trend(ema20: float, ema50: float, ema100: float, ema200: float) -> str:
-    if ema20 > ema50 > ema100 > ema200:
+def detect_trend(ema34: float, ema89: float, ema144: float, ema200: float) -> str:
+    if ema34 > ema89 > ema144 > ema200:
         return "uptrend"
-    if ema20 < ema50 < ema100 < ema200:
+    if ema34 < ema89 < ema144 < ema200:
         return "downtrend"
     return "sideway"
 

@@ -7,73 +7,332 @@
   <style>
     * { box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #0f1117; color: #e6edf3; }
-    h1, h2 { margin-top: 0; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 24px; }
-    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+    h1, h2, h3 { margin-top: 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .symbol-card { border-left: 3px solid #238636; }
     .label { color: #8b949e; font-size: 12px; text-transform: uppercase; }
-    .value { font-size: 20px; font-weight: 600; margin-top: 4px; }
+    .value { font-size: 18px; font-weight: 600; margin-top: 4px; }
     .green { color: #3fb950; }
     .red { color: #f85149; }
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 10px 12px; border-bottom: 1px solid #30363d; text-align: left; }
     th { color: #8b949e; font-size: 12px; text-transform: uppercase; }
-    form { display: flex; gap: 8px; margin-top: 12px; }
+    form { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
+    form.inline { display: inline-flex; margin: 0; }
     input, button { padding: 8px 12px; border-radius: 6px; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; }
     button { background: #238636; border-color: #238636; cursor: pointer; }
     button:hover { background: #2ea043; }
-    .meta { color: #8b949e; font-size: 13px; margin-bottom: 16px; }
+    button.danger { background: #da3633; border-color: #da3633; }
+    button.danger:hover { background: #f85149; }
+    button.secondary { background: #21262d; border-color: #30363d; }
+    button.secondary:hover { background: #30363d; }
+    .meta { color: #8b949e; font-size: 13px; margin-bottom: 8px; }
+    .watchlist-item { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #30363d; }
+    .watchlist-item:last-child { border-bottom: none; }
+    .cal-nav { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+    .cal-nav a { color: #58a6ff; text-decoration: none; font-size: 14px; }
+    .cal-nav a:hover { text-decoration: underline; }
+    .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; text-align: center; }
+    .cal-head { color: #8b949e; font-size: 12px; font-weight: 600; padding: 6px 0; }
+    .cal-cell { min-height: 52px; padding: 6px 4px; border-radius: 6px; background: #0d1117; border: 1px solid #21262d; font-size: 13px; }
+    .cal-cell.out { opacity: 0.25; }
+    .cal-cell.today { border-color: #58a6ff; }
+    .cal-cell.marked { background: #1a2e1a; border-color: #238636; }
+    .cal-day-num { font-weight: 600; }
+    .cal-badge { display: inline-block; margin-top: 4px; font-size: 10px; padding: 2px 5px; border-radius: 4px; background: #238636; color: #fff; }
+    .cal-equity { display: block; margin-top: 2px; font-size: 10px; color: #3fb950; font-weight: 600; line-height: 1.2; }
+    .cal-events { margin-top: 16px; }
+    .cal-event { padding: 8px 0; border-bottom: 1px solid #30363d; font-size: 13px; }
+    .cal-event:last-child { border-bottom: none; }
+    .ofi-card { border-left: 3px solid #58a6ff; }
+    .ofi-live { font-size: 28px; font-weight: 700; }
+    .prob { font-size: 32px; font-weight: 700; }
+    .pulse { animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.7} }
   </style>
 </head>
 <body>
   <h1>Bitget EMA Trend Bot</h1>
-  <p class="meta">Last updated: {{ status.last_updated or '—' }}</p>
 
-  <div class="card" style="margin-bottom: 24px;">
-    <h2>Settings</h2>
-    <form action="/settings/symbol" method="post">
-      <input type="text" name="symbol" value="{{ symbol }}" placeholder="SUIUSDT" required>
-      <button type="submit">Change Symbol</button>
+  <div class="card ofi-card">
+    <h2>Order Flow Imbalance — <span id="ofi-symbol">{{ ofi_symbol }}</span> <span class="meta pulse" id="ofi-updated">Realtime 1m</span></h2>
+    <div class="grid">
+      <div>
+        <div class="label">Dự đoán nến tiếp</div>
+        <div class="ofi-live" id="ofi-prediction">—</div>
+      </div>
+      <div>
+        <div class="label">Xác suất</div>
+        <div class="prob" id="ofi-probability">—</div>
+      </div>
+      <div>
+        <div class="label">Độ chính xác session</div>
+        <div class="value" id="ofi-accuracy">—</div>
+      </div>
+      <div>
+        <div class="label">Volume Delta (1m)</div>
+        <div class="value" id="ofi-delta">—</div>
+      </div>
+      <div>
+        <div class="label">Delta hiện tại</div>
+        <div class="value" id="ofi-current-delta">—</div>
+      </div>
+      <div>
+        <div class="label">Spike vs TB 10 nến</div>
+        <div class="value" id="ofi-spike">—</div>
+      </div>
+      <div>
+        <div class="label">OFI Bias</div>
+        <div class="value" id="ofi-bias">—</div>
+      </div>
+      <div>
+        <div class="label">Nến vừa đóng</div>
+        <div class="value" id="ofi-last-candle">—</div>
+      </div>
+    </div>
+    <p class="meta" id="ofi-volumes">Buy: — | Sell: — | History: — nến</p>
+
+    <h3>Lịch sử dự đoán (20 gần nhất)</h3>
+    <table>
+      <thead><tr><th>Thời gian</th><th>Dự đoán</th><th>Xác suất</th><th>Thực tế</th><th>Kết quả</th></tr></thead>
+      <tbody id="ofi-history">
+        <tr><td colspan="5" class="meta">Đang chờ dữ liệu...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+    function colorClass(val, pos, neg) {
+      if (val === pos) return 'green';
+      if (val === neg) return 'red';
+      return '';
+    }
+    function fmt(n, d=4) { return Number(n).toFixed(d); }
+
+    async function refreshOfi() {
+      try {
+        const r = await fetch('/api/ofi');
+        const d = await r.json();
+        document.getElementById('ofi-updated').textContent = 'Cập nhật: ' + (d.last_updated || '—');
+        const label = (d.prediction_label || d.prediction || 'neutral').toUpperCase();
+        const lean = label === 'NEUTRAL' && d.prediction
+          ? ' → ' + d.prediction.toUpperCase()
+          : '';
+        const predEl = document.getElementById('ofi-prediction');
+        predEl.textContent = label + lean;
+        predEl.className = 'ofi-live ' + colorClass(
+          d.prediction_label === 'neutral' ? '' : d.prediction,
+          'green', 'red'
+        );
+        const probEl = document.getElementById('ofi-probability');
+        probEl.textContent = fmt(d.prediction_probability, 1) + '%';
+        probEl.className = 'prob ' + colorClass(d.prediction, 'green', 'red');
+        document.getElementById('ofi-accuracy').textContent =
+          d.session_total > 0
+            ? fmt(d.session_accuracy, 1) + '% (' + d.session_correct + '/' + d.session_total + ')'
+            : 'Chưa đủ dữ liệu (' + d.history_candles + '/10 nến warmup)';
+        const deltaEl = document.getElementById('ofi-delta');
+        deltaEl.textContent = fmt(d.volume_delta);
+        deltaEl.className = 'value ' + (d.volume_delta > 0 ? 'green' : d.volume_delta < 0 ? 'red' : '');
+        const curEl = document.getElementById('ofi-current-delta');
+        curEl.textContent = fmt(d.current_delta);
+        curEl.className = 'value ' + (d.current_delta > 0 ? 'green' : d.current_delta < 0 ? 'red' : '');
+        document.getElementById('ofi-spike').textContent = fmt(d.delta_spike, 2) + 'x';
+        const biasEl = document.getElementById('ofi-bias');
+        biasEl.textContent = (d.ofi_bias || 'neutral').toUpperCase();
+        biasEl.className = 'value ' + colorClass(d.ofi_bias, 'bullish', 'bearish');
+        document.getElementById('ofi-last-candle').textContent =
+          (d.last_candle_color || '—').toUpperCase() + ' @ ' + fmt(d.last_close, 2);
+        document.getElementById('ofi-volumes').textContent =
+          'Buy: ' + fmt(d.buy_volume) + ' | Sell: ' + fmt(d.sell_volume) +
+          ' | History: ' + d.history_candles + ' nến';
+        const tbody = document.getElementById('ofi-history');
+        const rows = d.recent_predictions || [];
+        if (!rows.length) {
+          tbody.innerHTML = '<tr><td colspan="5" class="meta">Chưa có dự đoán đã xác minh</td></tr>';
+        } else {
+          tbody.innerHTML = rows.map(r => {
+            const ok = r.correct === true ? '✓ Đúng' : r.correct === false ? '✗ Sai' : '—';
+            const okClass = r.correct === true ? 'green' : r.correct === false ? 'red' : '';
+            return '<tr><td>' + (r.time || '—') + '</td><td>' + (r.predicted || '').toUpperCase() +
+              '</td><td>' + fmt(r.probability, 1) + '%</td><td>' + (r.actual || '—').toUpperCase() +
+              '</td><td class="' + okClass + '">' + ok + '</td></tr>';
+          }).join('');
+        }
+      } catch (e) { /* ignore */ }
+    }
+    refreshOfi();
+    setInterval(refreshOfi, 1000);
+  </script>
+
+  <div class="card">
+    <h2>Account Balance</h2>
+    <div class="value">{{ "%.2f"|format(account.equity) }} USDT</div>
+    <div class="meta">Available: {{ "%.2f"|format(account.available) }} | Updated: {{ account.last_updated | vn_time }}</div>
+    {% if account.baseline_equity is not none %}
+    <div class="meta">
+      Baseline: {{ "%.2f"|format(account.baseline_equity) }} USDT
+      {% if account.baseline_updated_at %}| Reset: {{ account.baseline_updated_at | vn_time }}{% endif %}
+    </div>
+    <div class="meta">
+      Lãi chưa chốt (unrealized):
+      {% if account.pnl_usdt is not none %}
+        <span class="{% if account.pnl_usdt >= 0 %}green{% else %}red{% endif %}">
+          {{ "%+.2f"|format(account.pnl_usdt) }} USDT ({{ "%+.2f"|format(account.pnl_pct or 0) }}% equity)
+        </span>
+      {% else %}—{% endif %}
+      | Target chốt: {{ "%.1f"|format(profit_target_pct) }}%
+    </div>
+    {% endif %}
+    {% if profit_target_pct > 0 %}
+    <form action="/settings/profit-take/trigger" method="post" style="margin-top: 12px;">
+      <button type="submit" class="danger">Chốt lời ngay</button>
+      <span class="meta" style="margin: 0;">Đóng hết lệnh + reset baseline (giống đạt target unrealized {{ "%.1f"|format(profit_target_pct) }}%)</span>
     </form>
-    <p class="meta">Margin: {{ status.margin_mode }} | Leverage: {{ status.leverage }}x</p>
+    <form action="/settings/baseline/reset" method="post" style="margin-top: 8px;">
+      <button type="submit" class="secondary">Reset Baseline</button>
+      <span class="meta" style="margin: 0;">Chỉ đổi mốc = equity hiện tại, không đóng lệnh</span>
+    </form>
+    {% endif %}
+    <div class="meta">Margin: {{ margin_mode }} | Leverage: {{ leverage }}x</div>
   </div>
 
-  <div class="grid">
-    <div class="card">
-      <div class="label">Symbol / Trend</div>
-      <div class="value">{{ status.symbol }} — {{ status.trend or '—' }}</div>
+  {% if profit_target_pct > 0 %}
+  <div class="card">
+    <h2>Lịch chốt lời</h2>
+    <p class="meta">Tự chốt khi tổng unrealized lệnh đang mở ≥ {{ "%.1f"|format(profit_target_pct) }}% equity</p>
+    <div class="cal-nav">
+      <a href="/?year={{ profit_calendar.prev_year }}&month={{ profit_calendar.prev_month }}">← Tháng trước</a>
+      <strong>{{ profit_calendar.month_label }}</strong>
+      <a href="/?year={{ profit_calendar.next_year }}&month={{ profit_calendar.next_month }}">Tháng sau →</a>
     </div>
-    <div class="card">
-      <div class="label">Last Candle</div>
-      <div class="value {% if status.candle_color == 'green' %}green{% elif status.candle_color == 'red' %}red{% endif %}">
-        {{ status.candle_color|upper or '—' }}
-      </div>
+    <div class="cal-grid">
+      {% for wd in profit_calendar.weekdays %}
+      <div class="cal-head">{{ wd }}</div>
+      {% endfor %}
+      {% for week in profit_calendar.weeks %}
+        {% for cell in week %}
+        <div class="cal-cell {% if not cell.in_month %}out{% endif %}{% if cell.is_today %} today{% endif %}{% if cell.marked %} marked{% endif %}">
+          {% if cell.in_month %}
+          <div class="cal-day-num">{{ cell.day }}</div>
+          {% if cell.marked %}
+          <span class="cal-equity">{{ "%.2f"|format(cell.equity_after) }}</span>
+          {% if cell.count > 1 %}<span class="cal-badge">×{{ cell.count }}</span>{% endif %}
+          {% endif %}
+          {% endif %}
+        </div>
+        {% endfor %}
+      {% endfor %}
     </div>
-    <div class="card">
-      <div class="label">Position</div>
-      <div class="value">
-        {% if status.position_side %}
-          {{ status.position_side|upper }} {{ "%.4f"|format(status.position_size) }}
-          {% if status.avg_entry %}@ {{ "%.4f"|format(status.avg_entry) }}{% endif %}
-        {% else %}
-          None
-        {% endif %}
-      </div>
-    </div>
-    <div class="card">
-      <div class="label">Balance</div>
-      <div class="value">{{ "%.2f"|format(status.balance_equity) }} USDT</div>
-      <div class="meta">Available: {{ "%.2f"|format(status.balance_available) }}</div>
+    <div class="cal-events">
+      <h3>Chi tiết tháng {{ profit_calendar.month_label }}</h3>
+      {% if profit_calendar.month_events %}
+      <table>
+        <thead>
+          <tr>
+            <th>Thời gian</th><th>Loại</th><th>Mốc reset</th><th>Baseline</th><th>Unrealized</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for e in profit_calendar.month_events %}
+        <tr>
+          <td>{{ e.taken_at_vn }}</td>
+          <td>{{ e.trigger_label }}</td>
+          <td class="green"><strong>{{ "%.2f"|format(e.equity_after) }} USDT</strong></td>
+          <td>{{ "%.2f"|format(e.baseline_before) }} USDT</td>
+          <td class="{% if (e.pnl_usdt or 0) >= 0 %}green{% else %}red{% endif %}">
+            {{ "%+.2f"|format(e.pnl_usdt) }} USDT ({{ "%+.2f"|format(e.pnl_pct) }}%)
+          </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+        <p class="meta">Chưa có lần chốt lời nào trong tháng này</p>
+      {% endif %}
     </div>
   </div>
+  {% endif %}
 
-  <div class="card" style="margin-bottom: 24px;">
-    <h2>EMA (5m)</h2>
-    <p>EMA20={{ "%.4f"|format(status.ema20) }} | EMA50={{ "%.4f"|format(status.ema50) }} | EMA100={{ "%.4f"|format(status.ema100) }} | EMA200={{ "%.4f"|format(status.ema200) }}</p>
-    <p>Last close: {{ "%.4f"|format(status.last_close) }}</p>
+  <div class="card">
+    <h2>Watchlist</h2>
+    <form action="/settings/symbols/add" method="post">
+      <input type="text" name="symbol" placeholder="BTCUSDT" required>
+      <button type="submit">Add Coin</button>
+    </form>
+    {% if symbols %}
+    <div style="margin-top: 16px;">
+      {% for sym in symbols %}
+      <div class="watchlist-item">
+        <span>{{ sym }}</span>
+        <form action="/settings/symbols/remove" method="post" class="inline">
+          <input type="hidden" name="symbol" value="{{ sym }}">
+          <button type="submit" class="danger">Remove</button>
+        </form>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="meta">No coins in watchlist. Add a symbol above.</p>
+    {% endif %}
+    <p class="meta" style="margin-top: 12px;">Removing a coin stops bot management only — it does not close open positions.</p>
+  </div>
+
+  {% for status in symbol_statuses %}
+  <div class="card symbol-card">
+    <h2>{{ status.symbol }} <span class="meta">Updated: {{ status.last_updated | vn_time }}</span></h2>
+
+    <div class="grid">
+      <div>
+        <div class="label">Trend</div>
+        <div class="value">{{ status.trend or '—' }}</div>
+      </div>
+      <div>
+        <div class="label">Last Candle</div>
+        <div class="value {% if status.candle_color == 'green' %}green{% elif status.candle_color == 'red' %}red{% endif %}">
+          {{ status.candle_color|upper or '—' }}
+        </div>
+      </div>
+      <div>
+        <div class="label">SAR</div>
+        <div class="value">
+          {% if status.sar_value %}{{ "%.4f"|format(status.sar_value) }}{% else %}—{% endif %}
+          {% if status.sar_position %} ({{ status.sar_position }}){% endif %}
+        </div>
+      </div>
+      <div>
+        <div class="label">SAR Signal</div>
+        <div class="value">{{ status.sar_signal or '—' }}</div>
+      </div>
+      <div>
+        <div class="label">Position</div>
+        <div class="value">
+          {% if status.position_side %}
+            {{ status.position_side|upper }} {{ "%.4f"|format(status.position_size) }}
+            {% if status.avg_entry %}@ {{ "%.4f"|format(status.avg_entry) }}{% endif %}
+          {% else %}
+            None
+          {% endif %}
+        </div>
+      </div>
+      <div>
+        <div class="label">Last Close</div>
+        <div class="value">{{ "%.4f"|format(status.last_close) }}</div>
+      </div>
+    </div>
+
+    <p class="meta">
+      EMA34={{ "%.4f"|format(status.ema34) }} |
+      EMA89={{ "%.4f"|format(status.ema89) }} |
+      EMA144={{ "%.4f"|format(status.ema144) }} |
+      EMA200={{ "%.4f"|format(status.ema200) }}
+    </p>
+
     <h3>Pending Orders</h3>
     {% if status.pending_orders %}
     <table>
-      <thead><tr><th>Side</th><th>Price</th><th>Size</th><th>Order ID</th></tr></thead>
+      <thead><tr><th>Side</th><th>Limit Price</th><th>Size</th><th>Order ID</th></tr></thead>
       <tbody>
         {% for o in status.pending_orders %}
         <tr>
@@ -86,43 +345,15 @@
       </tbody>
     </table>
     {% else %}
-    <p class="meta">No pending limit orders</p>
+    <p class="meta">No pending orders</p>
     {% endif %}
   </div>
+  {% endfor %}
 
+  {% if symbols and not symbol_statuses %}
   <div class="card">
-    <h2>Trade Cycles (P&amp;L Report)</h2>
-    {% if cycles %}
-    <table>
-      <thead>
-        <tr>
-          <th>ID</th><th>Symbol</th><th>Side</th><th>Balance Open</th><th>Balance Close</th><th>PnL USDT</th><th>PnL %</th><th>Opened</th><th>Closed</th><th>Status</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for c in cycles %}
-        <tr>
-          <td>{{ c.id }}</td>
-          <td>{{ c.symbol }}</td>
-          <td>{{ c.side }}</td>
-          <td>{{ "%.2f"|format(c.balance_at_open or 0) }}</td>
-          <td>{{ "%.2f"|format(c.balance_at_close or 0) if c.balance_at_close else '—' }}</td>
-          <td class="{% if (c.pnl_usdt or 0) >= 0 %}green{% else %}red{% endif %}">
-            {{ "%.2f"|format(c.pnl_usdt or 0) if c.pnl_usdt is not none else '—' }}
-          </td>
-          <td class="{% if (c.pnl_pct or 0) >= 0 %}green{% else %}red{% endif %}">
-            {{ "%.2f"|format(c.pnl_pct or 0) if c.pnl_pct is not none else '—' }}%
-          </td>
-          <td>{{ c.opened_at or '—' }}</td>
-          <td>{{ c.closed_at or '—' }}</td>
-          <td>{{ c.status }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% else %}
-    <p class="meta">No trade cycles yet</p>
-    {% endif %}
+    <p class="meta">Waiting for first analysis cycle...</p>
   </div>
+  {% endif %}
 </body>
 </html>
