@@ -21,35 +21,60 @@ TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.filters["vn_time"] = format_vn_time
 
-app = FastAPI(title="Bitget Ichimoku Bot Dashboard")
+app = FastAPI(title="Bitget RSI Bot Dashboard")
+
+_STATUS_LABELS = {
+    "open": ("Đang mở", "badge-ok"),
+    "rsi_cross_75": ("Thoát RSI 75", "badge-tp2"),
+    "rsi_cross_25": ("Thoát RSI 25", "badge-sl"),
+    "exchange_closed": ("Đóng (sàn)", "badge-closed"),
+    "closed": ("Đã đóng", "badge-closed"),
+}
+
+
+def _trade_status(trade) -> tuple[str, str]:
+    if trade["status"] == "open":
+        return _STATUS_LABELS["open"]
+    reason = str(trade["close_reason"] or "closed")
+    return _STATUS_LABELS.get(reason, _STATUS_LABELS["closed"])
+
+
+def _build_trade_row(trade, statuses: dict) -> dict:
+    symbol = trade["symbol"]
+    st = statuses.get(symbol)
+    is_open = trade["status"] == "open"
+    status_label, status_class = _trade_status(trade)
+    rsi_live = st.rsi_value if st else 0.0
+    dca_count = int(trade["dca_count"]) if "dca_count" in trade.keys() and trade["dca_count"] else 0
+    return {
+        "symbol": symbol,
+        "side": trade["side"],
+        "entry": float(trade["entry_price"]),
+        "rsi_entry": float(trade["rsi_entry"] or 0),
+        "rsi_live": rsi_live,
+        "dca_count": dca_count,
+        "entry_trigger": trade["entry_trigger"] or "—",
+        "position_size": float(st.position_size)
+        if is_open and st and st.position_size
+        else float(trade["position_size"] or 0),
+        "on_exchange": (st.on_exchange if st else False) if is_open else False,
+        "is_open": is_open,
+        "status_label": status_label,
+        "status_class": status_class,
+        "close_reason": trade["close_reason"] or "",
+        "last_updated": st.last_updated if is_open and st else trade["updated_at"],
+        "opened_at": trade["opened_at"],
+        "closed_at": trade["closed_at"] if not is_open else "",
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request) -> HTMLResponse:
-    open_trades = db.get_open_ichimoku_trades()
+    trades = db.get_rsi_trades_for_dashboard(closed_limit=50)
     statuses = get_all_statuses()
-    position_rows = []
-    for trade in open_trades:
-        symbol = trade["symbol"]
-        st = statuses.get(symbol)
-        position_rows.append(
-            {
-                "symbol": symbol,
-                "side": trade["side"],
-                "entry": float(trade["entry_price"]),
-                "stop_loss": float(trade["stop_price"]),
-                "tp1": float(trade["tp1_price"]),
-                "partial_taken": bool(trade["partial_taken"]),
-                "trigger": trade["trigger_type"] or "—",
-                "position_size": float(st.position_size)
-                if st and st.position_size
-                else float(trade["position_size"] or 0),
-                "on_exchange": st.on_exchange if st else True,
-                "is_tracked": True,
-                "last_updated": st.last_updated if st else trade["updated_at"],
-                "opened_at": trade["opened_at"],
-            }
-        )
+    trade_rows = [_build_trade_row(trade, statuses) for trade in trades]
+    open_count = sum(1 for row in trade_rows if row["is_open"])
+    closed_count = len(trade_rows) - open_count
 
     checked, last_signal = get_scan_stats()
 
@@ -57,8 +82,9 @@ def dashboard(request: Request) -> HTMLResponse:
         request,
         "index.html",
         {
-            "position_rows": position_rows,
-            "tracked_count": len(position_rows),
+            "trade_rows": trade_rows,
+            "open_count": open_count,
+            "closed_count": closed_count,
             "last_refreshed": get_last_refreshed(),
             "last_scan_checked": checked,
             "last_signal_symbol": last_signal,
@@ -100,7 +126,6 @@ def api_profit_takes() -> list[dict]:
 def api_status() -> dict:
     account = get_account_balance()
     statuses = get_all_statuses()
-    open_trades = db.get_open_ichimoku_trades()
     return {
         "account": {
             "available": account.available,
@@ -117,19 +142,21 @@ def api_status() -> dict:
             {
                 "symbol": row["symbol"],
                 "side": row["side"],
+                "status": row["status"],
+                "close_reason": row["close_reason"],
                 "entry_price": float(row["entry_price"]),
-                "stop_price": float(row["stop_price"]),
-                "tp1_price": float(row["tp1_price"]),
-                "partial_taken": bool(row["partial_taken"]),
-                "trigger_type": row["trigger_type"],
+                "rsi_entry": float(row["rsi_entry"] or 0),
+                "dca_count": int(row["dca_count"]) if "dca_count" in row.keys() and row["dca_count"] else 0,
+                "entry_trigger": row["entry_trigger"],
                 "position_size": float(row["position_size"] or 0),
                 "opened_at": format_vn_time(str(row["opened_at"])),
+                "closed_at": format_vn_time(str(row["closed_at"])) if row["closed_at"] else None,
                 "updated_at": format_vn_time(str(row["updated_at"])),
                 "live": status_to_dict(statuses[row["symbol"]])
-                if row["symbol"] in statuses
+                if row["status"] == "open" and row["symbol"] in statuses
                 else None,
             }
-            for row in open_trades
+            for row in db.get_rsi_trades_for_dashboard(closed_limit=50)
         ],
         "symbols": {
             sym: {
@@ -143,7 +170,7 @@ def api_status() -> dict:
 
 @app.get("/api/symbols")
 def api_symbols() -> list[str]:
-    return [row["symbol"] for row in db.get_open_ichimoku_trades()]
+    return [row["symbol"] for row in db.get_open_rsi_trades()]
 
 
 @app.post("/settings/profit-take/trigger")

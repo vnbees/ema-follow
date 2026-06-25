@@ -10,7 +10,7 @@ from src.bitget_client import (
 )
 from src.bot_state import get_account_balance, update_account_balance
 from src.config import PROFIT_TARGET_PCT, TRADING_ENABLED
-from src.ichimoku_positions import get_managed_symbols
+from src.rsi_positions import get_managed_symbols
 from src.market_universe import get_volume_ranked
 from src.trading import liquidate_all_and_reset
 

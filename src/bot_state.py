@@ -16,19 +16,19 @@ class BotStatus:
     sar_value: float = 0.0
     sar_position: str = ""
     sar_signal: str = ""
-    ichimoku_trend: str = ""
-    price_vs_kumo: str = ""
-    kumo_color: str = ""
-    kijun: float = 0.0
-    tenkan: float = 0.0
-    senkou_a: float = 0.0
-    senkou_b: float = 0.0
-    chikou_ok: bool = False
-    ichimoku_signal: str = ""
-    ichimoku_trigger: str = ""
-    stop_loss: float = 0.0
-    tp1_price: float = 0.0
-    partial_taken: bool = False
+    st_trend_5m: str = ""
+    st_trend_1h: str = ""
+    st_flip_5m: bool = False
+    st_signal: str = ""
+    st_supertrend_5m: float = 0.0
+    st_supertrend_1h: float = 0.0
+    rsi_value: float = 0.0
+    rsi_prev: float = 0.0
+    rsi_signal: str = ""
+    rsi_cross_up_25: bool = False
+    rsi_cross_up_75: bool = False
+    rsi_cross_down_75: bool = False
+    rsi_cross_down_25: bool = False
     is_tracked: bool = False
     on_exchange: bool = False
     ofi_buy_volume: float = 0.0
@@ -76,19 +76,19 @@ def _copy_status(status: BotStatus) -> BotStatus:
         sar_value=status.sar_value,
         sar_position=status.sar_position,
         sar_signal=status.sar_signal,
-        ichimoku_trend=status.ichimoku_trend,
-        price_vs_kumo=status.price_vs_kumo,
-        kumo_color=status.kumo_color,
-        kijun=status.kijun,
-        tenkan=status.tenkan,
-        senkou_a=status.senkou_a,
-        senkou_b=status.senkou_b,
-        chikou_ok=status.chikou_ok,
-        ichimoku_signal=status.ichimoku_signal,
-        ichimoku_trigger=status.ichimoku_trigger,
-        stop_loss=status.stop_loss,
-        tp1_price=status.tp1_price,
-        partial_taken=status.partial_taken,
+        st_trend_5m=status.st_trend_5m,
+        st_trend_1h=status.st_trend_1h,
+        st_flip_5m=status.st_flip_5m,
+        st_signal=status.st_signal,
+        st_supertrend_5m=status.st_supertrend_5m,
+        st_supertrend_1h=status.st_supertrend_1h,
+        rsi_value=status.rsi_value,
+        rsi_prev=status.rsi_prev,
+        rsi_signal=status.rsi_signal,
+        rsi_cross_up_25=status.rsi_cross_up_25,
+        rsi_cross_up_75=status.rsi_cross_up_75,
+        rsi_cross_down_75=status.rsi_cross_down_75,
+        rsi_cross_down_25=status.rsi_cross_down_25,
         is_tracked=status.is_tracked,
         on_exchange=status.on_exchange,
         ofi_buy_volume=status.ofi_buy_volume,
@@ -158,7 +158,7 @@ def get_all_statuses() -> dict[str, BotStatus]:
 def get_open_position_symbols() -> list[str]:
     from src import database as db
 
-    return [row["symbol"] for row in db.get_open_ichimoku_trades()]
+    return [row["symbol"] for row in db.get_open_rsi_trades()]
 
 
 def clear_stale_signal_statuses(managed_symbols: set[str]) -> None:
@@ -205,19 +205,19 @@ def status_to_dict(status: BotStatus) -> dict[str, Any]:
         "sar_value": status.sar_value,
         "sar_position": status.sar_position,
         "sar_signal": status.sar_signal,
-        "ichimoku_trend": status.ichimoku_trend,
-        "price_vs_kumo": status.price_vs_kumo,
-        "kumo_color": status.kumo_color,
-        "kijun": status.kijun,
-        "tenkan": status.tenkan,
-        "senkou_a": status.senkou_a,
-        "senkou_b": status.senkou_b,
-        "chikou_ok": status.chikou_ok,
-        "ichimoku_signal": status.ichimoku_signal,
-        "ichimoku_trigger": status.ichimoku_trigger,
-        "stop_loss": status.stop_loss,
-        "tp1_price": status.tp1_price,
-        "partial_taken": status.partial_taken,
+        "st_trend_5m": status.st_trend_5m,
+        "st_trend_1h": status.st_trend_1h,
+        "st_flip_5m": status.st_flip_5m,
+        "st_signal": status.st_signal,
+        "st_supertrend_5m": status.st_supertrend_5m,
+        "st_supertrend_1h": status.st_supertrend_1h,
+        "rsi_value": status.rsi_value,
+        "rsi_prev": status.rsi_prev,
+        "rsi_signal": status.rsi_signal,
+        "rsi_cross_up_25": status.rsi_cross_up_25,
+        "rsi_cross_up_75": status.rsi_cross_up_75,
+        "rsi_cross_down_75": status.rsi_cross_down_75,
+        "rsi_cross_down_25": status.rsi_cross_down_25,
         "is_tracked": status.is_tracked,
         "on_exchange": status.on_exchange,
         "ofi_buy_volume": status.ofi_buy_volume,

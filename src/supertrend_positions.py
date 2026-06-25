@@ -2,17 +2,16 @@ import logging
 
 from src import database as db
 from src.bitget_client import BitgetClientError, Position, fetch_all_open_positions, has_credentials
-from src.ichimoku_trading import clear_ichi_state, load_ichi_state_from_db
+from src.supertrend_trading import clear_st_state, load_st_state_from_db
 
 
 def restore_tracked_positions() -> list[str]:
-    """Load open trades from DB into memory on startup."""
-    rows = db.get_open_ichimoku_trades()
+    rows = db.get_open_supertrend_trades()
     for row in rows:
-        load_ichi_state_from_db(row)
+        load_st_state_from_db(row)
     if rows:
         logging.info(
-            "Restored %d open Ichimoku trade(s) from DB: %s",
+            "Restored %d open SuperTrend trade(s) from DB: %s",
             len(rows),
             ", ".join(row["symbol"] for row in rows),
         )
@@ -20,8 +19,7 @@ def restore_tracked_positions() -> list[str]:
 
 
 def sync_exchange_positions() -> list[str]:
-    """Reconcile DB with Bitget open positions; return all symbols to manage."""
-    db_symbols = {row["symbol"] for row in db.get_open_ichimoku_trades()}
+    db_symbols = {row["symbol"] for row in db.get_open_supertrend_trades()}
 
     if not has_credentials():
         return sorted(db_symbols)
@@ -38,19 +36,18 @@ def sync_exchange_positions() -> list[str]:
     exchange_symbols = set(exchange_map)
 
     for symbol, pos in exchange_map.items():
-        row = db.get_open_ichimoku_trade(symbol)
+        row = db.get_open_supertrend_trade(symbol)
         if row is None:
-            db.insert_ichimoku_trade(
+            db.insert_supertrend_trade(
                 symbol=symbol,
                 side=pos.side or "long",
                 entry_price=pos.avg_price or 0.0,
-                stop_price=0.0,
-                risk_distance=0.0,
-                tp1_price=0.0,
-                trigger_type="adopted",
+                trend_5m_entry="",
+                trend_1h_entry="",
+                entry_trigger="adopted",
                 position_size=pos.size,
             )
-            row = db.get_open_ichimoku_trade(symbol)
+            row = db.get_open_supertrend_trade(symbol)
             logging.info(
                 "  Adopted exchange position %s %s size=%.4f (no DB record)",
                 symbol,
@@ -58,18 +55,22 @@ def sync_exchange_positions() -> list[str]:
                 pos.size,
             )
         if row is not None:
-            load_ichi_state_from_db(row)
-            db.update_ichimoku_trade(symbol, position_size=pos.size)
+            load_st_state_from_db(row)
+            db.update_supertrend_trade(symbol, position_size=pos.size)
 
     for symbol in db_symbols - exchange_symbols:
-        db.close_ichimoku_trade(symbol, close_reason="exchange_closed")
-        clear_ichi_state(symbol)
+        db.close_supertrend_trade(symbol, close_reason="exchange_closed")
+        clear_st_state(symbol)
         logging.info("  Closed DB trade %s — no longer open on exchange", symbol)
 
-    managed = sorted(exchange_symbols | {row["symbol"] for row in db.get_open_ichimoku_trades()})
+    managed = sorted(exchange_symbols | {row["symbol"] for row in db.get_open_supertrend_trades()})
     if managed:
         logging.info("Tracking %d open position(s): %s", len(managed), ", ".join(managed))
     return managed
+
+
+def get_open_position_count() -> int:
+    return len(db.get_open_supertrend_trades())
 
 
 def get_managed_symbols() -> list[str]:

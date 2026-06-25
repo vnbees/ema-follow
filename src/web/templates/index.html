@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Bitget Ichimoku Bot</title>
+  <title>Bitget RSI Bot</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #0f1117; color: #e6edf3; }
@@ -13,68 +13,82 @@
     .red { color: #f85149; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
     .badge-ok { background: rgba(63,185,80,.15); color: #3fb950; }
-    .badge-warn { background: rgba(210,153,34,.15); color: #d29922; }
+    .badge-sl { background: rgba(248,81,73,.18); color: #f85149; }
+    .badge-tp2 { background: rgba(56,139,253,.15); color: #58a6ff; }
+    .badge-closed { background: rgba(139,148,158,.15); color: #8b949e; }
     table { width: 100%; border-collapse: collapse; font-size: 14px; }
     th, td { padding: 8px 10px; border-bottom: 1px solid #30363d; text-align: left; white-space: nowrap; }
     th { color: #8b949e; font-size: 11px; text-transform: uppercase; }
     tr.long { background: rgba(63, 185, 80, 0.06); }
     tr.short { background: rgba(248, 81, 73, 0.06); }
+    tr.closed-row { opacity: 0.85; }
     .meta { color: #8b949e; font-size: 13px; margin-bottom: 8px; }
     .table-wrap { overflow-x: auto; }
+    .counts { display: flex; gap: 16px; margin-bottom: 8px; }
   </style>
 </head>
 <body>
-  <h1>Bitget Ichimoku M15 Bot</h1>
+  <h1>Bitget RSI Bot (14, 5m)</h1>
+  <p class="meta">Long: RSI chéo lên 25 → thoát chéo lên 75 | Short: RSI chéo xuống 75 → thoát chéo xuống 25 | DCA khi tín hiệu lặp cùng hướng</p>
 
   <div class="card">
-    <h2>Lệnh đang theo dõi ({{ tracked_count }})</h2>
+    <h2>Lịch sử lệnh RSI</h2>
+    <div class="counts">
+      <span class="green"><strong>{{ open_count }}</strong> đang mở</span>
+      <span class="meta"><strong>{{ closed_count }}</strong> đã đóng</span>
+    </div>
     <p class="meta">
-      Bot đồng bộ position từ Bitget mỗi cycle 15m và lưu thông số vào database.
       {% if last_refreshed %}Volume rank: {{ last_refreshed | vn_time }}.{% endif %}
-      {% if last_scan_checked %}Quét mới: {{ last_scan_checked }} coin{% if last_signal_symbol %} — tín hiệu tại <strong>{{ last_signal_symbol }}</strong>{% endif %}.{% endif %}
+      {% if last_scan_checked %}Quét: {{ last_scan_checked }} coin{% if last_signal_symbol %} — tín hiệu <strong>{{ last_signal_symbol }}</strong>{% endif %}.{% endif %}
     </p>
 
-    {% if position_rows %}
+    {% if trade_rows %}
     <div class="table-wrap">
       <table>
         <thead>
           <tr>
+            <th>Trạng thái</th>
             <th>Symbol</th>
             <th>Side</th>
             <th>Entry</th>
-            <th>SL</th>
-            <th>TP1 giá</th>
-            <th>TP2</th>
-            <th>Size</th>
-            <th>Chốt 1R</th>
-            <th>Sàn</th>
+            <th>RSI entry</th>
+            <th>RSI hiện tại</th>
+            <th>DCA</th>
             <th>Trigger</th>
+            <th>Size</th>
+            <th>Sàn</th>
             <th>Mở lúc</th>
-            <th>Cập nhật</th>
+            <th>Đóng lúc</th>
           </tr>
         </thead>
         <tbody>
-          {% for row in position_rows %}
-          <tr class="{{ row.side }}">
+          {% for row in trade_rows %}
+          <tr class="{{ row.side }}{% if not row.is_open %} closed-row{% endif %}">
+            <td><span class="badge {{ row.status_class }}">{{ row.status_label }}</span></td>
             <td><strong>{{ row.symbol }}</strong></td>
             <td class="{% if row.side == 'long' %}green{% else %}red{% endif %}">{{ row.side|upper }}</td>
             <td>{{ "%.4f"|format(row.entry) if row.entry else '—' }}</td>
-            <td class="red">{{ "%.4f"|format(row.stop_loss) if row.stop_loss else '—' }}</td>
-            <td class="green">{{ "%.4f"|format(row.tp1) if row.tp1 else '—' }}</td>
-            <td>Kijun trail</td>
+            <td>{{ "%.1f"|format(row.rsi_entry) if row.rsi_entry else '—' }}</td>
+            <td>{% if row.is_open and row.rsi_live %}{{ "%.1f"|format(row.rsi_live) }}{% else %}—{% endif %}</td>
+            <td>{% if row.dca_count %}×{{ row.dca_count }}{% else %}—{% endif %}</td>
+            <td>{{ row.entry_trigger }}</td>
             <td>{{ "%.4f"|format(row.position_size) if row.position_size else '—' }}</td>
-            <td>{% if row.partial_taken %}<span class="badge badge-ok">Đã chốt</span>{% else %}<span class="badge badge-warn">Chờ 1R</span>{% endif %}</td>
-            <td>{% if row.on_exchange %}<span class="badge badge-ok">Đang mở</span>{% else %}<span class="badge badge-warn">Chưa sync</span>{% endif %}</td>
-            <td>{{ row.trigger }}</td>
+            <td>
+              {% if row.is_open %}
+                {% if row.on_exchange %}<span class="badge badge-ok">Mở</span>{% else %}<span class="badge badge-closed">Sync</span>{% endif %}
+              {% else %}
+                <span class="badge badge-closed">Đóng</span>
+              {% endif %}
+            </td>
             <td class="meta">{{ row.opened_at | vn_time }}</td>
-            <td class="meta">{{ row.last_updated | vn_time }}</td>
+            <td class="meta">{% if row.closed_at %}{{ row.closed_at | vn_time }}{% else %}—{% endif %}</td>
           </tr>
           {% endfor %}
         </tbody>
       </table>
     </div>
     {% else %}
-    <p class="meta">Chưa có lệnh nào đang được theo dõi.</p>
+    <p class="meta">Chưa có lệnh nào trong database.</p>
     {% endif %}
   </div>
 </body>

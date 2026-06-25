@@ -101,9 +101,9 @@ def _tp1_price(entry: float, risk: float, side: str) -> float:
     return entry - risk
 
 
-def _close_full(symbol: str, hold_side: str) -> None:
+def _close_full(symbol: str, hold_side: str, close_reason: str) -> None:
     close_positions(symbol, hold_side=hold_side)
-    db.close_ichimoku_trade(symbol)
+    db.close_ichimoku_trade(symbol, close_reason=close_reason)
     clear_ichi_state(symbol)
 
 
@@ -240,11 +240,11 @@ def evaluate_ichimoku_trade(
         if side == "long":
             if stop > 0 and snap.low <= stop:
                 logging.info("  [%s] Long stop hit (low %.4f <= stop %.4f)", symbol, snap.low, stop)
-                _close_full(symbol, "long")
+                _close_full(symbol, "long", "stop_loss")
                 return
             if snap.close < snap.kijun:
                 logging.info("  [%s] Long Kijun exit (close %.4f < kijun %.4f)", symbol, snap.close, snap.kijun)
-                _close_full(symbol, "long")
+                _close_full(symbol, "long", "kijun_exit")
                 return
             if not ichi.partial_taken and risk > 0 and snap.close >= entry + risk:
                 partial_size = position.size * ICHIMOKU_PARTIAL_TP_RATIO
@@ -259,11 +259,11 @@ def evaluate_ichimoku_trade(
         if side == "short":
             if stop > 0 and snap.high >= stop:
                 logging.info("  [%s] Short stop hit (high %.4f >= stop %.4f)", symbol, snap.high, stop)
-                _close_full(symbol, "short")
+                _close_full(symbol, "short", "stop_loss")
                 return
             if snap.close > snap.kijun:
                 logging.info("  [%s] Short Kijun exit (close %.4f > kijun %.4f)", symbol, snap.close, snap.kijun)
-                _close_full(symbol, "short")
+                _close_full(symbol, "short", "kijun_exit")
                 return
             if not ichi.partial_taken and risk > 0 and snap.close <= entry - risk:
                 partial_size = position.size * ICHIMOKU_PARTIAL_TP_RATIO

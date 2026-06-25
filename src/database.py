@@ -78,6 +78,10 @@ def init_db() -> None:
         _migrate_profit_takes(conn)
         _migrate_profit_take_trigger_type(conn)
         _migrate_ichimoku_trades(conn)
+        _migrate_ichimoku_close_reason(conn)
+        _migrate_supertrend_trades(conn)
+        _migrate_rsi_trades(conn)
+        _migrate_rsi_trades_dca_count(conn)
 
 
 def _migrate_profit_take_trigger_type(conn: sqlite3.Connection) -> None:
@@ -498,6 +502,12 @@ def _migrate_ichimoku_trades(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_ichimoku_close_reason(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(ichimoku_trades)").fetchall()}
+    if "close_reason" not in cols:
+        conn.execute("ALTER TABLE ichimoku_trades ADD COLUMN close_reason TEXT")
+
+
 def insert_ichimoku_trade(
     symbol: str,
     side: str,
@@ -577,17 +587,36 @@ def update_ichimoku_trade(
         )
 
 
-def close_ichimoku_trade(symbol: str) -> None:
+def close_ichimoku_trade(symbol: str, close_reason: str = "") -> None:
     now = _utc_now()
     with get_connection() as conn:
         conn.execute(
             """
             UPDATE ichimoku_trades
-            SET status = 'closed', closed_at = ?, updated_at = ?
+            SET status = 'closed', closed_at = ?, updated_at = ?, close_reason = ?
             WHERE symbol = ? AND status = 'open'
             """,
-            (now, now, symbol.upper()),
+            (now, now, close_reason or None, symbol.upper()),
         )
+
+
+def get_recent_closed_ichimoku_trades(limit: int = 30) -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM ichimoku_trades
+            WHERE status = 'closed'
+            ORDER BY closed_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def get_ichimoku_trades_for_dashboard(closed_limit: int = 30) -> list[sqlite3.Row]:
+    open_rows = get_open_ichimoku_trades()
+    closed_rows = get_recent_closed_ichimoku_trades(closed_limit)
+    return list(open_rows) + list(closed_rows)
 
 
 def get_open_ichimoku_trades() -> list[sqlite3.Row]:
@@ -611,6 +640,306 @@ def get_open_ichimoku_trade(symbol: str) -> sqlite3.Row | None:
             """,
             (symbol.upper(),),
         ).fetchone()
+
+
+def _migrate_supertrend_trades(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS supertrend_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            entry_price REAL NOT NULL,
+            position_size REAL,
+            trend_5m_entry TEXT,
+            trend_1h_entry TEXT,
+            entry_trigger TEXT,
+            close_reason TEXT,
+            opened_at TEXT NOT NULL,
+            closed_at TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_supertrend_trades_open_symbol
+        ON supertrend_trades(symbol) WHERE status = 'open'
+        """
+    )
+
+
+def insert_supertrend_trade(
+    symbol: str,
+    side: str,
+    entry_price: float,
+    trend_5m_entry: str,
+    trend_1h_entry: str,
+    entry_trigger: str = "5m_flip",
+    position_size: float | None = None,
+) -> int:
+    now = _utc_now()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO supertrend_trades (
+                symbol, side, status, entry_price, position_size,
+                trend_5m_entry, trend_1h_entry, entry_trigger,
+                opened_at, updated_at
+            )
+            VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                symbol.upper(),
+                side,
+                entry_price,
+                position_size,
+                trend_5m_entry,
+                trend_1h_entry,
+                entry_trigger,
+                now,
+                now,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def update_supertrend_trade(
+    symbol: str,
+    *,
+    entry_price: float | None = None,
+    position_size: float | None = None,
+) -> None:
+    fields: list[str] = []
+    values: list[object] = []
+    if entry_price is not None:
+        fields.append("entry_price = ?")
+        values.append(entry_price)
+    if position_size is not None:
+        fields.append("position_size = ?")
+        values.append(position_size)
+    if not fields:
+        return
+    fields.append("updated_at = ?")
+    values.append(_utc_now())
+    values.append(symbol.upper())
+    with get_connection() as conn:
+        conn.execute(
+            f"UPDATE supertrend_trades SET {', '.join(fields)} WHERE symbol = ? AND status = 'open'",
+            values,
+        )
+
+
+def close_supertrend_trade(symbol: str, close_reason: str = "") -> None:
+    now = _utc_now()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE supertrend_trades
+            SET status = 'closed', closed_at = ?, updated_at = ?, close_reason = ?
+            WHERE symbol = ? AND status = 'open'
+            """,
+            (now, now, close_reason or None, symbol.upper()),
+        )
+
+
+def get_open_supertrend_trades() -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM supertrend_trades
+            WHERE status = 'open'
+            ORDER BY opened_at ASC
+            """,
+        ).fetchall()
+
+
+def get_open_supertrend_trade(symbol: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM supertrend_trades
+            WHERE symbol = ? AND status = 'open'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (symbol.upper(),),
+        ).fetchone()
+
+
+def get_recent_closed_supertrend_trades(limit: int = 50) -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM supertrend_trades
+            WHERE status = 'closed'
+            ORDER BY closed_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def get_supertrend_trades_for_dashboard(closed_limit: int = 50) -> list[sqlite3.Row]:
+    return list(get_open_supertrend_trades()) + list(get_recent_closed_supertrend_trades(closed_limit))
+
+
+def _migrate_rsi_trades(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rsi_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            entry_price REAL NOT NULL,
+            position_size REAL,
+            rsi_entry REAL,
+            entry_trigger TEXT,
+            close_reason TEXT,
+            opened_at TEXT NOT NULL,
+            closed_at TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_rsi_trades_open_symbol
+        ON rsi_trades(symbol) WHERE status = 'open'
+        """
+    )
+
+
+def _migrate_rsi_trades_dca_count(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(rsi_trades)").fetchall()}
+    if "dca_count" not in cols:
+        conn.execute(
+            "ALTER TABLE rsi_trades ADD COLUMN dca_count INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+def insert_rsi_trade(
+    symbol: str,
+    side: str,
+    entry_price: float,
+    rsi_entry: float,
+    entry_trigger: str = "rsi_cross_25",
+    position_size: float | None = None,
+) -> int:
+    now = _utc_now()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO rsi_trades (
+                symbol, side, status, entry_price, position_size,
+                rsi_entry, entry_trigger, opened_at, updated_at
+            )
+            VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                symbol.upper(),
+                side,
+                entry_price,
+                position_size,
+                rsi_entry,
+                entry_trigger,
+                now,
+                now,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def update_rsi_trade(
+    symbol: str,
+    *,
+    entry_price: float | None = None,
+    position_size: float | None = None,
+    rsi_entry: float | None = None,
+    entry_trigger: str | None = None,
+    dca_count: int | None = None,
+) -> None:
+    fields: list[str] = []
+    values: list[object] = []
+    if entry_price is not None:
+        fields.append("entry_price = ?")
+        values.append(entry_price)
+    if position_size is not None:
+        fields.append("position_size = ?")
+        values.append(position_size)
+    if rsi_entry is not None:
+        fields.append("rsi_entry = ?")
+        values.append(rsi_entry)
+    if entry_trigger is not None:
+        fields.append("entry_trigger = ?")
+        values.append(entry_trigger)
+    if dca_count is not None:
+        fields.append("dca_count = ?")
+        values.append(dca_count)
+    if not fields:
+        return
+    fields.append("updated_at = ?")
+    values.append(_utc_now())
+    values.append(symbol.upper())
+    with get_connection() as conn:
+        conn.execute(
+            f"UPDATE rsi_trades SET {', '.join(fields)} WHERE symbol = ? AND status = 'open'",
+            values,
+        )
+
+
+def close_rsi_trade(symbol: str, close_reason: str = "") -> None:
+    now = _utc_now()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE rsi_trades
+            SET status = 'closed', closed_at = ?, updated_at = ?, close_reason = ?
+            WHERE symbol = ? AND status = 'open'
+            """,
+            (now, now, close_reason or None, symbol.upper()),
+        )
+
+
+def get_open_rsi_trades() -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM rsi_trades
+            WHERE status = 'open'
+            ORDER BY opened_at ASC
+            """,
+        ).fetchall()
+
+
+def get_open_rsi_trade(symbol: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM rsi_trades
+            WHERE symbol = ? AND status = 'open'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (symbol.upper(),),
+        ).fetchone()
+
+
+def get_recent_closed_rsi_trades(limit: int = 50) -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM rsi_trades
+            WHERE status = 'closed'
+            ORDER BY closed_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def get_rsi_trades_for_dashboard(closed_limit: int = 50) -> list[sqlite3.Row]:
+    return list(get_open_rsi_trades()) + list(get_recent_closed_rsi_trades(closed_limit))
 
 
 @dataclass

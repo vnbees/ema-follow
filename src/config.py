@@ -13,31 +13,32 @@ DEFAULT_SYMBOL = os.getenv("SYMBOL", "SUIUSDT")
 SYMBOL = DEFAULT_SYMBOL
 PRODUCT_TYPE = "usdt-futures"
 PRODUCT_TYPE_API = "USDT-FUTURES"
-GRANULARITY = os.getenv("GRANULARITY", "15m")
+GRANULARITY = os.getenv("GRANULARITY", "5m")
 CANDLE_LIMIT = int(os.getenv("CANDLE_LIMIT", "200"))
 EMA_PERIODS = (34, 89, 144, 200)
-INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "15"))
 
-ICHIMOKU_TENKAN = int(os.getenv("ICHIMOKU_TENKAN", "9"))
-ICHIMOKU_KIJUN = int(os.getenv("ICHIMOKU_KIJUN", "26"))
-ICHIMOKU_SENKOU_B = int(os.getenv("ICHIMOKU_SENKOU_B", "52"))
-ICHIMOKU_DISPLACEMENT = int(os.getenv("ICHIMOKU_DISPLACEMENT", "26"))
-ICHIMOKU_SL_TICKS = int(os.getenv("ICHIMOKU_SL_TICKS", "8"))
-ICHIMOKU_RETEST_TOLERANCE_TICKS = int(os.getenv("ICHIMOKU_RETEST_TOLERANCE_TICKS", "3"))
-ICHIMOKU_PARTIAL_TP_RATIO = float(os.getenv("ICHIMOKU_PARTIAL_TP_RATIO", "0.5"))
-ICHIMOKU_MIN_CANDLES = ICHIMOKU_SENKOU_B + ICHIMOKU_DISPLACEMENT + 2
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+RSI_LONG_ENTRY = float(os.getenv("RSI_LONG_ENTRY", "25"))
+RSI_LONG_EXIT = float(os.getenv("RSI_LONG_EXIT", "75"))
+RSI_SHORT_ENTRY = float(os.getenv("RSI_SHORT_ENTRY", "75"))
+RSI_SHORT_EXIT = float(os.getenv("RSI_SHORT_EXIT", "25"))
+INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "5"))
+RSI_MIN_CANDLES = RSI_PERIOD + 2
 
 ORDER_SIZE_USDT = float(os.getenv("ORDER_SIZE_USDT", "5"))
 MARGIN_MODE = os.getenv("MARGIN_MODE", "crossed")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() in ("1", "true", "yes")
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
 
 
 def order_notional_usdt() -> float:
     """Position notional = margin (ORDER_SIZE_USDT) × leverage."""
     return ORDER_SIZE_USDT * LEVERAGE
+
+
 WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
-PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "1"))
+PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0"))
 SAR_AF = float(os.getenv("SAR_AF", "0.02"))
 SAR_MAX_AF = float(os.getenv("SAR_MAX_AF", "0.2"))
 OFI_SPIKE_THRESHOLD = float(os.getenv("OFI_SPIKE_THRESHOLD", "1.5"))
