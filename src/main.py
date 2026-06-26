@@ -14,14 +14,14 @@ from src.config import (
     INTERVAL_MINUTES,
     LOG_DIR,
     MAX_OPEN_POSITIONS,
-    ORDER_SIZE_USDT,
+    ORDER_MARGIN_MIN_USDT,
+    ORDER_MARGIN_PCT,
     PROFIT_TARGET_PCT,
     RSI_MIN_CANDLES,
     RSI_PERIOD,
     TRADING_ENABLED,
     WEB_PORT,
     LEVERAGE,
-    order_notional_usdt,
 )
 from src.database import init_db
 from src.market_universe import refresh_volume_rank, set_scan_progress
@@ -248,10 +248,10 @@ def main() -> None:
     logging.info("Cycle: %dm | RSI period: %d", INTERVAL_MINUTES, RSI_PERIOD)
     if TRADING_ENABLED:
         logging.info(
-            "Trading: LIVE RSI — margin %.0f USDT @ %dx (notional ~%.0f USDT)",
-            ORDER_SIZE_USDT,
+            "Trading: LIVE RSI — entry margin max(%.0f USDT, %.1f%% equity) @ %dx",
+            ORDER_MARGIN_MIN_USDT,
+            ORDER_MARGIN_PCT,
             LEVERAGE,
-            order_notional_usdt(),
         )
         logging.info("  Long: RSI cross up 25 | Exit long: cross up 75 | DCA: repeat cross up 25")
         logging.info("  Short: RSI cross down 75 | Exit short: cross down 25 | DCA: repeat cross down 75")

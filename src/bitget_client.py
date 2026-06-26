@@ -455,6 +455,34 @@ def _parse_unrealized_pnl(data: dict, side: str | None, size: float, avg_price: 
     return (avg_price - mark) * size
 
 
+def fetch_symbol_unrealized_pnl(symbol: str) -> tuple[float, float]:
+    """Return (unrealized USDT, mark price) for an open position, or (0, 0) if flat."""
+    data = _private_get(
+        SINGLE_POSITION_ENDPOINT,
+        {
+            "symbol": symbol,
+            "productType": PRODUCT_TYPE_API,
+            "marginCoin": MARGIN_COIN,
+        },
+    )
+    if not data:
+        return 0.0, 0.0
+    if isinstance(data, list):
+        if not data:
+            return 0.0, 0.0
+        data = data[0]
+    size = abs(float(data.get("total", 0) or 0))
+    if size <= 0:
+        return 0.0, 0.0
+    hold_side = (data.get("holdSide") or "").lower()
+    side = "long" if hold_side == "long" else "short" if hold_side == "short" else None
+    if side is None:
+        side = "long" if float(data.get("total", 0)) > 0 else "short"
+    avg_price = float(data.get("openPriceAvg") or data.get("averageOpenPrice") or 0)
+    mark = float(data.get("markPrice") or 0)
+    return _parse_unrealized_pnl(data, side, size, avg_price), mark
+
+
 def fetch_total_unrealized_pnl(symbols: list[str]) -> tuple[float, int]:
     """Return (sum unrealized USDT, number of open positions)."""
     total = 0.0

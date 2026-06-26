@@ -82,6 +82,7 @@ def init_db() -> None:
         _migrate_supertrend_trades(conn)
         _migrate_rsi_trades(conn)
         _migrate_rsi_trades_dca_count(conn)
+        _migrate_rsi_trades_sizing_pnl(conn)
 
 
 def _migrate_profit_take_trigger_type(conn: sqlite3.Connection) -> None:
@@ -819,6 +820,19 @@ def _migrate_rsi_trades_dca_count(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_rsi_trades_sizing_pnl(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(rsi_trades)").fetchall()}
+    if "margin_usdt" not in cols:
+        conn.execute("ALTER TABLE rsi_trades ADD COLUMN margin_usdt REAL")
+    if "realized_pnl_usdt" not in cols:
+        conn.execute("ALTER TABLE rsi_trades ADD COLUMN realized_pnl_usdt REAL")
+    if "close_price" not in cols:
+        conn.execute("ALTER TABLE rsi_trades ADD COLUMN close_price REAL")
+    conn.execute(
+        "UPDATE rsi_trades SET margin_usdt = 5 WHERE margin_usdt IS NULL"
+    )
+
+
 def insert_rsi_trade(
     symbol: str,
     side: str,
@@ -826,6 +840,7 @@ def insert_rsi_trade(
     rsi_entry: float,
     entry_trigger: str = "rsi_cross_25",
     position_size: float | None = None,
+    margin_usdt: float | None = None,
 ) -> int:
     now = _utc_now()
     with get_connection() as conn:
@@ -833,9 +848,9 @@ def insert_rsi_trade(
             """
             INSERT INTO rsi_trades (
                 symbol, side, status, entry_price, position_size,
-                rsi_entry, entry_trigger, opened_at, updated_at
+                rsi_entry, entry_trigger, margin_usdt, opened_at, updated_at
             )
-            VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 symbol.upper(),
@@ -844,6 +859,7 @@ def insert_rsi_trade(
                 position_size,
                 rsi_entry,
                 entry_trigger,
+                margin_usdt,
                 now,
                 now,
             ),
@@ -889,16 +905,30 @@ def update_rsi_trade(
         )
 
 
-def close_rsi_trade(symbol: str, close_reason: str = "") -> None:
+def close_rsi_trade(
+    symbol: str,
+    close_reason: str = "",
+    *,
+    realized_pnl_usdt: float | None = None,
+    close_price: float | None = None,
+) -> None:
     now = _utc_now()
     with get_connection() as conn:
         conn.execute(
             """
             UPDATE rsi_trades
-            SET status = 'closed', closed_at = ?, updated_at = ?, close_reason = ?
+            SET status = 'closed', closed_at = ?, updated_at = ?, close_reason = ?,
+                realized_pnl_usdt = ?, close_price = ?
             WHERE symbol = ? AND status = 'open'
             """,
-            (now, now, close_reason or None, symbol.upper()),
+            (
+                now,
+                now,
+                close_reason or None,
+                realized_pnl_usdt,
+                close_price,
+                symbol.upper(),
+            ),
         )
 
 
@@ -940,6 +970,18 @@ def get_recent_closed_rsi_trades(limit: int = 50) -> list[sqlite3.Row]:
 
 def get_rsi_trades_for_dashboard(closed_limit: int = 50) -> list[sqlite3.Row]:
     return list(get_open_rsi_trades()) + list(get_recent_closed_rsi_trades(closed_limit))
+
+
+def get_rsi_closed_realized_summary(closed_limit: int = 50) -> tuple[float, int]:
+    """Sum realized PnL from closed trades that have a recorded value."""
+    rows = get_recent_closed_rsi_trades(closed_limit)
+    total = 0.0
+    count = 0
+    for row in rows:
+        if "realized_pnl_usdt" in row.keys() and row["realized_pnl_usdt"] is not None:
+            total += float(row["realized_pnl_usdt"])
+            count += 1
+    return total, count
 
 
 @dataclass

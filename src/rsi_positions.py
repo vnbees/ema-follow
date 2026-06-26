@@ -2,6 +2,7 @@ import logging
 
 from src import database as db
 from src.bitget_client import BitgetClientError, Position, fetch_all_open_positions, has_credentials
+from src.config import LEGACY_MARGIN_USDT
 from src.rsi_trading import clear_rsi_state, load_rsi_state_from_db
 
 
@@ -45,6 +46,7 @@ def sync_exchange_positions() -> list[str]:
                 rsi_entry=0.0,
                 entry_trigger="adopted",
                 position_size=pos.size,
+                margin_usdt=LEGACY_MARGIN_USDT,
             )
             row = db.get_open_rsi_trade(symbol)
             logging.info(

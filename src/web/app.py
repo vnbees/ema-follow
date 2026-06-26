@@ -5,6 +5,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from src import database as db
+from src.bitget_client import BitgetClientError, fetch_symbol_unrealized_pnl, has_credentials
 from src.bot_state import (
     get_account_balance,
     get_all_statuses,
@@ -13,6 +14,7 @@ from src.bot_state import (
 from src.config import PROFIT_TARGET_PCT
 from src.market_universe import get_last_refreshed, get_scan_stats
 from src.orderflow import live_state_to_dict
+from src.pnl import dca_count_from_row, margin_from_trade_row, roi_pct, total_margin_deployed
 from src.profit_target import reset_baseline_to_current_equity, trigger_manual_profit_take
 
 from src.web.time_format import format_vn_time
@@ -39,20 +41,56 @@ def _trade_status(trade) -> tuple[str, str]:
     return _STATUS_LABELS.get(reason, _STATUS_LABELS["closed"])
 
 
-def _build_trade_row(trade, statuses: dict) -> dict:
+def _fetch_open_unrealized(symbols: list[str]) -> dict[str, float]:
+    result: dict[str, float] = {}
+    if not has_credentials():
+        return result
+    for symbol in symbols:
+        try:
+            pnl, _ = fetch_symbol_unrealized_pnl(symbol)
+            result[symbol] = pnl
+        except BitgetClientError:
+            result[symbol] = 0.0
+    return result
+
+
+def _trade_pnl_roi(trade, unrealized_map: dict[str, float]) -> tuple[float | None, float | None]:
+    margin = margin_from_trade_row(trade)
+    dca_count = dca_count_from_row(trade)
+    deployed = total_margin_deployed(margin, dca_count)
+
+    if trade["status"] == "open":
+        pnl = unrealized_map.get(trade["symbol"])
+        if pnl is None:
+            return None, None
+        return pnl, roi_pct(pnl, deployed)
+
+    if "realized_pnl_usdt" in trade.keys() and trade["realized_pnl_usdt"] is not None:
+        realized = float(trade["realized_pnl_usdt"])
+        return realized, roi_pct(realized, deployed)
+    return None, None
+
+
+def _build_trade_row(trade, statuses: dict, unrealized_map: dict[str, float]) -> dict:
     symbol = trade["symbol"]
     st = statuses.get(symbol)
     is_open = trade["status"] == "open"
     status_label, status_class = _trade_status(trade)
     rsi_live = st.rsi_value if st else 0.0
-    dca_count = int(trade["dca_count"]) if "dca_count" in trade.keys() and trade["dca_count"] else 0
+    margin_usdt = margin_from_trade_row(trade)
+    dca_count = dca_count_from_row(trade)
+    pnl_usdt, roi = _trade_pnl_roi(trade, unrealized_map)
+
     return {
         "symbol": symbol,
         "side": trade["side"],
         "entry": float(trade["entry_price"]),
         "rsi_entry": float(trade["rsi_entry"] or 0),
         "rsi_live": rsi_live,
+        "margin_usdt": margin_usdt,
         "dca_count": dca_count,
+        "pnl_usdt": pnl_usdt,
+        "roi_pct": roi,
         "entry_trigger": trade["entry_trigger"] or "—",
         "position_size": float(st.position_size)
         if is_open and st and st.position_size
@@ -68,11 +106,31 @@ def _build_trade_row(trade, statuses: dict) -> dict:
     }
 
 
+def _build_pnl_summary(trades: list, trade_rows: list[dict]) -> dict:
+    open_unrealized = sum(
+        row["pnl_usdt"] for row in trade_rows if row["is_open"] and row["pnl_usdt"] is not None
+    )
+    open_count = sum(1 for row in trade_rows if row["is_open"])
+    closed_realized, closed_count = db.get_rsi_closed_realized_summary(
+        closed_limit=len([t for t in trades if t["status"] == "closed"])
+    )
+    return {
+        "open_unrealized": open_unrealized,
+        "open_count": open_count,
+        "closed_realized": closed_realized,
+        "closed_count": closed_count,
+        "total_pnl": open_unrealized + closed_realized,
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request) -> HTMLResponse:
     trades = db.get_rsi_trades_for_dashboard(closed_limit=50)
     statuses = get_all_statuses()
-    trade_rows = [_build_trade_row(trade, statuses) for trade in trades]
+    open_symbols = [t["symbol"] for t in trades if t["status"] == "open"]
+    unrealized_map = _fetch_open_unrealized(open_symbols)
+    trade_rows = [_build_trade_row(trade, statuses, unrealized_map) for trade in trades]
+    pnl_summary = _build_pnl_summary(trades, trade_rows)
     open_count = sum(1 for row in trade_rows if row["is_open"])
     closed_count = len(trade_rows) - open_count
 
@@ -83,6 +141,7 @@ def dashboard(request: Request) -> HTMLResponse:
         "index.html",
         {
             "trade_rows": trade_rows,
+            "pnl_summary": pnl_summary,
             "open_count": open_count,
             "closed_count": closed_count,
             "last_refreshed": get_last_refreshed(),
@@ -126,6 +185,12 @@ def api_profit_takes() -> list[dict]:
 def api_status() -> dict:
     account = get_account_balance()
     statuses = get_all_statuses()
+    trades = db.get_rsi_trades_for_dashboard(closed_limit=50)
+    open_symbols = [t["symbol"] for t in trades if t["status"] == "open"]
+    unrealized_map = _fetch_open_unrealized(open_symbols)
+    trade_rows = [_build_trade_row(trade, statuses, unrealized_map) for trade in trades]
+    pnl_summary = _build_pnl_summary(trades, trade_rows)
+
     return {
         "account": {
             "available": account.available,
@@ -138,25 +203,29 @@ def api_status() -> dict:
             "profit_target_pct": account.profit_target_pct or PROFIT_TARGET_PCT,
             "baseline_updated_at": format_vn_time(account.baseline_updated_at),
         },
+        "pnl_summary": pnl_summary,
         "open_trades": [
             {
                 "symbol": row["symbol"],
                 "side": row["side"],
-                "status": row["status"],
-                "close_reason": row["close_reason"],
-                "entry_price": float(row["entry_price"]),
-                "rsi_entry": float(row["rsi_entry"] or 0),
-                "dca_count": int(row["dca_count"]) if "dca_count" in row.keys() and row["dca_count"] else 0,
-                "entry_trigger": row["entry_trigger"],
-                "position_size": float(row["position_size"] or 0),
-                "opened_at": format_vn_time(str(row["opened_at"])),
-                "closed_at": format_vn_time(str(row["closed_at"])) if row["closed_at"] else None,
-                "updated_at": format_vn_time(str(row["updated_at"])),
-                "live": status_to_dict(statuses[row["symbol"]])
-                if row["status"] == "open" and row["symbol"] in statuses
+                "status": trade["status"],
+                "close_reason": trade["close_reason"],
+                "entry_price": float(trade["entry_price"]),
+                "margin_usdt": row["margin_usdt"],
+                "pnl_usdt": row["pnl_usdt"],
+                "roi_pct": row["roi_pct"],
+                "rsi_entry": float(trade["rsi_entry"] or 0),
+                "dca_count": row["dca_count"],
+                "entry_trigger": trade["entry_trigger"],
+                "position_size": float(trade["position_size"] or 0),
+                "opened_at": format_vn_time(str(trade["opened_at"])),
+                "closed_at": format_vn_time(str(trade["closed_at"])) if trade["closed_at"] else None,
+                "updated_at": format_vn_time(str(trade["updated_at"])),
+                "live": status_to_dict(statuses[trade["symbol"]])
+                if trade["status"] == "open" and trade["symbol"] in statuses
                 else None,
             }
-            for row in db.get_rsi_trades_for_dashboard(closed_limit=50)
+            for trade, row in zip(trades, trade_rows)
         ],
         "symbols": {
             sym: {

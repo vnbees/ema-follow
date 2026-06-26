@@ -7,17 +7,18 @@ from src.bitget_client import (
     BitgetClientError,
     close_positions,
     fetch_contract_spec,
+    fetch_futures_balance,
+    fetch_symbol_unrealized_pnl,
     has_credentials,
     notional_to_size,
     place_market_order,
 )
 from src.bot_state import update_symbol_status
-from src.config import (
-    LEVERAGE,
-    MARGIN_MODE,
-    MAX_OPEN_POSITIONS,
-    TRADING_ENABLED,
-    order_notional_usdt,
+from src.config import LEVERAGE, MARGIN_MODE, MAX_OPEN_POSITIONS, TRADING_ENABLED
+from src.order_sizing import (
+    compute_entry_margin_usdt,
+    margin_to_notional,
+    trade_margin_usdt,
 )
 from src.rsi import RsiSnapshot
 from src.rsi_signals import RsiSignal, detect_dca_signal, should_exit
@@ -56,8 +57,20 @@ def clear_rsi_state(symbol: str) -> None:
 
 
 def _close_full(symbol: str, hold_side: str, close_reason: str) -> None:
+    unrealized = 0.0
+    mark_price = 0.0
+    try:
+        unrealized, mark_price = fetch_symbol_unrealized_pnl(symbol)
+    except BitgetClientError as exc:
+        logging.warning("  [%s] Could not fetch unrealized PnL before close: %s", symbol, exc)
+
     close_positions(symbol, hold_side=hold_side)
-    db.close_rsi_trade(symbol, close_reason=close_reason)
+    db.close_rsi_trade(
+        symbol,
+        close_reason=close_reason,
+        realized_pnl_usdt=unrealized,
+        close_price=mark_price if mark_price > 0 else None,
+    )
     clear_rsi_state(symbol)
 
 
@@ -95,22 +108,29 @@ def _update_status_from_snap(
     )
 
 
+def _size_for_margin(symbol: str, margin_usdt: float, price: float) -> str:
+    spec = fetch_contract_spec(symbol)
+    return notional_to_size(margin_to_notional(margin_usdt), price, spec)
+
+
 def _open_new_position(
     symbol: str,
     signal: RsiSignal,
     snap: RsiSnapshot,
     trade_state,
 ) -> None:
-    spec = fetch_contract_spec(symbol)
+    balance = fetch_futures_balance(symbol)
+    margin_usdt = compute_entry_margin_usdt(balance.account_equity)
     price = snap.close
-    size_str = notional_to_size(order_notional_usdt(), price, spec)
+    size_str = _size_for_margin(symbol, margin_usdt, price)
 
     if signal.side == "long":
         logging.info(
-            "  [%s] RSI LONG: cross up 25 | RSI=%.2f | price=%.4f",
+            "  [%s] RSI LONG: cross up 25 | RSI=%.2f | price=%.4f | margin=%.2f USDT",
             symbol,
             snap.rsi,
             price,
+            margin_usdt,
         )
         result = place_market_order(symbol, "buy", size_str)
         order_id = str(result.get("orderId", ""))
@@ -125,11 +145,12 @@ def _open_new_position(
             rsi_entry=snap.rsi,
             entry_trigger=signal.entry_trigger or "rsi_cross_25",
             position_size=float(size_str),
+            margin_usdt=margin_usdt,
         )
         logging.info(
-            "  [%s] Placed market buy: margin=%.0f USDT @ %dx size=%s fill=%.4f",
+            "  [%s] Placed market buy: margin=%.2f USDT @ %dx size=%s fill=%.4f",
             symbol,
-            order_notional_usdt() / LEVERAGE,
+            margin_usdt,
             LEVERAGE,
             size_str,
             fill,
@@ -138,10 +159,11 @@ def _open_new_position(
 
     if signal.side == "short":
         logging.info(
-            "  [%s] RSI SHORT: cross down 75 | RSI=%.2f | price=%.4f",
+            "  [%s] RSI SHORT: cross down 75 | RSI=%.2f | price=%.4f | margin=%.2f USDT",
             symbol,
             snap.rsi,
             price,
+            margin_usdt,
         )
         result = place_market_order(symbol, "sell", size_str)
         order_id = str(result.get("orderId", ""))
@@ -156,11 +178,12 @@ def _open_new_position(
             rsi_entry=snap.rsi,
             entry_trigger=signal.entry_trigger or "rsi_cross_75",
             position_size=float(size_str),
+            margin_usdt=margin_usdt,
         )
         logging.info(
-            "  [%s] Placed market sell: margin=%.0f USDT @ %dx size=%s fill=%.4f",
+            "  [%s] Placed market sell: margin=%.2f USDT @ %dx size=%s fill=%.4f",
             symbol,
-            order_notional_usdt() / LEVERAGE,
+            margin_usdt,
             LEVERAGE,
             size_str,
             fill,
@@ -177,18 +200,18 @@ def _add_to_position(
     row = db.get_open_rsi_trade(symbol)
     prev_dca = int(row["dca_count"]) if row and "dca_count" in row.keys() else 0
     dca_num = prev_dca + 1
+    margin_usdt = trade_margin_usdt(row)
 
-    spec = fetch_contract_spec(symbol)
     price = snap.close
-    size_str = notional_to_size(order_notional_usdt(), price, spec)
+    size_str = _size_for_margin(symbol, margin_usdt, price)
 
     if side == "long":
         logging.info(
-            "  [%s] RSI DCA LONG #%d: cross up 25 | RSI=%.2f | price=%.4f",
+            "  [%s] RSI DCA LONG #%d: cross up 25 | RSI=%.2f | margin=%.2f USDT",
             symbol,
             dca_num,
             snap.rsi,
-            price,
+            margin_usdt,
         )
         result = place_market_order(symbol, "buy", size_str)
         order_id = str(result.get("orderId", ""))
@@ -198,11 +221,11 @@ def _add_to_position(
         )
     else:
         logging.info(
-            "  [%s] RSI DCA SHORT #%d: cross down 75 | RSI=%.2f | price=%.4f",
+            "  [%s] RSI DCA SHORT #%d: cross down 75 | RSI=%.2f | margin=%.2f USDT",
             symbol,
             dca_num,
             snap.rsi,
-            price,
+            margin_usdt,
         )
         result = place_market_order(symbol, "sell", size_str)
         order_id = str(result.get("orderId", ""))
@@ -221,10 +244,10 @@ def _add_to_position(
         dca_count=dca_num,
     )
     logging.info(
-        "  [%s] DCA #%d placed: margin=%.0f USDT @ %dx size=%s | total=%.4f",
+        "  [%s] DCA #%d placed: locked margin=%.2f USDT @ %dx size=%s | total=%.4f",
         symbol,
         dca_num,
-        order_notional_usdt() / LEVERAGE,
+        margin_usdt,
         LEVERAGE,
         size_str,
         position.size,
