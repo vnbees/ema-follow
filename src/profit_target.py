@@ -59,6 +59,10 @@ def refresh_account_profit_info(
     )
 
 
+def _liquidatable_symbols(symbols: list[str]) -> list[str]:
+    return symbols
+
+
 def _record_profit_take_and_reset(
     symbols: list[str],
     baseline: float,
@@ -70,8 +74,9 @@ def _record_profit_take_and_reset(
     margin_coin: str,
     now_str: str,
 ) -> float | None:
+    liquidate_symbols = _liquidatable_symbols(symbols)
     try:
-        new_equity = liquidate_all_and_reset(symbols)
+        new_equity = liquidate_all_and_reset(liquidate_symbols)
     except BitgetClientError as exc:
         logging.error("  Liquidation failed: %s", exc)
         return None
@@ -93,7 +98,8 @@ def _record_profit_take_and_reset(
     )
 
     try:
-        post_balance = fetch_futures_balance(symbols[0])
+        balance_symbol = liquidate_symbols[0] if liquidate_symbols else symbols[0]
+        post_balance = fetch_futures_balance(balance_symbol)
         refresh_account_profit_info(
             symbols,
             post_balance.available,

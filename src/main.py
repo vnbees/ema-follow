@@ -13,9 +13,10 @@ from src.config import (
     GRANULARITY,
     INTERVAL_MINUTES,
     LOG_DIR,
-    MAX_OPEN_POSITIONS,
+    MAX_OPEN_SYMBOLS,
     ORDER_MARGIN_MIN_USDT,
     ORDER_MARGIN_PCT,
+    PAIR_PROFIT_TARGET_PCT,
     PROFIT_TARGET_PCT,
     RSI_MIN_CANDLES,
     RSI_PERIOD,
@@ -28,7 +29,7 @@ from src.market_universe import refresh_volume_rank, set_scan_progress
 from src.profit_target import check_profit_target, refresh_account_profit_info
 from src.rsi import get_rsi_snapshot
 from src.rsi_signals import detect_entry_signal
-from src.rsi_trading import can_open_new_position, evaluate_rsi_trade
+from src.rsi_trading import can_open_new_symbol, evaluate_rsi_trade
 from src.rsi_positions import get_managed_symbols, get_open_position_count, restore_tracked_positions
 from src.trend import candle_color
 from src.web.app import app as web_app
@@ -171,16 +172,17 @@ def run_cycle() -> None:
         return
 
     managed_symbols = get_managed_symbols()
-    clear_stale_signal_statuses(set(managed_symbols))
-    pnl_symbols = managed_symbols or [ranked[0][0]]
+    cycle_symbols = sorted(managed_symbols)
+    clear_stale_signal_statuses(set(cycle_symbols))
+    pnl_symbols = cycle_symbols or [ranked[0][0]]
 
     if check_profit_target(pnl_symbols):
         log_futures_balance_once(pnl_symbols[0])
         return
 
-    scanned: set[str] = set(managed_symbols)
+    scanned: set[str] = set(cycle_symbols)
 
-    for symbol in managed_symbols:
+    for symbol in cycle_symbols:
         try:
             run_analysis_for_symbol(symbol)
         except BitgetClientError as exc:
@@ -188,7 +190,7 @@ def run_cycle() -> None:
 
     signal_symbol = ""
     checked = 0
-    if can_open_new_position():
+    if can_open_new_symbol():
         for rank, (symbol, _volume) in enumerate(ranked, 1):
             if symbol in scanned:
                 continue
@@ -211,13 +213,13 @@ def run_cycle() -> None:
                 break
     else:
         logging.info(
-            "Max open positions reached (%d/%d) — skip scan for new entries",
+            "Max open symbols reached (%d/%d) — skip scan for new entries",
             get_open_position_count(),
-            MAX_OPEN_POSITIONS,
+            MAX_OPEN_SYMBOLS,
         )
 
     set_scan_progress(checked, signal_symbol)
-    if not signal_symbol and not managed_symbols:
+    if not signal_symbol and not cycle_symbols:
         logging.info(
             "Scan complete: checked %d/%d coins, no RSI entry",
             checked,
@@ -241,21 +243,20 @@ def main() -> None:
     logging.info("Bitget RSI Bot started")
     logging.info("Dashboard: http://localhost:%d", WEB_PORT)
     logging.info(
-        "Scan mode: volume rank until first RSI entry (%d pairs) | %s",
-        len(ranked),
-        GRANULARITY,
+        "Scan mode: TP %.1f%% mỗi cycle (đóng only) | cross 25/75: TP+reopen/stack | max %d symbols",
+        PAIR_PROFIT_TARGET_PCT,
+        MAX_OPEN_SYMBOLS,
     )
     logging.info("Cycle: %dm | RSI period: %d", INTERVAL_MINUTES, RSI_PERIOD)
     if TRADING_ENABLED:
         logging.info(
-            "Trading: LIVE RSI — entry margin max(%.0f USDT, %.1f%% equity) @ %dx",
+            "Trading: LIVE hedged RSI — cycle TP %.1f%% | cross 25/75 pair+stack | margin/leg max(%.0f USDT, %.1f%% equity) @ %dx",
+            PAIR_PROFIT_TARGET_PCT,
             ORDER_MARGIN_MIN_USDT,
             ORDER_MARGIN_PCT,
             LEVERAGE,
         )
-        logging.info("  Long: RSI cross up 25 | Exit long: cross up 75 | DCA: repeat cross up 25")
-        logging.info("  Short: RSI cross down 75 | Exit short: cross down 25 | DCA: repeat cross down 75")
-        logging.info("  Max open positions: %d", MAX_OPEN_POSITIONS)
+        logging.info("  Max open symbols: %d (hedge mode)", MAX_OPEN_SYMBOLS)
     else:
         logging.info("Trading: DISABLED — analysis and dashboard only")
     if PROFIT_TARGET_PCT > 0 and TRADING_ENABLED:

@@ -359,7 +359,7 @@ def set_position_mode(product_type: str = PRODUCT_TYPE_API) -> None:
             SET_POSITION_MODE_ENDPOINT,
             {
                 "productType": product_type,
-                "posMode": "one_way_mode",
+                "posMode": "hedge_mode",
             },
         )
     except BitgetClientError as exc:
@@ -392,11 +392,25 @@ def _parse_position_row(symbol: str, data: dict) -> Position:
     )
 
 
-def fetch_position(
+def _empty_position(symbol: str) -> Position:
+    return Position(symbol=symbol, side=None, size=0.0, avg_price=0.0)
+
+
+def _position_rows_from_response(data) -> list[dict]:
+    if not data:
+        return []
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)]
+    if isinstance(data, dict):
+        return [data]
+    return []
+
+
+def fetch_symbol_positions(
     symbol: str,
     product_type: str = PRODUCT_TYPE_API,
     margin_coin: str = MARGIN_COIN,
-) -> Position:
+) -> dict[str, Position]:
     data = _private_get(
         SINGLE_POSITION_ENDPOINT,
         {
@@ -405,15 +419,50 @@ def fetch_position(
             "marginCoin": margin_coin,
         },
     )
-    if not data:
-        return Position(symbol=symbol, side=None, size=0.0, avg_price=0.0)
+    result = {
+        "long": _empty_position(symbol),
+        "short": _empty_position(symbol),
+    }
+    for row in _position_rows_from_response(data):
+        pos = _parse_position_row(symbol, row)
+        if pos.side in result and pos.size > 0:
+            result[pos.side] = pos
+    return result
 
-    if isinstance(data, list):
-        if not data:
-            return Position(symbol=symbol, side=None, size=0.0, avg_price=0.0)
-        data = data[0]
 
-    return _parse_position_row(symbol, data)
+def fetch_side_mark_price(
+    symbol: str,
+    product_type: str = PRODUCT_TYPE_API,
+    margin_coin: str = MARGIN_COIN,
+) -> float:
+    data = _private_get(
+        SINGLE_POSITION_ENDPOINT,
+        {
+            "symbol": symbol,
+            "productType": product_type,
+            "marginCoin": margin_coin,
+        },
+    )
+    for row in _position_rows_from_response(data):
+        mark = float(row.get("markPrice") or 0)
+        if mark > 0:
+            return mark
+    return 0.0
+
+
+def fetch_position(
+    symbol: str,
+    product_type: str = PRODUCT_TYPE_API,
+    margin_coin: str = MARGIN_COIN,
+) -> Position:
+    positions = fetch_symbol_positions(symbol, product_type, margin_coin)
+    long_pos = positions["long"]
+    short_pos = positions["short"]
+    if long_pos.size >= short_pos.size and long_pos.size > 0:
+        return long_pos
+    if short_pos.size > 0:
+        return short_pos
+    return _empty_position(symbol)
 
 
 def fetch_all_open_positions(
@@ -483,36 +532,42 @@ def fetch_symbol_unrealized_pnl(symbol: str) -> tuple[float, float]:
     return _parse_unrealized_pnl(data, side, size, avg_price), mark
 
 
+def fetch_side_unrealized_pnl(symbol: str, hold_side: str) -> float:
+    positions = fetch_symbol_positions(symbol)
+    pos = positions.get(hold_side)
+    if pos is None or pos.size <= 0:
+        return 0.0
+    data = _private_get(
+        SINGLE_POSITION_ENDPOINT,
+        {
+            "symbol": symbol,
+            "productType": PRODUCT_TYPE_API,
+            "marginCoin": MARGIN_COIN,
+        },
+    )
+    for row in _position_rows_from_response(data):
+        row_side = (row.get("holdSide") or "").lower()
+        if row_side != hold_side:
+            continue
+        size = abs(float(row.get("total", 0) or 0))
+        avg_price = float(row.get("openPriceAvg") or row.get("averageOpenPrice") or 0)
+        return _parse_unrealized_pnl(row, hold_side, size, avg_price)
+    return 0.0
+
+
 def fetch_total_unrealized_pnl(symbols: list[str]) -> tuple[float, int]:
-    """Return (sum unrealized USDT, number of open positions)."""
+    """Return (sum unrealized USDT, number of open legs)."""
     total = 0.0
     open_count = 0
     for symbol in symbols:
         try:
-            data = _private_get(
-                SINGLE_POSITION_ENDPOINT,
-                {
-                    "symbol": symbol,
-                    "productType": PRODUCT_TYPE_API,
-                    "marginCoin": MARGIN_COIN,
-                },
-            )
-            if not data:
-                continue
-            if isinstance(data, list):
-                if not data:
+            positions = fetch_symbol_positions(symbol)
+            for hold_side in ("long", "short"):
+                pos = positions[hold_side]
+                if pos.size <= 0:
                     continue
-                data = data[0]
-            size = abs(float(data.get("total", 0) or 0))
-            if size <= 0:
-                continue
-            hold_side = (data.get("holdSide") or "").lower()
-            side = "long" if hold_side == "long" else "short" if hold_side == "short" else None
-            if side is None:
-                side = "long" if float(data.get("total", 0)) > 0 else "short"
-            avg_price = float(data.get("openPriceAvg") or data.get("averageOpenPrice") or 0)
-            total += _parse_unrealized_pnl(data, side, size, avg_price)
-            open_count += 1
+                total += fetch_side_unrealized_pnl(symbol, hold_side)
+                open_count += 1
         except BitgetClientError:
             continue
     return total, open_count
@@ -618,6 +673,16 @@ def place_limit_order(
     )
 
 
+def _market_order_side(hold_side: str, trade_side: str) -> str:
+    """Bitget hedge mode: side is position direction, tradeSide is open/close.
+
+    Open/close long  -> side=buy
+    Open/close short -> side=sell
+    """
+    _ = trade_side
+    return "buy" if hold_side == "long" else "sell"
+
+
 def place_market_order(
     symbol: str,
     side: str,
@@ -626,23 +691,54 @@ def place_market_order(
     margin_mode: str = MARGIN_MODE,
     margin_coin: str = MARGIN_COIN,
     *,
+    hold_side: str | None = None,
+    trade_side: str | None = None,
     reduce_only: bool = False,
 ) -> dict:
     client_oid = f"bot_{uuid.uuid4().hex[:16]}"
+    order_side = side
+    if hold_side and trade_side:
+        order_side = _market_order_side(hold_side, trade_side)
     body: dict[str, str] = {
         "symbol": symbol,
         "productType": product_type,
         "marginMode": margin_mode,
         "marginCoin": margin_coin,
         "size": size,
-        "side": side,
+        "side": order_side,
         "orderType": "market",
         "force": "ioc",
         "clientOid": client_oid,
     }
-    if reduce_only:
+    if hold_side:
+        body["holdSide"] = hold_side
+    if trade_side:
+        body["tradeSide"] = trade_side
+    # reduceOnly is one-way mode only; hedge uses holdSide + tradeSide=close
+    if reduce_only and not (hold_side and trade_side):
         body["reduceOnly"] = "YES"
     return _private_post(PLACE_ORDER_ENDPOINT, body)
+
+
+def close_position_side(
+    symbol: str,
+    hold_side: str,
+    size: str,
+    product_type: str = PRODUCT_TYPE_API,
+    margin_mode: str = MARGIN_MODE,
+    margin_coin: str = MARGIN_COIN,
+) -> dict:
+    return place_market_order(
+        symbol,
+        _market_order_side(hold_side, "close"),
+        size,
+        product_type=product_type,
+        margin_mode=margin_mode,
+        margin_coin=margin_coin,
+        hold_side=hold_side,
+        trade_side="close",
+        reduce_only=True,
+    )
 
 
 def format_size(size: float, spec: ContractSpec) -> str:

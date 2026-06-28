@@ -26,13 +26,16 @@ INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "5"))
 RSI_MIN_CANDLES = RSI_PERIOD + 2
 
 ORDER_SIZE_USDT = float(os.getenv("ORDER_SIZE_USDT", "5"))
-ORDER_MARGIN_PCT = float(os.getenv("ORDER_MARGIN_PCT", "1"))
+ORDER_MARGIN_PCT = float(os.getenv("ORDER_MARGIN_PCT", "0.5"))
 ORDER_MARGIN_MIN_USDT = float(os.getenv("ORDER_MARGIN_MIN_USDT", "1"))
 LEGACY_MARGIN_USDT = float(os.getenv("LEGACY_MARGIN_USDT", "5"))
 MARGIN_MODE = os.getenv("MARGIN_MODE", "crossed")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() in ("1", "true", "yes")
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "15"))
+MAX_OPEN_SYMBOLS = int(os.getenv("MAX_OPEN_SYMBOLS", os.getenv("MAX_OPEN_POSITIONS", "40")))
+MAX_OPEN_POSITIONS = MAX_OPEN_SYMBOLS
+MAX_OPEN_LEGS = MAX_OPEN_SYMBOLS * 2
+PAIR_PROFIT_TARGET_PCT = float(os.getenv("PAIR_PROFIT_TARGET_PCT", "2"))
 
 
 def order_notional_usdt() -> float:

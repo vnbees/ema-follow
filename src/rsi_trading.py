@@ -1,111 +1,49 @@
 import logging
-from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from src import database as db
 from src.bitget_client import (
     BitgetClientError,
-    close_positions,
+    close_position_side,
     fetch_contract_spec,
     fetch_futures_balance,
-    fetch_symbol_unrealized_pnl,
+    fetch_pending_orders,
+    fetch_side_mark_price,
+    fetch_side_unrealized_pnl,
+    fetch_symbol_positions,
+    format_size,
     has_credentials,
     notional_to_size,
     place_market_order,
 )
 from src.bot_state import update_symbol_status
-from src.config import LEVERAGE, MARGIN_MODE, MAX_OPEN_POSITIONS, TRADING_ENABLED
-from src.order_sizing import (
-    compute_entry_margin_usdt,
-    margin_to_notional,
-    trade_margin_usdt,
+from src.config import (
+    LEVERAGE,
+    MARGIN_MODE,
+    MAX_OPEN_SYMBOLS,
+    PAIR_PROFIT_TARGET_PCT,
+    TRADING_ENABLED,
 )
+from src.order_sizing import compute_entry_margin_usdt, margin_to_notional
 from src.rsi import RsiSnapshot
-from src.rsi_signals import RsiSignal, detect_dca_signal, should_exit
-from src.trading import (
-    _get_state,
-    _record_market_entry,
-    ensure_symbol_configured,
-    sync_state,
-)
+from src.rsi_signals import RsiSignal, detect_pair_event, price_move_pct, should_take_profit
+from src.trading import _get_state, _record_market_entry, ensure_symbol_configured
 
 
-@dataclass
-class RsiTradeState:
-    trade_id: int | None = None
-    entry_trigger: str = ""
-
-
-_rsi_states: dict[str, RsiTradeState] = {}
+def can_open_new_symbol() -> bool:
+    return db.count_open_symbols() < MAX_OPEN_SYMBOLS
 
 
 def can_open_new_position() -> bool:
-    return len(db.get_open_rsi_trades()) < MAX_OPEN_POSITIONS
+    return can_open_new_symbol()
 
 
-def load_rsi_state_from_db(row) -> RsiTradeState:
-    state = RsiTradeState(
-        trade_id=int(row["id"]),
-        entry_trigger=str(row["entry_trigger"] or ""),
-    )
-    _rsi_states[row["symbol"]] = state
-    return state
+def load_rsi_state_from_db(_row) -> None:
+    return None
 
 
-def clear_rsi_state(symbol: str) -> None:
-    _rsi_states.pop(symbol, None)
-
-
-def _close_full(symbol: str, hold_side: str, close_reason: str) -> None:
-    unrealized = 0.0
-    mark_price = 0.0
-    try:
-        unrealized, mark_price = fetch_symbol_unrealized_pnl(symbol)
-    except BitgetClientError as exc:
-        logging.warning("  [%s] Could not fetch unrealized PnL before close: %s", symbol, exc)
-
-    close_positions(symbol, hold_side=hold_side)
-    db.close_rsi_trade(
-        symbol,
-        close_reason=close_reason,
-        realized_pnl_usdt=unrealized,
-        close_price=mark_price if mark_price > 0 else None,
-    )
-    clear_rsi_state(symbol)
-
-
-def _update_status_from_snap(
-    symbol: str,
-    snap: RsiSnapshot,
-    signal: RsiSignal,
-    *,
-    position_side: str | None,
-    position_size: float,
-    avg_entry: float | None,
-    on_exchange: bool,
-    is_tracked: bool,
-    pending_orders: list[dict],
-    now_str: str,
-) -> None:
-    update_symbol_status(
-        symbol,
-        position_side=position_side,
-        position_size=position_size,
-        avg_entry=avg_entry,
-        rsi_value=snap.rsi,
-        rsi_prev=snap.prev_rsi,
-        rsi_signal=signal.side or "",
-        rsi_cross_up_25=snap.cross_up_25,
-        rsi_cross_up_75=snap.cross_up_75,
-        rsi_cross_down_75=snap.cross_down_75,
-        rsi_cross_down_25=snap.cross_down_25,
-        is_tracked=is_tracked,
-        on_exchange=on_exchange,
-        pending_orders=pending_orders,
-        margin_mode=MARGIN_MODE,
-        leverage=LEVERAGE,
-        last_updated=now_str,
-    )
+def clear_rsi_state(_symbol: str) -> None:
+    return None
 
 
 def _size_for_margin(symbol: str, margin_usdt: float, price: float) -> str:
@@ -113,179 +51,309 @@ def _size_for_margin(symbol: str, margin_usdt: float, price: float) -> str:
     return notional_to_size(margin_to_notional(margin_usdt), price, spec)
 
 
-def _open_new_position(
-    symbol: str,
-    signal: RsiSignal,
-    snap: RsiSnapshot,
-    trade_state,
-) -> None:
+def _format_close_size(symbol: str, size: float) -> str:
+    spec = fetch_contract_spec(symbol)
+    return format_size(size, spec)
+
+
+def _open_pair(symbol: str, snap: RsiSnapshot, trigger: str) -> int | None:
     balance = fetch_futures_balance(symbol)
     margin_usdt = compute_entry_margin_usdt(balance.account_equity)
-    price = snap.close
+    price = snap.close if snap.close > 0 else fetch_side_mark_price(symbol)
     size_str = _size_for_margin(symbol, margin_usdt, price)
 
-    if signal.side == "long":
-        logging.info(
-            "  [%s] RSI LONG: cross up 25 | RSI=%.2f | price=%.4f | margin=%.2f USDT",
-            symbol,
-            snap.rsi,
-            price,
-            margin_usdt,
-        )
-        result = place_market_order(symbol, "buy", size_str)
-        order_id = str(result.get("orderId", ""))
-        client_oid = str(result.get("clientOid", ""))
-        fill = _record_market_entry(
-            symbol, "long", order_id, client_oid, size_str, price, trade_state.open_cycle_id,
-        )
-        db.insert_rsi_trade(
-            symbol=symbol,
-            side="long",
-            entry_price=fill,
-            rsi_entry=snap.rsi,
-            entry_trigger=signal.entry_trigger or "rsi_cross_25",
-            position_size=float(size_str),
-            margin_usdt=margin_usdt,
-        )
-        logging.info(
-            "  [%s] Placed market buy: margin=%.2f USDT @ %dx size=%s fill=%.4f",
-            symbol,
-            margin_usdt,
-            LEVERAGE,
-            size_str,
-            fill,
-        )
-        return
-
-    if signal.side == "short":
-        logging.info(
-            "  [%s] RSI SHORT: cross down 75 | RSI=%.2f | price=%.4f | margin=%.2f USDT",
-            symbol,
-            snap.rsi,
-            price,
-            margin_usdt,
-        )
-        result = place_market_order(symbol, "sell", size_str)
-        order_id = str(result.get("orderId", ""))
-        client_oid = str(result.get("clientOid", ""))
-        fill = _record_market_entry(
-            symbol, "short", order_id, client_oid, size_str, price, trade_state.open_cycle_id,
-        )
-        db.insert_rsi_trade(
-            symbol=symbol,
-            side="short",
-            entry_price=fill,
-            rsi_entry=snap.rsi,
-            entry_trigger=signal.entry_trigger or "rsi_cross_75",
-            position_size=float(size_str),
-            margin_usdt=margin_usdt,
-        )
-        logging.info(
-            "  [%s] Placed market sell: margin=%.2f USDT @ %dx size=%s fill=%.4f",
-            symbol,
-            margin_usdt,
-            LEVERAGE,
-            size_str,
-            fill,
-        )
-
-
-def _add_to_position(
-    symbol: str,
-    side: str,
-    snap: RsiSnapshot,
-    signal: RsiSignal,
-    trade_state,
-) -> None:
-    row = db.get_open_rsi_trade(symbol)
-    prev_dca = int(row["dca_count"]) if row and "dca_count" in row.keys() else 0
-    dca_num = prev_dca + 1
-    margin_usdt = trade_margin_usdt(row)
-
-    price = snap.close
-    size_str = _size_for_margin(symbol, margin_usdt, price)
-
-    if side == "long":
-        logging.info(
-            "  [%s] RSI DCA LONG #%d: cross up 25 | RSI=%.2f | margin=%.2f USDT",
-            symbol,
-            dca_num,
-            snap.rsi,
-            margin_usdt,
-        )
-        result = place_market_order(symbol, "buy", size_str)
-        order_id = str(result.get("orderId", ""))
-        client_oid = str(result.get("clientOid", ""))
-        _record_market_entry(
-            symbol, "long", order_id, client_oid, size_str, price, trade_state.open_cycle_id,
-        )
-    else:
-        logging.info(
-            "  [%s] RSI DCA SHORT #%d: cross down 75 | RSI=%.2f | margin=%.2f USDT",
-            symbol,
-            dca_num,
-            snap.rsi,
-            margin_usdt,
-        )
-        result = place_market_order(symbol, "sell", size_str)
-        order_id = str(result.get("orderId", ""))
-        client_oid = str(result.get("clientOid", ""))
-        _record_market_entry(
-            symbol, "short", order_id, client_oid, size_str, price, trade_state.open_cycle_id,
-        )
-
-    position, _, avg_entry = sync_state(symbol)
-    db.update_rsi_trade(
+    logging.info(
+        "  [%s] Open pair L+S | trigger=%s | margin/leg=%.2f USDT | size=%s",
         symbol,
-        entry_price=avg_entry or price,
-        position_size=position.size,
-        rsi_entry=snap.rsi,
-        entry_trigger=signal.entry_trigger,
-        dca_count=dca_num,
+        trigger,
+        margin_usdt,
+        size_str,
+    )
+
+    long_result = place_market_order(
+        symbol, "buy", size_str, hold_side="long", trade_side="open",
+    )
+    short_result = place_market_order(
+        symbol, "sell", size_str, hold_side="short", trade_side="open",
+    )
+
+    trade_state = _get_state(symbol)
+    long_oid = str(long_result.get("orderId", ""))
+    long_coid = str(long_result.get("clientOid", ""))
+    short_oid = str(short_result.get("orderId", ""))
+    short_coid = str(short_result.get("clientOid", ""))
+
+    long_fill = _record_market_entry(
+        symbol, "long", long_oid, long_coid, size_str, price, trade_state.open_cycle_id,
+    )
+    _record_market_entry(
+        symbol, "short", short_oid, short_coid, size_str, price, trade_state.open_cycle_id,
+    )
+
+    size_val = float(size_str)
+    lot_id = db.insert_pair_lot(
+        symbol,
+        long_size=size_val,
+        long_entry=long_fill or price,
+        short_size=size_val,
+        short_entry=price,
+        margin_usdt=margin_usdt,
+        entry_trigger=trigger,
     )
     logging.info(
-        "  [%s] DCA #%d placed: locked margin=%.2f USDT @ %dx size=%s | total=%.4f",
+        "  [%s] Pair opened lot #%d | long fill=%.4f short ref=%.4f",
         symbol,
-        dca_num,
-        margin_usdt,
-        LEVERAGE,
+        lot_id,
+        long_fill or price,
+        price,
+    )
+    return lot_id
+
+
+def _verify_side_reduced(symbol: str, side: str, size_before: float) -> None:
+    positions = fetch_symbol_positions(symbol)
+    size_after = positions[side].size
+    if size_after >= size_before - 1e-6:
+        other = "short" if side == "long" else "long"
+        other_after = positions[other].size
+        logging.error(
+            "  [%s] Close %s may have failed — %s size %.4f -> %.4f | other %s=%.4f",
+            symbol,
+            side.upper(),
+            side,
+            size_before,
+            size_after,
+            other,
+            other_after,
+        )
+
+
+def _take_profit_aggregate_side(
+    symbol: str,
+    side: str,
+    mark: float,
+    snap: RsiSnapshot,
+    trigger: str,
+    *,
+    reopen_pair: bool,
+) -> None:
+    positions = fetch_symbol_positions(symbol)
+    pos = positions[side]
+    if pos.size <= 0:
+        return
+    size_str = _format_close_size(symbol, pos.size)
+    pnl = fetch_side_unrealized_pnl(symbol, side)
+    move = price_move_pct(side, pos.avg_price, mark)
+    logging.info(
+        "  [%s] Aggregate take profit %s | trigger=%s | move=%+.2f%% | size=%s | pnl≈%+.2f",
+        symbol,
+        side.upper(),
+        trigger,
+        move,
         size_str,
-        position.size,
+        pnl,
+    )
+    close_position_side(symbol, side, size_str)
+    _verify_side_reduced(symbol, side, pos.size)
+    db.close_all_lot_sides(symbol, side, mark=mark)
+    if reopen_pair:
+        _open_pair(symbol, snap, f"{trigger}_tp_agg_{side}")
+
+
+def _estimate_leg_pnl(side: str, entry: float, mark: float, size: float) -> float:
+    if side == "long":
+        return (mark - entry) * size
+    return (entry - mark) * size
+
+
+def _take_profit_lot_side(
+    symbol: str,
+    lot,
+    side: str,
+    mark: float,
+    snap: RsiSnapshot,
+    trigger: str,
+    *,
+    reopen_pair: bool,
+) -> None:
+    if side == "long":
+        if lot["long_status"] != "open":
+            return
+        entry = float(lot["long_entry"])
+        size = float(lot["long_size"])
+    else:
+        if lot["short_status"] != "open":
+            return
+        entry = float(lot["short_entry"])
+        size = float(lot["short_size"])
+    if size <= 0 or not should_take_profit(side, entry, mark):
+        return
+
+    size_str = _format_close_size(symbol, size)
+    pnl = _estimate_leg_pnl(side, entry, mark, size)
+    move = price_move_pct(side, entry, mark)
+    logging.info(
+        "  [%s] Lot #%d take profit %s | trigger=%s | move=%+.2f%% | size=%s",
+        symbol,
+        lot["id"],
+        side.upper(),
+        trigger,
+        move,
+        size_str,
+    )
+    close_position_side(symbol, side, size_str)
+    _verify_side_reduced(symbol, side, size)
+    db.close_lot_side(
+        int(lot["id"]),
+        side,
+        realized_pnl_usdt=pnl,
+        close_price=mark,
+    )
+    if reopen_pair:
+        _open_pair(symbol, snap, f"{trigger}_tp_lot{lot['id']}_{side}")
+
+
+def _scan_take_profits(
+    symbol: str,
+    mark: float,
+    snap: RsiSnapshot,
+    trigger: str,
+    *,
+    reopen_pair: bool,
+) -> bool:
+    took_action = False
+    long_agg_closed = False
+    short_agg_closed = False
+
+    positions = fetch_symbol_positions(symbol)
+    long_agg = positions["long"]
+    if long_agg.size > 0 and should_take_profit("long", long_agg.avg_price, mark):
+        _take_profit_aggregate_side(
+            symbol, "long", mark, snap, trigger, reopen_pair=reopen_pair,
+        )
+        took_action = True
+        long_agg_closed = True
+        positions = fetch_symbol_positions(symbol)
+
+    short_agg = positions["short"]
+    if short_agg.size > 0 and should_take_profit("short", short_agg.avg_price, mark):
+        _take_profit_aggregate_side(
+            symbol, "short", mark, snap, trigger, reopen_pair=reopen_pair,
+        )
+        took_action = True
+        short_agg_closed = True
+
+    if not long_agg_closed:
+        for lot in db.get_open_pair_lots(symbol):
+            if lot["long_status"] != "open":
+                continue
+            entry = float(lot["long_entry"])
+            if should_take_profit("long", entry, mark):
+                _take_profit_lot_side(
+                    symbol, lot, "long", mark, snap, trigger, reopen_pair=reopen_pair,
+                )
+                took_action = True
+
+    if not short_agg_closed:
+        for lot in db.get_open_pair_lots(symbol):
+            if lot["short_status"] != "open":
+                continue
+            entry = float(lot["short_entry"])
+            if should_take_profit("short", entry, mark):
+                _take_profit_lot_side(
+                    symbol, lot, "short", mark, snap, trigger, reopen_pair=reopen_pair,
+                )
+                took_action = True
+
+    return took_action
+
+
+def _sync_lots_with_exchange(symbol: str) -> None:
+    positions = fetch_symbol_positions(symbol)
+    long_size = positions["long"].size
+    short_size = positions["short"].size
+    open_lots = db.get_open_pair_lots(symbol)
+    lot_long = sum(float(r["long_size"]) for r in open_lots if r["long_status"] == "open")
+    lot_short = sum(float(r["short_size"]) for r in open_lots if r["short_status"] == "open")
+    if abs(lot_long - long_size) > 1e-6 or abs(lot_short - short_size) > 1e-6:
+        logging.warning(
+            "  [%s] Lot/exchange size mismatch: lots L=%.4f S=%.4f vs exchange L=%.4f S=%.4f",
+            symbol,
+            lot_long,
+            lot_short,
+            long_size,
+            short_size,
+        )
+
+
+def _update_status(
+    symbol: str,
+    snap: RsiSnapshot,
+    pair_event: RsiSignal | None,
+    mark: float,
+    now_str: str,
+) -> None:
+    positions = fetch_symbol_positions(symbol)
+    pending = fetch_pending_orders(symbol)
+    long_pos = positions["long"]
+    short_pos = positions["short"]
+    on_exchange = long_pos.size > 0 or short_pos.size > 0
+    position_side = None
+    position_size = 0.0
+    avg_entry = None
+    if long_pos.size >= short_pos.size and long_pos.size > 0:
+        position_side = "long"
+        position_size = long_pos.size
+        avg_entry = long_pos.avg_price
+    elif short_pos.size > 0:
+        position_side = "short"
+        position_size = short_pos.size
+        avg_entry = short_pos.avg_price
+
+    update_symbol_status(
+        symbol,
+        position_side=position_side,
+        position_size=position_size,
+        avg_entry=avg_entry,
+        rsi_value=snap.rsi,
+        rsi_prev=snap.prev_rsi,
+        rsi_signal=pair_event.entry_trigger if pair_event else "",
+        rsi_cross_up_25=snap.cross_up_25,
+        rsi_cross_up_75=snap.cross_up_75,
+        rsi_cross_down_75=snap.cross_down_75,
+        rsi_cross_down_25=snap.cross_down_25,
+        is_tracked=db.symbol_has_open_lots(symbol) or on_exchange,
+        on_exchange=on_exchange,
+        pending_orders=[
+            {"order_id": o.order_id, "side": o.side, "price": o.price, "size": o.size}
+            for o in pending
+        ],
+        margin_mode=MARGIN_MODE,
+        leverage=LEVERAGE,
+        last_updated=now_str,
     )
 
 
 def evaluate_rsi_trade(
     symbol: str,
     snap: RsiSnapshot,
-    signal: RsiSignal,
+    signal: RsiSignal | None = None,
 ) -> None:
     if not has_credentials():
         logging.warning("  [%s] RSI trading skipped: missing API credentials", symbol)
         return
 
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    pair_event = signal if signal and signal.side == "pair" else detect_pair_event(snap)
 
     if not TRADING_ENABLED:
+        mark = fetch_side_mark_price(symbol) if has_credentials() else 0.0
         try:
-            position, pending, avg_entry = sync_state(symbol)
-            _update_status_from_snap(
-                symbol,
-                snap,
-                signal,
-                position_side=position.side,
-                position_size=position.size,
-                avg_entry=avg_entry,
-                on_exchange=position.size > 0,
-                is_tracked=db.get_open_rsi_trade(symbol) is not None,
-                pending_orders=[
-                    {"order_id": o.order_id, "side": o.side, "price": o.price, "size": o.size}
-                    for o in pending
-                ],
-                now_str=now_str,
-            )
+            _sync_lots_with_exchange(symbol)
+            _update_status(symbol, snap, pair_event, mark, now_str)
         except BitgetClientError as exc:
-            logging.warning("  [%s] Position sync failed: %s", symbol, exc)
-        logging.info("  [%s] Trading disabled (TRADING_ENABLED=false) — no orders", symbol)
+            logging.warning("  [%s] Sync failed: %s", symbol, exc)
+        logging.info("  [%s] Trading disabled — no orders", symbol)
         return
 
     if not snap.ready:
@@ -293,72 +361,42 @@ def evaluate_rsi_trade(
         return
 
     ensure_symbol_configured(symbol)
-    position, pending, avg_entry = sync_state(symbol)
-    trade_state = _get_state(symbol)
-    on_exchange = position.size > 0 and bool(position.side)
-    pending_orders = [
-        {"order_id": o.order_id, "side": o.side, "price": o.price, "size": o.size}
-        for o in pending
-    ]
+    mark = fetch_side_mark_price(symbol)
+    if mark <= 0:
+        mark = snap.close
+    _sync_lots_with_exchange(symbol)
+    _update_status(symbol, snap, pair_event, mark, now_str)
 
-    display_signal = signal
-    if position.size > 0 and position.side:
-        dca_signal = detect_dca_signal(position.side, snap)
-        if dca_signal:
-            display_signal = dca_signal
+    _scan_take_profits(symbol, mark, snap, trigger="cycle", reopen_pair=False)
 
-    _update_status_from_snap(
+    if pair_event is None:
+        return
+
+    logging.info(
+        "  [%s] RSI cross event: %s | RSI=%.2f",
         symbol,
-        snap,
-        display_signal,
-        position_side=position.side,
-        position_size=position.size,
-        avg_entry=avg_entry,
-        on_exchange=on_exchange,
-        is_tracked=True,
-        pending_orders=pending_orders,
-        now_str=now_str,
+        pair_event.entry_trigger,
+        snap.rsi,
     )
 
-    if position.size > 0 and position.side:
-        exit_now, reason = should_exit(position.side, snap)
-        logging.info(
-            "  [%s] Managing %s | RSI=%.2f (prev=%.2f) | size=%.4f",
-            symbol,
-            position.side.upper(),
-            snap.rsi,
-            snap.prev_rsi,
-            position.size,
-        )
-        if exit_now:
-            logging.info("  [%s] Exit %s — %s", symbol, position.side, reason)
-            _close_full(symbol, position.side, reason)
-            return
-
-        dca_signal = detect_dca_signal(position.side, snap)
-        if dca_signal and dca_signal.side:
-            _add_to_position(symbol, position.side, snap, dca_signal, trade_state)
+    trigger = pair_event.entry_trigger or "rsi_cross"
+    took_action = _scan_take_profits(
+        symbol, mark, snap, trigger=trigger, reopen_pair=True,
+    )
+    if took_action:
         return
 
-    if position.size > 0:
+    if db.symbol_has_open_lots(symbol):
+        _open_pair(symbol, snap, f"{trigger}_stack")
         return
 
-    if not signal.side:
-        logging.info(
-            "  [%s] RSI: no entry (%s)",
-            symbol,
-            ", ".join(signal.reasons) if signal.reasons else "no signal",
-        )
+    if can_open_new_symbol():
+        _open_pair(symbol, snap, trigger)
         return
 
-    if not can_open_new_position():
-        open_count = len(db.get_open_rsi_trades())
-        logging.info(
-            "  [%s] Max open positions reached (%d/%d) — skip entry",
-            symbol,
-            open_count,
-            MAX_OPEN_POSITIONS,
-        )
-        return
-
-    _open_new_position(symbol, signal, snap, trade_state)
+    logging.info(
+        "  [%s] Max open symbols reached (%d/%d) — skip pair entry",
+        symbol,
+        db.count_open_symbols(),
+        MAX_OPEN_SYMBOLS,
+    )

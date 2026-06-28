@@ -83,6 +83,8 @@ def init_db() -> None:
         _migrate_rsi_trades(conn)
         _migrate_rsi_trades_dca_count(conn)
         _migrate_rsi_trades_sizing_pnl(conn)
+        _migrate_manual_hold_symbols(conn)
+        _migrate_rsi_pair_lots(conn)
 
 
 def _migrate_profit_take_trigger_type(conn: sqlite3.Connection) -> None:
@@ -833,6 +835,365 @@ def _migrate_rsi_trades_sizing_pnl(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_manual_hold_symbols(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS manual_hold_symbols (
+            symbol TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO manual_hold_symbols (symbol, created_at) VALUES (?, ?)",
+        ("VELVETUSDT", _utc_now()),
+    )
+
+
+def get_manual_hold_symbols() -> list[str]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT symbol FROM manual_hold_symbols ORDER BY created_at ASC"
+        ).fetchall()
+    return [row["symbol"] for row in rows]
+
+
+def get_manual_hold_set() -> set[str]:
+    return set(get_manual_hold_symbols())
+
+
+def is_manual_hold(symbol: str) -> bool:
+    symbol = symbol.upper().strip()
+    if not symbol:
+        return False
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM manual_hold_symbols WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+    return row is not None
+
+
+def add_manual_hold_symbol(symbol: str) -> bool:
+    symbol = symbol.upper().strip()
+    if not symbol:
+        return False
+    with get_connection() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO manual_hold_symbols (symbol, created_at) VALUES (?, ?)",
+                (symbol, _utc_now()),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def remove_manual_hold_symbol(symbol: str) -> bool:
+    symbol = symbol.upper().strip()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM manual_hold_symbols WHERE symbol = ?",
+            (symbol,),
+        )
+        return cursor.rowcount > 0
+
+
+def remove_manual_hold_symbol(symbol: str) -> bool:
+    symbol = symbol.upper().strip()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM manual_hold_symbols WHERE symbol = ?",
+            (symbol,),
+        )
+        return cursor.rowcount > 0
+
+
+def _migrate_rsi_pair_lots(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rsi_pair_lots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            long_size REAL NOT NULL DEFAULT 0,
+            long_entry REAL NOT NULL DEFAULT 0,
+            long_status TEXT NOT NULL DEFAULT 'open',
+            short_size REAL NOT NULL DEFAULT 0,
+            short_entry REAL NOT NULL DEFAULT 0,
+            short_status TEXT NOT NULL DEFAULT 'open',
+            margin_usdt REAL,
+            entry_trigger TEXT,
+            opened_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            long_closed_at TEXT,
+            short_closed_at TEXT,
+            long_realized_pnl_usdt REAL,
+            short_realized_pnl_usdt REAL,
+            long_close_price REAL,
+            short_close_price REAL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_rsi_pair_lots_symbol_open
+        ON rsi_pair_lots(symbol, opened_at)
+        """
+    )
+
+
+def insert_pair_lot(
+    symbol: str,
+    *,
+    long_size: float,
+    long_entry: float,
+    short_size: float,
+    short_entry: float,
+    margin_usdt: float,
+    entry_trigger: str,
+) -> int:
+    now = _utc_now()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO rsi_pair_lots (
+                symbol, long_size, long_entry, long_status,
+                short_size, short_entry, short_status,
+                margin_usdt, entry_trigger, opened_at, updated_at
+            )
+            VALUES (?, ?, ?, 'open', ?, ?, 'open', ?, ?, ?, ?)
+            """,
+            (
+                symbol.upper(),
+                long_size,
+                long_entry,
+                short_size,
+                short_entry,
+                margin_usdt,
+                entry_trigger,
+                now,
+                now,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def get_open_pair_lots(symbol: str | None = None) -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        if symbol:
+            return conn.execute(
+                """
+                SELECT * FROM rsi_pair_lots
+                WHERE symbol = ?
+                  AND (long_status = 'open' OR short_status = 'open')
+                ORDER BY opened_at ASC
+                """,
+                (symbol.upper(),),
+            ).fetchall()
+        return conn.execute(
+            """
+            SELECT * FROM rsi_pair_lots
+            WHERE long_status = 'open' OR short_status = 'open'
+            ORDER BY symbol ASC, opened_at ASC
+            """
+        ).fetchall()
+
+
+def get_all_open_pair_lots() -> list[sqlite3.Row]:
+    return get_open_pair_lots(None)
+
+
+def get_recent_pair_lots(limit: int = 100) -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM rsi_pair_lots
+            ORDER BY opened_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def get_pair_lots_for_dashboard(limit: int = 80) -> list[sqlite3.Row]:
+    open_rows = get_all_open_pair_lots()
+    open_ids = {row["id"] for row in open_rows}
+    recent = get_recent_pair_lots(limit)
+    rows = list(open_rows)
+    for row in recent:
+        if row["id"] not in open_ids:
+            rows.append(row)
+    rows.sort(key=lambda r: (r["symbol"], r["opened_at"]), reverse=False)
+    return rows
+
+
+def close_lot_side(
+    lot_id: int,
+    side: str,
+    *,
+    realized_pnl_usdt: float | None = None,
+    close_price: float | None = None,
+) -> None:
+    side = side.lower()
+    now = _utc_now()
+    if side == "long":
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE rsi_pair_lots
+                SET long_status = 'closed', long_closed_at = ?, updated_at = ?,
+                    long_realized_pnl_usdt = ?, long_close_price = ?
+                WHERE id = ?
+                """,
+                (now, now, realized_pnl_usdt, close_price, lot_id),
+            )
+        return
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE rsi_pair_lots
+            SET short_status = 'closed', short_closed_at = ?, updated_at = ?,
+                short_realized_pnl_usdt = ?, short_close_price = ?
+            WHERE id = ?
+            """,
+            (now, now, realized_pnl_usdt, close_price, lot_id),
+        )
+
+
+def close_all_lot_sides(
+    symbol: str,
+    side: str,
+    *,
+    mark: float | None = None,
+) -> None:
+    side = side.lower()
+    for lot in get_open_pair_lots(symbol.upper()):
+        status_col = "long_status" if side == "long" else "short_status"
+        if lot[status_col] != "open":
+            continue
+        entry = float(lot["long_entry"] if side == "long" else lot["short_entry"])
+        size = float(lot["long_size"] if side == "long" else lot["short_size"])
+        realized = None
+        if mark and mark > 0 and entry > 0 and size > 0:
+            if side == "long":
+                realized = (mark - entry) * size
+            else:
+                realized = (entry - mark) * size
+        close_lot_side(
+            int(lot["id"]),
+            side,
+            realized_pnl_usdt=realized,
+            close_price=mark,
+        )
+
+
+def count_open_symbols() -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(DISTINCT symbol) AS cnt FROM rsi_pair_lots
+            WHERE long_status = 'open' OR short_status = 'open'
+            """
+        ).fetchone()
+    return int(row["cnt"]) if row else 0
+
+
+def count_open_legs() -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT
+              SUM(CASE WHEN long_status = 'open' THEN 1 ELSE 0 END)
+            + SUM(CASE WHEN short_status = 'open' THEN 1 ELSE 0 END) AS cnt
+            FROM rsi_pair_lots
+            WHERE long_status = 'open' OR short_status = 'open'
+            """
+        ).fetchone()
+    return int(row["cnt"] or 0) if row else 0
+
+
+def symbol_has_open_lots(symbol: str) -> bool:
+    return len(get_open_pair_lots(symbol)) > 0
+
+
+def get_closed_lot_side_events() -> list[sqlite3.Row]:
+    """One row per closed leg for PnL calendar and history."""
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT
+                symbol,
+                side,
+                closed_at,
+                realized_pnl_usdt,
+                close_price,
+                entry,
+                size,
+                margin_usdt,
+                entry_trigger,
+                lot_id
+            FROM (
+                SELECT
+                    symbol,
+                    'long' AS side,
+                    long_closed_at AS closed_at,
+                    long_realized_pnl_usdt AS realized_pnl_usdt,
+                    long_close_price AS close_price,
+                    long_entry AS entry,
+                    long_size AS size,
+                    margin_usdt,
+                    entry_trigger,
+                    id AS lot_id
+                FROM rsi_pair_lots
+                WHERE long_closed_at IS NOT NULL
+                UNION ALL
+                SELECT
+                    symbol,
+                    'short' AS side,
+                    short_closed_at AS closed_at,
+                    short_realized_pnl_usdt AS realized_pnl_usdt,
+                    short_close_price AS close_price,
+                    short_entry AS entry,
+                    short_size AS size,
+                    margin_usdt,
+                    entry_trigger,
+                    id AS lot_id
+                FROM rsi_pair_lots
+                WHERE short_closed_at IS NOT NULL
+            )
+            ORDER BY closed_at DESC
+            """
+        ).fetchall()
+
+
+def get_closed_realized_from_lots() -> tuple[float, int, int]:
+    """Return (total realized USDT incl. estimates, exact PnL leg count, total closed legs)."""
+    from src.config import PAIR_PROFIT_TARGET_PCT
+    from src.pnl import estimate_tp_pnl_usdt, leg_realized_pnl
+
+    total = 0.0
+    exact_count = 0
+    total_legs = 0
+    for row in get_closed_lot_side_events():
+        total_legs += 1
+        entry = float(row["entry"] or 0)
+        size = float(row["size"] or 0)
+        pnl = leg_realized_pnl(
+            row["side"],
+            entry,
+            size,
+            realized_pnl_usdt=row["realized_pnl_usdt"],
+            close_price=row["close_price"],
+        )
+        if pnl is not None:
+            exact_count += 1
+        elif entry > 0 and size > 0:
+            pnl = estimate_tp_pnl_usdt(entry, size, PAIR_PROFIT_TARGET_PCT)
+        if pnl is not None:
+            total += pnl
+    return total, exact_count, total_legs
+
+
 def insert_rsi_trade(
     symbol: str,
     side: str,
@@ -968,6 +1329,17 @@ def get_recent_closed_rsi_trades(limit: int = 50) -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def get_all_closed_rsi_trades() -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM rsi_trades
+            WHERE status = 'closed' AND closed_at IS NOT NULL
+            ORDER BY closed_at DESC
+            """,
+        ).fetchall()
+
+
 def get_rsi_trades_for_dashboard(closed_limit: int = 50) -> list[sqlite3.Row]:
     return list(get_open_rsi_trades()) + list(get_recent_closed_rsi_trades(closed_limit))
 
@@ -982,6 +1354,28 @@ def get_rsi_closed_realized_summary(closed_limit: int = 50) -> tuple[float, int]
             total += float(row["realized_pnl_usdt"])
             count += 1
     return total, count
+
+
+def clear_dashboard_history(*, reset_baseline: bool = True) -> dict[str, int]:
+    """Delete RSI lot/trade history shown on the dashboard. Keeps manual_hold_symbols."""
+    tables = (
+        "rsi_pair_lots",
+        "rsi_trades",
+        "profit_takes",
+        "entries",
+        "trade_cycles",
+    )
+    counts: dict[str, int] = {}
+    with get_connection() as conn:
+        for table in tables:
+            row = conn.execute(f"SELECT COUNT(*) AS cnt FROM {table}").fetchone()
+            counts[table] = int(row["cnt"]) if row else 0
+            conn.execute(f"DELETE FROM {table}")
+        if reset_baseline:
+            conn.execute(
+                "DELETE FROM settings WHERE key IN ('baseline_equity', 'baseline_updated_at')"
+            )
+    return counts
 
 
 @dataclass

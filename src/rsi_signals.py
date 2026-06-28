@@ -1,63 +1,47 @@
 from dataclasses import dataclass, field
 
+from src.config import PAIR_PROFIT_TARGET_PCT
 from src.rsi import RsiSnapshot
 
 
 @dataclass
 class RsiSignal:
-    side: str | None = None  # "long" | "short"
+    side: str | None = None  # "pair" when cross entry event
     entry_trigger: str = ""
     reasons: list[str] = field(default_factory=list)
 
 
-def detect_entry_signal(snap: RsiSnapshot) -> RsiSignal:
-    if not snap.ready:
-        return RsiSignal(reasons=["rsi_not_ready"])
-
-    signal = RsiSignal()
-    if snap.cross_up_25:
-        signal.side = "long"
-        signal.entry_trigger = "rsi_cross_25"
-        signal.reasons.append("entry_ok")
-        return signal
-
-    if snap.cross_down_75:
-        signal.side = "short"
-        signal.entry_trigger = "rsi_cross_75"
-        signal.reasons.append("entry_ok")
-        return signal
-
-    signal.reasons.append("no_rsi_cross")
-    return signal
-
-
-def detect_dca_signal(position_side: str, snap: RsiSnapshot) -> RsiSignal | None:
+def detect_pair_event(snap: RsiSnapshot) -> RsiSignal | None:
     if not snap.ready:
         return None
-
-    if position_side == "long" and snap.cross_up_25:
-        return RsiSignal(
-            side="long",
-            entry_trigger="rsi_cross_25_dca",
-            reasons=["dca_ok"],
-        )
-
-    if position_side == "short" and snap.cross_down_75:
-        return RsiSignal(
-            side="short",
-            entry_trigger="rsi_cross_75_dca",
-            reasons=["dca_ok"],
-        )
-
+    if snap.cross_up_25:
+        return RsiSignal(side="pair", entry_trigger="rsi_cross_25", reasons=["cross_up_25"])
+    if snap.cross_down_75:
+        return RsiSignal(side="pair", entry_trigger="rsi_cross_75", reasons=["cross_down_75"])
     return None
 
 
-def should_exit(position_side: str, snap: RsiSnapshot) -> tuple[bool, str]:
-    if not snap.ready:
-        return False, ""
+def detect_entry_signal(snap: RsiSnapshot) -> RsiSignal:
+    """Legacy alias for scan compatibility."""
+    event = detect_pair_event(snap)
+    if event:
+        return event
+    return RsiSignal(reasons=["no_rsi_cross"])
 
-    if position_side == "long" and snap.cross_up_75:
-        return True, "rsi_cross_75"
-    if position_side == "short" and snap.cross_down_25:
-        return True, "rsi_cross_25"
-    return False, ""
+
+def price_move_pct(side: str, entry: float, mark: float) -> float:
+    if entry <= 0 or mark <= 0:
+        return 0.0
+    if side == "long":
+        return (mark - entry) / entry * 100
+    return (entry - mark) / entry * 100
+
+
+def should_take_profit(
+    side: str,
+    entry: float,
+    mark: float,
+    target_pct: float | None = None,
+) -> bool:
+    target = PAIR_PROFIT_TARGET_PCT if target_pct is None else target_pct
+    return price_move_pct(side, entry, mark) >= target - 1e-9

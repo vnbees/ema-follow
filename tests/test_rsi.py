@@ -2,7 +2,12 @@ import unittest
 
 from src.bitget_client import Candle
 from src.rsi import RsiSnapshot, compute_rsi_series, get_rsi_snapshot
-from src.rsi_signals import detect_dca_signal, detect_entry_signal, should_exit
+from src.rsi_signals import (
+    detect_entry_signal,
+    detect_pair_event,
+    price_move_pct,
+    should_take_profit,
+)
 
 
 def _make_candles(closes: list[float], interval_ms: int = 300_000) -> list[Candle]:
@@ -40,83 +45,49 @@ class TestRsiIndicator(unittest.TestCase):
         self.assertFalse(snap.ready)
 
 
-class TestRsiSignals(unittest.TestCase):
+class TestPairSignals(unittest.TestCase):
     def test_not_ready(self):
+        self.assertIsNone(detect_pair_event(RsiSnapshot(ready=False)))
         sig = detect_entry_signal(RsiSnapshot(ready=False))
         self.assertIsNone(sig.side)
-        self.assertIn("rsi_not_ready", sig.reasons)
+        self.assertIn("no_rsi_cross", sig.reasons)
 
-    def test_long_entry_cross_up_25(self):
+    def test_pair_cross_up_25(self):
         snap = RsiSnapshot(ready=True, rsi=26.0, prev_rsi=24.0, cross_up_25=True)
-        sig = detect_entry_signal(snap)
-        self.assertEqual(sig.side, "long")
+        sig = detect_pair_event(snap)
+        self.assertIsNotNone(sig)
+        assert sig is not None
+        self.assertEqual(sig.side, "pair")
         self.assertEqual(sig.entry_trigger, "rsi_cross_25")
 
-    def test_short_entry_cross_down_75(self):
+    def test_pair_cross_down_75(self):
         snap = RsiSnapshot(ready=True, rsi=74.0, prev_rsi=76.0, cross_down_75=True)
-        sig = detect_entry_signal(snap)
-        self.assertEqual(sig.side, "short")
+        sig = detect_pair_event(snap)
+        self.assertIsNotNone(sig)
+        assert sig is not None
+        self.assertEqual(sig.side, "pair")
         self.assertEqual(sig.entry_trigger, "rsi_cross_75")
 
-    def test_no_signal(self):
+    def test_no_cross(self):
         snap = RsiSnapshot(ready=True, rsi=50.0, prev_rsi=49.0)
+        self.assertIsNone(detect_pair_event(snap))
         sig = detect_entry_signal(snap)
         self.assertIsNone(sig.side)
         self.assertIn("no_rsi_cross", sig.reasons)
 
 
-class TestRsiExit(unittest.TestCase):
-    def test_long_exit_cross_up_75(self):
-        snap = RsiSnapshot(ready=True, rsi=76.0, prev_rsi=74.0, cross_up_75=True)
-        exit_flag, reason = should_exit("long", snap)
-        self.assertTrue(exit_flag)
-        self.assertEqual(reason, "rsi_cross_75")
+class TestPriceMovePct(unittest.TestCase):
+    def test_long_profit(self):
+        self.assertAlmostEqual(price_move_pct("long", 100.0, 102.0), 2.0)
 
-    def test_short_exit_cross_down_25(self):
-        snap = RsiSnapshot(ready=True, rsi=24.0, prev_rsi=26.0, cross_down_25=True)
-        exit_flag, reason = should_exit("short", snap)
-        self.assertTrue(exit_flag)
-        self.assertEqual(reason, "rsi_cross_25")
+    def test_short_profit(self):
+        self.assertAlmostEqual(price_move_pct("short", 100.0, 98.0), 2.0)
 
-    def test_long_hold(self):
-        snap = RsiSnapshot(ready=True, rsi=50.0, prev_rsi=48.0)
-        exit_flag, reason = should_exit("long", snap)
-        self.assertFalse(exit_flag)
+    def test_should_take_profit_at_target(self):
+        self.assertTrue(should_take_profit("long", 100.0, 102.0, target_pct=2.0))
 
-    def test_short_hold(self):
-        snap = RsiSnapshot(ready=True, rsi=50.0, prev_rsi=52.0)
-        exit_flag, reason = should_exit("short", snap)
-        self.assertFalse(exit_flag)
-
-
-class TestRsiDca(unittest.TestCase):
-    def test_long_dca_cross_up_25(self):
-        snap = RsiSnapshot(ready=True, rsi=26.0, prev_rsi=24.0, cross_up_25=True)
-        sig = detect_dca_signal("long", snap)
-        self.assertIsNotNone(sig)
-        assert sig is not None
-        self.assertEqual(sig.side, "long")
-        self.assertEqual(sig.entry_trigger, "rsi_cross_25_dca")
-
-    def test_short_dca_cross_down_75(self):
-        snap = RsiSnapshot(ready=True, rsi=74.0, prev_rsi=76.0, cross_down_75=True)
-        sig = detect_dca_signal("short", snap)
-        self.assertIsNotNone(sig)
-        assert sig is not None
-        self.assertEqual(sig.side, "short")
-        self.assertEqual(sig.entry_trigger, "rsi_cross_75_dca")
-
-    def test_long_no_dca_on_cross_down_75(self):
-        snap = RsiSnapshot(ready=True, rsi=74.0, prev_rsi=76.0, cross_down_75=True)
-        self.assertIsNone(detect_dca_signal("long", snap))
-
-    def test_short_no_dca_on_cross_down_25(self):
-        snap = RsiSnapshot(ready=True, rsi=24.0, prev_rsi=26.0, cross_down_25=True)
-        self.assertIsNone(detect_dca_signal("short", snap))
-
-    def test_opposite_signal_while_long(self):
-        snap = RsiSnapshot(ready=True, rsi=74.0, prev_rsi=76.0, cross_down_75=True)
-        self.assertIsNone(detect_dca_signal("long", snap))
+    def test_should_not_take_profit_below_target(self):
+        self.assertFalse(should_take_profit("long", 100.0, 101.0, target_pct=2.0))
 
 
 if __name__ == "__main__":
