@@ -8,16 +8,16 @@ from src.bitget_client import (
     Position,
     cancel_all_pending_limits,
     close_positions,
-    configure_symbol_trading,
     fetch_contract_spec,
     fetch_futures_balance,
     fetch_order_detail,
     fetch_pending_orders,
     fetch_position,
-    has_credentials,
+    has_credentials as bitget_has_credentials,
     notional_to_size,
     place_market_order,
 )
+from src.exchange import ExchangeClientError, configure_symbol_trading, fetch_order_detail as exchange_fetch_order_detail
 from src.bot_state import update_symbol_status
 from src.config import LEVERAGE, MARGIN_MODE, ORDER_SIZE_USDT, TRADING_ENABLED
 from src.database import get_symbols, update_entry_by_order_id
@@ -139,7 +139,12 @@ def liquidate_all_and_reset(symbols: list[str]) -> float:
 
 
 def _parse_fill_price(detail: dict) -> float | None:
-    raw = detail.get("priceAvg") or detail.get("price_avg") or detail.get("averagePrice")
+    raw = (
+        detail.get("priceAvg")
+        or detail.get("price_avg")
+        or detail.get("averagePrice")
+        or detail.get("avgPrice")
+    )
     if raw is None or raw == "":
         return None
     try:
@@ -315,14 +320,14 @@ def _record_market_entry(
     filled = False
     if order_id:
         try:
-            detail = fetch_order_detail(symbol, order_id)
+            detail = exchange_fetch_order_detail(symbol, order_id)
             state = (detail.get("state") or detail.get("status") or "").lower()
             parsed = _parse_fill_price(detail)
             if parsed is not None:
                 fill_price = parsed
-            if state in {"filled", "partially_filled", "partial-fill"}:
+            if state in {"filled", "partially_filled", "partial-fill", "partially_filled"}:
                 filled = True
-        except BitgetClientError as exc:
+        except ExchangeClientError as exc:
             logging.warning("  [%s] Could not resolve market fill for %s: %s", symbol, order_id, exc)
 
     db.insert_entry(
@@ -347,7 +352,7 @@ def evaluate_and_trade(
     sar_signal: str | None,
     last_close: float,
 ) -> None:
-    if not has_credentials():
+    if not bitget_has_credentials():
         logging.warning("  [%s] Trading skipped: missing API credentials", symbol)
         return
 

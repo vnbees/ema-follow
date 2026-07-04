@@ -2,7 +2,7 @@ import logging
 import threading
 from datetime import datetime, timezone
 
-from src.bitget_client import BitgetClientError, fetch_top_futures_by_volume
+from src.exchange import ExchangeClientError, fetch_top_futures_by_volume
 
 _lock = threading.Lock()
 _volume_rank: list[tuple[str, float]] = []
@@ -15,7 +15,7 @@ def refresh_volume_rank() -> list[tuple[str, float]]:
     global _volume_rank, _last_refreshed
     try:
         rows = fetch_top_futures_by_volume(limit=None)
-    except BitgetClientError as exc:
+    except ExchangeClientError as exc:
         logging.warning("Failed to refresh volume rank: %s", exc)
         with _lock:
             return list(_volume_rank)

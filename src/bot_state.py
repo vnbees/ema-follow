@@ -56,6 +56,12 @@ class AccountBalance:
     pnl_pct: float | None = None
     profit_target_pct: float = 0.0
     baseline_updated_at: str = ""
+    maint_margin_pct: float | None = None
+    initial_margin_pct: float | None = None
+    margin_guard_tier: str = ""
+    margin_guard_scenario: str = ""
+    suggest_deposit_usdt: float | None = None
+    effective_tp_pct: float | None = None
 
 
 _lock = threading.Lock()
@@ -126,6 +132,12 @@ def update_account_balance(
     pnl_pct: float | None = None,
     profit_target_pct: float = 0.0,
     baseline_updated_at: str = "",
+    maint_margin_pct: float | None = None,
+    initial_margin_pct: float | None = None,
+    margin_guard_tier: str | None = None,
+    margin_guard_scenario: str | None = None,
+    suggest_deposit_usdt: float | None = None,
+    effective_tp_pct: float | None = None,
 ) -> None:
     with _lock:
         _account.available = available
@@ -143,6 +155,18 @@ def update_account_balance(
             _account.profit_target_pct = profit_target_pct
         if baseline_updated_at:
             _account.baseline_updated_at = baseline_updated_at
+        if maint_margin_pct is not None:
+            _account.maint_margin_pct = maint_margin_pct
+        if initial_margin_pct is not None:
+            _account.initial_margin_pct = initial_margin_pct
+        if margin_guard_tier is not None:
+            _account.margin_guard_tier = margin_guard_tier
+        if margin_guard_scenario is not None:
+            _account.margin_guard_scenario = margin_guard_scenario
+        if suggest_deposit_usdt is not None:
+            _account.suggest_deposit_usdt = suggest_deposit_usdt
+        if effective_tp_pct is not None:
+            _account.effective_tp_pct = effective_tp_pct
 
 
 def remove_symbol_status(symbol: str) -> None:
@@ -181,6 +205,12 @@ def get_account_balance() -> AccountBalance:
             pnl_pct=_account.pnl_pct,
             profit_target_pct=_account.profit_target_pct,
             baseline_updated_at=_account.baseline_updated_at,
+            maint_margin_pct=_account.maint_margin_pct,
+            initial_margin_pct=_account.initial_margin_pct,
+            margin_guard_tier=_account.margin_guard_tier,
+            margin_guard_scenario=_account.margin_guard_scenario,
+            suggest_deposit_usdt=_account.suggest_deposit_usdt,
+            effective_tp_pct=_account.effective_tp_pct,
         )
 
 

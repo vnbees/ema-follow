@@ -1,12 +1,7 @@
 import logging
 
 from src import database as db
-from src.bitget_client import (
-    BitgetClientError,
-    fetch_all_open_positions,
-    fetch_symbol_positions,
-    has_credentials,
-)
+from src.exchange import ExchangeClientError, fetch_all_open_positions, fetch_symbol_positions, has_credentials
 from src.config import LEGACY_MARGIN_USDT
 
 
@@ -29,7 +24,7 @@ def sync_exchange_positions() -> list[str]:
 
     try:
         all_positions = fetch_all_open_positions()
-    except BitgetClientError as exc:
+    except ExchangeClientError as exc:
         logging.warning("Exchange position sync failed: %s — using DB only", exc)
         return sorted(db_symbols)
 

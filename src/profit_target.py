@@ -2,8 +2,8 @@ import logging
 from datetime import datetime, timezone
 
 from src import database as db
-from src.bitget_client import (
-    BitgetClientError,
+from src.exchange import (
+    ExchangeClientError,
     fetch_futures_balance,
     fetch_total_unrealized_pnl,
     has_credentials,
@@ -12,7 +12,7 @@ from src.bot_state import get_account_balance, update_account_balance
 from src.config import PROFIT_TARGET_PCT, TRADING_ENABLED
 from src.rsi_positions import get_managed_symbols
 from src.market_universe import get_volume_ranked
-from src.trading import liquidate_all_and_reset
+from src.rsi_trading import liquidate_all_hedge_pairs
 
 
 def _symbols_for_pnl() -> list[str]:
@@ -76,8 +76,8 @@ def _record_profit_take_and_reset(
 ) -> float | None:
     liquidate_symbols = _liquidatable_symbols(symbols)
     try:
-        new_equity = liquidate_all_and_reset(liquidate_symbols)
-    except BitgetClientError as exc:
+        new_equity = liquidate_all_hedge_pairs(liquidate_symbols)
+    except ExchangeClientError as exc:
         logging.error("  Liquidation failed: %s", exc)
         return None
 
@@ -130,7 +130,7 @@ def check_profit_target(symbols: list[str]) -> bool:
     try:
         balance = fetch_futures_balance(symbols[0])
         unrealized_usdt, open_count = fetch_total_unrealized_pnl(symbols)
-    except BitgetClientError as exc:
+    except ExchangeClientError as exc:
         logging.warning("  Profit target check failed: %s", exc)
         return False
 
@@ -192,7 +192,7 @@ def trigger_manual_profit_take() -> dict:
     try:
         balance = fetch_futures_balance(symbols[0])
         unrealized_usdt, _ = fetch_total_unrealized_pnl(symbols)
-    except BitgetClientError as exc:
+    except ExchangeClientError as exc:
         return {"ok": False, "error": str(exc)}
 
     equity = balance.account_equity

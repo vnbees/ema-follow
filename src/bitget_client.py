@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import requests
 
 from src.bitget_auth import build_auth_headers, build_query_string
+from src.exchange.symbols import is_scan_symbol
 from src.config import (
     ACCOUNT_ENDPOINT,
     BITGET_API_BASE,
@@ -180,11 +181,26 @@ def _parse_candle(raw: list) -> Candle:
 
 
 def _parse_balance(data: dict) -> FuturesAccountBalance:
+    equity = float(data.get("accountEquity", 0) or 0)
+    maint = float(
+        data.get("unionMm")
+        or data.get("maintMargin")
+        or data.get("crossedMaintMargin")
+        or 0
+    )
+    initial = float(
+        data.get("unionIm")
+        or data.get("initialMargin")
+        or data.get("crossedInitialMargin")
+        or 0
+    )
     return FuturesAccountBalance(
         margin_coin=data.get("marginCoin", MARGIN_COIN),
         available=float(data.get("available", 0)),
-        account_equity=float(data.get("accountEquity", 0)),
+        account_equity=equity,
         usdt_equity=float(data.get("usdtEquity", 0)),
+        total_maint_margin=maint,
+        total_initial_margin=initial,
     )
 
 
@@ -208,7 +224,7 @@ def fetch_top_futures_by_volume(
     ranked: list[tuple[str, float]] = []
     for item in data:
         symbol = str(item.get("symbol", "")).upper()
-        if not symbol.endswith("USDT") or "_" in symbol:
+        if not is_scan_symbol(symbol):
             continue
         if item.get("deliveryTime"):
             continue

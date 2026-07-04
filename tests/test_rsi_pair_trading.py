@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from src.bitget_client import Position
+from src.exchange.types import Position
 from src.rsi import RsiSnapshot
 from src.rsi_trading import _scan_take_profits, evaluate_rsi_trade
 
@@ -80,6 +80,8 @@ class TestScanTakeProfits(unittest.TestCase):
 class TestEvaluateRsiTrade(unittest.TestCase):
     def test_no_cross_runs_cycle_scan_only(self):
         with (
+            patch("src.margin_guard.should_block_new_entries", return_value=False),
+            patch("src.margin_guard.effective_tp_pct", return_value=2.0),
             patch("src.rsi_trading._open_pair") as open_pair,
             patch("src.rsi_trading._scan_take_profits") as scan_tp,
             patch("src.rsi_trading._update_status"),
@@ -98,6 +100,8 @@ class TestEvaluateRsiTrade(unittest.TestCase):
 
     def test_cross_tp_then_no_stack(self):
         with (
+            patch("src.margin_guard.should_block_new_entries", return_value=False),
+            patch("src.margin_guard.effective_tp_pct", return_value=2.0),
             patch("src.rsi_trading._open_pair") as open_pair,
             patch("src.rsi_trading._scan_take_profits") as scan_tp,
             patch("src.rsi_trading._update_status"),
@@ -118,6 +122,8 @@ class TestEvaluateRsiTrade(unittest.TestCase):
 
     def test_cross_stack_when_no_tp(self):
         with (
+            patch("src.margin_guard.should_block_new_entries", return_value=False),
+            patch("src.margin_guard.effective_tp_pct", return_value=2.0),
             patch("src.rsi_trading._open_pair") as open_pair,
             patch("src.rsi_trading._scan_take_profits", return_value=False),
             patch("src.rsi_trading.db.symbol_has_open_lots", return_value=True),
@@ -137,6 +143,8 @@ class TestEvaluateRsiTrade(unittest.TestCase):
 
     def test_first_pair_entry_for_new_symbol(self):
         with (
+            patch("src.margin_guard.should_block_new_entries", return_value=False),
+            patch("src.margin_guard.effective_tp_pct", return_value=2.0),
             patch("src.rsi_trading._open_pair") as open_pair,
             patch("src.rsi_trading._scan_take_profits", return_value=False),
             patch("src.rsi_trading.db.symbol_has_open_lots", return_value=False),

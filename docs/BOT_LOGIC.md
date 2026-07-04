@@ -1,6 +1,29 @@
-# Tổng hợp logic bot RSI hedged (Bitget USDT-M)
+# Tổng hợp logic bot RSI hedged (USDT-M)
 
 Bot chạy vòng **5 phút**, chiến lược **cặp long + short** (hedge mode), tín hiệu **RSI(14)** trên nến **5m**, chốt lãi theo **% giá** (mặc định 2%).
+
+Hỗ trợ **Bitget** hoặc **Binance** USDT-M qua `EXCHANGE=bitget|binance`.
+
+---
+
+## 0. Multi-exchange
+
+| Env | Ý nghĩa |
+|-----|---------|
+| `EXCHANGE=bitget` | Default — Bitget USDT-M |
+| `EXCHANGE=binance` | Binance USDT-M mainnet (`fapi.binance.com`) |
+| `BITGET_*` | API key Bitget (passphrase bắt buộc) |
+| `BINANCE_API_KEY` / `BINANCE_SECRET_KEY` | API key Binance Futures |
+
+**Checklist đổi sàn:**
+
+1. Tắt bot (`TRADING_ENABLED=false` hoặc Ctrl+C)
+2. Đổi `EXCHANGE` + credentials tương ứng
+3. Dùng `DATABASE_PATH` riêng hoặc `clear_dashboard_history()` — tránh lot lẫn sàn
+4. Binance: bật **Hedge Mode** (Dual Side Position) trên app; API key cần quyền **Futures**
+5. Restart `python -m src.main`
+
+Code: [`src/exchange/`](src/exchange/) — facade; Bitget adapter bọc [`src/bitget_client.py`](src/bitget_client.py); Binance tại [`src/exchange/binance.py`](src/exchange/binance.py).
 
 ---
 
@@ -16,7 +39,7 @@ flowchart TB
     main --> scan["Quét coin mới theo volume"]
     managed --> eval["evaluate_rsi_trade"]
     scan --> eval
-    eval --> bitget["Bitget API hedge mode"]
+    eval --> exchange["Exchange API hedge mode"]
     eval --> db["rsi_pair_lots DB"]
     main --> web["Dashboard :8080"]
 ```
@@ -29,7 +52,8 @@ flowchart TB
 | `rsi_positions.py` | Sync sàn ↔ DB, danh sách symbol quản lý |
 | `order_sizing.py` | Tính margin/size từ equity |
 | `database.py` | Bảng `rsi_pair_lots` — FIFO từng lần vào cặp |
-| `bitget_client.py` | Hedge mode, long/short riêng |
+| `src/exchange/` | Facade Bitget / Binance, hedge orders |
+| `src/bitget_client.py` | Bitget REST (legacy EMA path) |
 
 **Đã bỏ:** RSI 1 chiều, DCA, thoát RSI 75/25, manual hold.
 
@@ -43,7 +67,7 @@ flowchart TB
 4. Bật **dashboard** FastAPI port `WEB_PORT` (8080)
 5. Vòng lặp vô hạn: `run_cycle()` → sleep đến **mốc 5 phút** tiếp theo
 
-**Yêu cầu:** API Bitget + **hedge mode** trên tài khoản. `TRADING_ENABLED=false` → chỉ sync/dashboard, không đặt lệnh.
+**Yêu cầu:** API sàn đang chọn + **hedge mode** trên tài khoản. `TRADING_ENABLED=false` → chỉ sync/dashboard, không đặt lệnh.
 
 ---
 
@@ -65,7 +89,7 @@ sequenceDiagram
     loop Mỗi symbol managed
         C->>M: run_analysis → evaluate_rsi_trade
     end
-    alt count_open_symbols < 40
+    alt count_open_symbols < 20
         loop Volume rank (dừng khi có cross)
             C->>S: scan_only symbol mới
         end
@@ -79,7 +103,7 @@ sequenceDiagram
 2. **Sync** vị thế sàn → cập nhật danh sách symbol đang track
 3. Nếu `PROFIT_TARGET_PCT > 0` và unrealized/equity đạt ngưỡng → **đóng hết** mọi symbol, reset baseline, **bỏ qua** cycle
 4. Với **mỗi symbol đang track**: tính RSI + `evaluate_rsi_trade` (luôn chạy, kể cả không cross)
-5. Nếu còn slot symbol (`< 40`): quét volume từ đầu, **dừng ngay** coin đầu tiên có RSI cross (mở cặp qua bước 4 của symbol đó)
+5. Nếu còn slot symbol (`< 20`): quét volume từ đầu, **dừng ngay** coin đầu tiên có RSI cross (mở cặp qua bước 4 của symbol đó)
 6. Log balance + cập nhật dashboard state
 
 **Symbol được track** = có lot open trong DB **hoặc** còn size trên sàn (sau `sync_exchange_positions`).
@@ -106,8 +130,8 @@ Margin **tính lại mỗi lần** `_open_pair` theo equity lúc đó. Mỗi lot
 
 **Giới hạn exposure (lý thuyết tối đa):**
 
-- `MAX_OPEN_SYMBOLS=40` → tối đa **40 coin**
-- Mỗi coin có thể **nhiều lot** (stack) → margin thực tế có thể cao hơn 40×2 leg nếu stack nhiều lần
+- `MAX_OPEN_SYMBOLS=20` → tối đa **20 coin**
+- Mỗi coin có thể **nhiều lot** (stack) → margin thực tế có thể cao hơn 20×2 leg nếu stack nhiều lần
 
 ---
 
@@ -220,7 +244,7 @@ Nếu **không** chốt trên cross:
 
 - Đã có lot → **stack** thêm 1 cặp (`{trigger}_stack`)
 - Chưa có lot + còn slot → **entry đầu**
-- Đủ 40 symbol → skip
+- Đủ 20 symbol → skip
 
 ### So sánh cycle vs cross
 
@@ -249,8 +273,8 @@ Nếu có RSI cross 25/75:
 5. Nếu đã chốt ở bước 4 → return (không stack thêm)
 6. Nếu không chốt:
    - Symbol đã có lot → stack thêm 1 cặp ({trigger}_stack)
-   - Symbol mới + count_open_symbols() < 40 → entry cặp đầu
-   - Đầy 40 symbol → skip, log
+   - Symbol mới + count_open_symbols() < 20 → entry cặp đầu
+   - Đầy 20 symbol → skip, log
 ```
 
 ---
@@ -281,8 +305,8 @@ Mỗi lần `_open_pair` = **1 lot** (1 row):
 
 | Config | Mặc định | Ý nghĩa |
 |--------|----------|---------|
-| `MAX_OPEN_SYMBOLS` | 40 | Tối đa 40 coin có lot open |
-| Volume scan | Toàn bộ USDT-M | Chỉ khi `count_open_symbols < 40` |
+| `MAX_OPEN_SYMBOLS` | 20 | Tối đa 20 coin có lot open |
+| Volume scan | Toàn bộ USDT-M | Chỉ khi `count_open_symbols < 20` |
 
 **Stack:** không giới hạn số lot/symbol — chỉ giới hạn **số symbol distinct**.
 
@@ -313,10 +337,18 @@ Manual hold UI đã **bỏ**.
 ## 14. Config `.env` quan trọng
 
 ```env
-# Bắt buộc trade
+EXCHANGE=bitget              # hoặc binance
+
+# Bitget
 BITGET_API_KEY=
-BITGET_SECRET=
+BITGET_SECRET_KEY=
 BITGET_PASSPHRASE=
+
+# Binance USDT-M
+BINANCE_API_KEY=
+BINANCE_SECRET_KEY=
+BINANCE_API_BASE=https://fapi.binance.com
+
 TRADING_ENABLED=true
 
 # Vốn
@@ -326,7 +358,7 @@ LEVERAGE=10
 MARGIN_MODE=crossed
 
 # Chiến lược
-MAX_OPEN_SYMBOLS=40
+MAX_OPEN_SYMBOLS=20
 PAIR_PROFIT_TARGET_PCT=2   # Chốt lãi theo % giá
 GRANULARITY=5m
 INTERVAL_MINUTES=5
@@ -352,7 +384,7 @@ DATABASE_PATH=data/bot.db
 
 ## 16. Tóm tắt hành vi
 
-Bot **mỗi 5 phút** sync và **quét chốt ≥2%** mọi leg (chỉ đóng, không mở thêm). Khi **RSI cắt 25 hoặc 75**, nếu đủ điều kiện thì **chốt + mở lại cặp**, hoặc **stack cặp** nếu không chốt. Mỗi lần vào dùng **0.5% equity/leg**, tối đa **40 coin**, hedge **long+short** song song, theo dõi từng lần vào bằng **lot FIFO** trong DB.
+Bot **mỗi 5 phút** sync và **quét chốt ≥2%** mọi leg (chỉ đóng, không mở thêm). Khi **RSI cắt 25 hoặc 75**, nếu đủ điều kiện thì **chốt + mở lại cặp**, hoặc **stack cặp** nếu không chốt. Mỗi lần vào dùng **0.5% equity/leg**, tối đa **20 coin**, hedge **long+short** song song, theo dõi từng lần vào bằng **lot FIFO** trong DB.
 
 ---
 
@@ -365,7 +397,9 @@ Bot **mỗi 5 phút** sync và **quét chốt ≥2%** mọi leg (chỉ đóng, k
 | `src/rsi_signals.py` | `detect_pair_event`, `should_take_profit` |
 | `src/rsi_positions.py` | `sync_exchange_positions`, adopt |
 | `src/order_sizing.py` | `compute_entry_margin_usdt` |
-| `src/bitget_client.py` | Hedge orders, `_market_order_side` |
+| `src/exchange/__init__.py` | Facade, `get_client()` |
+| `src/exchange/binance.py` | Binance USDT-M client |
+| `src/bitget_client.py` | Bitget REST (adapter + legacy) |
 | `src/database.py` | `rsi_pair_lots`, `clear_dashboard_history` |
 | `src/profit_target.py` | Chốt toàn portfolio |
 | `src/web/app.py` | Dashboard `symbol_groups` |

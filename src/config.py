@@ -32,10 +32,22 @@ LEGACY_MARGIN_USDT = float(os.getenv("LEGACY_MARGIN_USDT", "5"))
 MARGIN_MODE = os.getenv("MARGIN_MODE", "crossed")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() in ("1", "true", "yes")
-MAX_OPEN_SYMBOLS = int(os.getenv("MAX_OPEN_SYMBOLS", os.getenv("MAX_OPEN_POSITIONS", "40")))
+MAX_OPEN_SYMBOLS = int(os.getenv("MAX_OPEN_SYMBOLS", os.getenv("MAX_OPEN_POSITIONS", "20")))
 MAX_OPEN_POSITIONS = MAX_OPEN_SYMBOLS
 MAX_OPEN_LEGS = MAX_OPEN_SYMBOLS * 2
 PAIR_PROFIT_TARGET_PCT = float(os.getenv("PAIR_PROFIT_TARGET_PCT", "2"))
+
+MARGIN_GUARD_ENABLED = os.getenv("MARGIN_GUARD_ENABLED", "true").lower() in ("1", "true", "yes")
+MARGIN_MAINT_OK_PCT = float(os.getenv("MARGIN_MAINT_OK_PCT", "15"))
+MARGIN_MAINT_WARN_PCT = float(os.getenv("MARGIN_MAINT_WARN_PCT", "20"))
+MARGIN_MAINT_HIGH_PCT = float(os.getenv("MARGIN_MAINT_HIGH_PCT", "25"))
+MARGIN_MAINT_CRITICAL_PCT = float(os.getenv("MARGIN_MAINT_CRITICAL_PCT", "35"))
+MARGIN_MAINT_DELEVERAGE_PCT = float(os.getenv("MARGIN_MAINT_DELEVERAGE_PCT", "30"))
+MARGIN_HIGH_TP_PCT = float(os.getenv("MARGIN_HIGH_TP_PCT", "1"))
+MARGIN_DEPOSIT_TARGET_PCT = float(os.getenv("MARGIN_DEPOSIT_TARGET_PCT", "18"))
+MARGIN_ELEVATED_CYCLE_LIMIT = int(os.getenv("MARGIN_ELEVATED_CYCLE_LIMIT", "3"))
+MARGIN_HIGH_CYCLE_LIMIT = int(os.getenv("MARGIN_HIGH_CYCLE_LIMIT", "2"))
+MARGIN_IMPROVEMENT_PCT = float(os.getenv("MARGIN_IMPROVEMENT_PCT", "0.3"))
 
 
 def order_notional_usdt() -> float:
@@ -81,3 +93,13 @@ MARGIN_COIN = "USDT"
 BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
 BITGET_SECRET_KEY = os.getenv("BITGET_SECRET_KEY", "")
 BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
+
+_EXCHANGE_RAW = os.getenv("EXCHANGE", "bitget").strip().lower()
+if _EXCHANGE_RAW not in ("bitget", "binance"):
+    _EXCHANGE_RAW = "bitget"
+EXCHANGE = _EXCHANGE_RAW
+EXCHANGE_DISPLAY_NAME = "Binance" if EXCHANGE == "binance" else "Bitget"
+
+BINANCE_API_BASE = os.getenv("BINANCE_API_BASE", "https://fapi.binance.com")
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import uvicorn
 
-from src.bitget_client import BitgetClientError, fetch_candles, fetch_futures_balance, has_credentials
+from src.exchange import ExchangeClientError, fetch_candles, fetch_futures_balance, has_credentials
 from src.bot_state import clear_stale_signal_statuses, update_account_balance
 from src.candles import get_closed_candles, get_last_closed_candle
 from src.config import (
@@ -18,6 +18,7 @@ from src.config import (
     ORDER_MARGIN_PCT,
     PAIR_PROFIT_TARGET_PCT,
     PROFIT_TARGET_PCT,
+    EXCHANGE_DISPLAY_NAME,
     RSI_MIN_CANDLES,
     RSI_PERIOD,
     TRADING_ENABLED,
@@ -29,7 +30,9 @@ from src.market_universe import refresh_volume_rank, set_scan_progress
 from src.profit_target import check_profit_target, refresh_account_profit_info
 from src.rsi import get_rsi_snapshot
 from src.rsi_signals import detect_entry_signal
-from src.rsi_trading import can_open_new_symbol, evaluate_rsi_trade
+from src.rsi_trading import can_open_new_symbol, close_all_blocked_symbols, evaluate_rsi_trade
+from src.exchange.symbols import is_tradeable_symbol
+from src.margin_guard import get_margin_guard_state, process_margin_guard_cycle, refresh_margin_dashboard_fields
 from src.rsi_positions import get_managed_symbols, get_open_position_count, restore_tracked_positions
 from src.trend import candle_color
 from src.web.app import app as web_app
@@ -74,14 +77,23 @@ def log_futures_balance_once(symbol: str) -> None:
         balance = fetch_futures_balance(symbol)
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         logging.info(
-            "  Futures balance: available=%.2f %s | equity=%.2f %s | usdt_equity=%.2f",
+            "  Futures balance: available=%.2f %s | equity=%.2f %s | maint=%.2f%% | initial=%.2f%%",
             balance.available,
             balance.margin_coin,
             balance.account_equity,
             balance.margin_coin,
-            balance.usdt_equity,
+            balance.maint_margin_pct,
+            balance.initial_margin_pct,
         )
         update_account_balance(
+            balance.available,
+            balance.account_equity,
+            balance.margin_coin,
+            now_str,
+            maint_margin_pct=balance.maint_margin_pct,
+            initial_margin_pct=balance.initial_margin_pct,
+        )
+        refresh_margin_dashboard_fields(
             balance.available,
             balance.account_equity,
             balance.margin_coin,
@@ -94,7 +106,7 @@ def log_futures_balance_once(symbol: str) -> None:
             balance.margin_coin,
             now_str,
         )
-    except BitgetClientError as exc:
+    except ExchangeClientError as exc:
         logging.warning("  Futures balance: failed to fetch (%s)", exc)
 
 
@@ -102,7 +114,7 @@ def _fetch_rsi_snapshot(symbol: str):
     candles = fetch_candles(symbol=symbol, granularity=GRANULARITY, limit=CANDLE_LIMIT)
     closed = get_closed_candles(candles, interval_minutes=INTERVAL_MINUTES)
     if len(closed) < RSI_MIN_CANDLES:
-        raise BitgetClientError(
+        raise ExchangeClientError(
             f"Need at least {RSI_MIN_CANDLES} closed {GRANULARITY} candles, got {len(closed)}"
         )
     snap = get_rsi_snapshot(closed)
@@ -157,7 +169,7 @@ def run_analysis_for_symbol(
 
     try:
         evaluate_rsi_trade(symbol, snap, signal)
-    except BitgetClientError as exc:
+    except ExchangeClientError as exc:
         logging.error("  [%s] Trading failed: %s", symbol, exc)
 
     if signal_side:
@@ -168,7 +180,15 @@ def run_analysis_for_symbol(
 def run_cycle() -> None:
     ranked = refresh_volume_rank()
     if not ranked:
-        logging.warning("Volume rank empty — could not fetch Bitget tickers")
+        logging.warning("Volume rank empty — could not fetch tickers")
+        return
+
+    close_all_blocked_symbols()
+
+    guard = process_margin_guard_cycle(ranked[0][0])
+    if guard.skip_cycle:
+        log_futures_balance_once(ranked[0][0])
+        logging.info("  Cycle skipped after margin critical liquidation")
         return
 
     managed_symbols = get_managed_symbols()
@@ -185,19 +205,22 @@ def run_cycle() -> None:
     for symbol in cycle_symbols:
         try:
             run_analysis_for_symbol(symbol)
-        except BitgetClientError as exc:
+        except ExchangeClientError as exc:
             logging.error("[%s] Position management failed: %s", symbol, exc)
 
     signal_symbol = ""
     checked = 0
-    if can_open_new_symbol():
+    block_scan = get_margin_guard_state().block_new_entries
+    if can_open_new_symbol() and not block_scan:
         for rank, (symbol, _volume) in enumerate(ranked, 1):
             if symbol in scanned:
+                continue
+            if not is_tradeable_symbol(symbol):
                 continue
             checked += 1
             try:
                 result = run_analysis_for_symbol(symbol, scan_only=True, scan_rank=rank)
-            except BitgetClientError as exc:
+            except ExchangeClientError as exc:
                 logging.error("[%s] Scan failed: %s", symbol, exc)
                 continue
             if result:
@@ -212,11 +235,17 @@ def run_cycle() -> None:
                 )
                 break
     else:
-        logging.info(
-            "Max open symbols reached (%d/%d) — skip scan for new entries",
-            get_open_position_count(),
-            MAX_OPEN_SYMBOLS,
-        )
+        if block_scan:
+            logging.info(
+                "  Margin guard — skip scan for new entries (tier=%s)",
+                get_margin_guard_state().tier,
+            )
+        else:
+            logging.info(
+                "Max open symbols reached (%d/%d) — skip scan for new entries",
+                get_open_position_count(),
+                MAX_OPEN_SYMBOLS,
+            )
 
     set_scan_progress(checked, signal_symbol)
     if not signal_symbol and not cycle_symbols:
@@ -240,7 +269,9 @@ def main() -> None:
     init_db()
     restore_tracked_positions()
     ranked = refresh_volume_rank()
-    logging.info("Bitget RSI Bot started")
+    if TRADING_ENABLED and has_credentials():
+        close_all_blocked_symbols()
+    logging.info("%s RSI Bot started", EXCHANGE_DISPLAY_NAME)
     logging.info("Dashboard: http://localhost:%d", WEB_PORT)
     logging.info(
         "Scan mode: TP %.1f%% mỗi cycle (đóng only) | cross 25/75: TP+reopen/stack | max %d symbols",

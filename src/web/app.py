@@ -7,20 +7,21 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from src import database as db
-from src.bitget_client import (
-    BitgetClientError,
+from src.exchange import (
+    ExchangeClientError,
     fetch_side_mark_price,
     fetch_side_unrealized_pnl,
     fetch_symbol_positions,
     has_credentials,
 )
-from src.config import MAX_OPEN_LEGS, MAX_OPEN_SYMBOLS, PAIR_PROFIT_TARGET_PCT, PROFIT_TARGET_PCT
+from src.config import EXCHANGE_DISPLAY_NAME, MAX_OPEN_LEGS, MAX_OPEN_SYMBOLS, PAIR_PROFIT_TARGET_PCT, PROFIT_TARGET_PCT
 from src.rsi_signals import price_move_pct, should_take_profit
 from src.bot_state import (
     get_account_balance,
     get_all_statuses,
     status_to_dict,
 )
+from src.margin_guard import get_margin_guard_state
 from src.market_universe import get_last_refreshed, get_scan_stats
 from src.orderflow import live_state_to_dict
 from src.pnl import estimate_tp_pnl_usdt, leg_realized_pnl, leg_unrealized_pnl, roi_pct
@@ -32,7 +33,7 @@ TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.filters["vn_time"] = format_vn_time
 
-app = FastAPI(title="Bitget RSI Bot Dashboard")
+app = FastAPI(title=f"{EXCHANGE_DISPLAY_NAME} RSI Bot Dashboard")
 
 
 def _fetch_symbol_marks(symbols: list[str]) -> dict[str, float]:
@@ -42,7 +43,7 @@ def _fetch_symbol_marks(symbols: list[str]) -> dict[str, float]:
     for symbol in symbols:
         try:
             result[symbol] = fetch_side_mark_price(symbol)
-        except BitgetClientError:
+        except ExchangeClientError:
             result[symbol] = 0.0
     return result
 
@@ -56,7 +57,7 @@ def _fetch_open_unrealized_by_symbol(symbols: list[str]) -> dict[str, float]:
             long_pnl = fetch_side_unrealized_pnl(symbol, "long")
             short_pnl = fetch_side_unrealized_pnl(symbol, "short")
             result[symbol] = long_pnl + short_pnl
-        except BitgetClientError:
+        except ExchangeClientError:
             result[symbol] = 0.0
     return result
 
@@ -204,7 +205,7 @@ def _fetch_agg_for_symbol(symbol: str, mark: float) -> tuple[dict, dict]:
             _build_agg_side("long", positions["long"].size, positions["long"].avg_price, mark),
             _build_agg_side("short", positions["short"].size, positions["short"].avg_price, mark),
         )
-    except BitgetClientError:
+    except ExchangeClientError:
         return (
             _build_agg_side("long", 0, 0, mark),
             _build_agg_side("short", 0, 0, mark),
@@ -355,12 +356,21 @@ def _dashboard_context(
     cal_year, cal_month = _resolve_calendar_month(year, month)
     pnl_calendar = _build_pnl_calendar_payload(cal_year, cal_month)
     selected_day = day if day is not None and 1 <= day <= 31 else None
+    account = get_account_balance()
+    margin_guard = get_margin_guard_state()
+    effective_tp = (
+        margin_guard.effective_tp_pct
+        if margin_guard.effective_tp_pct
+        else PAIR_PROFIT_TARGET_PCT
+    )
 
     return {
+        "exchange_name": EXCHANGE_DISPLAY_NAME,
         "symbol_groups": symbol_groups,
         "max_open_symbols": MAX_OPEN_SYMBOLS,
         "max_open_legs": MAX_OPEN_LEGS,
-        "profit_target_pct": PAIR_PROFIT_TARGET_PCT,
+        "profit_target_pct": effective_tp,
+        "base_profit_target_pct": PAIR_PROFIT_TARGET_PCT,
         "pnl_summary": pnl_summary,
         "open_count": open_count,
         "closed_count": closed_count,
@@ -371,6 +381,8 @@ def _dashboard_context(
         "selected_day": selected_day,
         "cal_year": cal_year,
         "cal_month": cal_month,
+        "account": account,
+        "margin_guard": margin_guard,
     }
 
 
