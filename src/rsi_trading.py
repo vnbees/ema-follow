@@ -21,6 +21,7 @@ from src.bot_state import update_symbol_status
 from src.config import (
     LEVERAGE,
     MARGIN_MODE,
+    MARGIN_PREFLIGHT_ENABLED,
     MAX_OPEN_SYMBOLS,
     PAIR_PROFIT_TARGET_PCT,
     TRADING_ENABLED,
@@ -206,25 +207,55 @@ def _open_pair(symbol: str, snap: RsiSnapshot, trigger: str) -> int | None:
     if not is_tradeable_symbol(symbol):
         logging.info("  [%s] Blocked symbol — skip open pair", symbol)
         return None
+
+    if MARGIN_PREFLIGHT_ENABLED:
+        from src.margin_preflight import ensure_available_for_pair
+
+        if not ensure_available_for_pair(symbol, snap, trigger):
+            logging.warning(
+                "  [%s] Skip open pair — insufficient available after preflight",
+                symbol,
+            )
+            return None
+
     balance = fetch_futures_balance(symbol)
     margin_usdt = compute_entry_margin_usdt(balance.account_equity)
     price = snap.close if snap.close > 0 else fetch_side_mark_price(symbol)
     size_str = _size_for_margin(symbol, margin_usdt, price)
 
     logging.info(
-        "  [%s] Open pair L+S | trigger=%s | margin/leg=%.2f USDT | size=%s",
+        "  [%s] Open pair L+S | trigger=%s | margin/leg=%.2f USDT | size=%s | available=%.2f",
         symbol,
         trigger,
         margin_usdt,
         size_str,
+        balance.available,
     )
 
     long_result = place_market_order(
         symbol, "buy", size_str, hold_side="long", trade_side="open",
     )
-    short_result = place_market_order(
-        symbol, "sell", size_str, hold_side="short", trade_side="open",
-    )
+    try:
+        short_result = place_market_order(
+            symbol, "sell", size_str, hold_side="short", trade_side="open",
+        )
+    except ExchangeClientError as exc:
+        logging.error(
+            "  [%s] Short open failed — rollback long size=%s: %s",
+            symbol,
+            size_str,
+            exc,
+        )
+        try:
+            close_position_side(symbol, "long", size_str)
+            _verify_side_reduced(symbol, "long", float(size_str))
+        except ExchangeClientError as rollback_exc:
+            logging.error(
+                "  [%s] Long rollback failed after short error: %s",
+                symbol,
+                rollback_exc,
+            )
+        raise
 
     trade_state = _get_state(symbol)
     long_oid = str(long_result.get("orderId", ""))
@@ -315,6 +346,49 @@ def _estimate_leg_pnl(side: str, entry: float, mark: float, size: float) -> floa
     return (entry - mark) * size
 
 
+def close_lot_leg(
+    symbol: str,
+    lot,
+    side: str,
+    mark: float,
+    trigger: str,
+) -> None:
+    if side == "long":
+        if lot["long_status"] != "open":
+            return
+        entry = float(lot["long_entry"])
+        size = float(lot["long_size"])
+    else:
+        if lot["short_status"] != "open":
+            return
+        entry = float(lot["short_entry"])
+        size = float(lot["short_size"])
+    if size <= 0:
+        return
+
+    size_str = _format_close_size(symbol, size)
+    pnl = _estimate_leg_pnl(side, entry, mark, size)
+    move = price_move_pct(side, entry, mark)
+    logging.info(
+        "  [%s] Lot #%d close %s | trigger=%s | move=%+.2f%% | size=%s | pnl≈%+.2f",
+        symbol,
+        lot["id"],
+        side.upper(),
+        trigger,
+        move,
+        size_str,
+        pnl,
+    )
+    close_position_side(symbol, side, size_str)
+    _verify_side_reduced(symbol, side, size)
+    db.close_lot_side(
+        int(lot["id"]),
+        side,
+        realized_pnl_usdt=pnl,
+        close_price=mark,
+    )
+
+
 def _take_profit_lot_side(
     symbol: str,
     lot,
@@ -338,26 +412,7 @@ def _take_profit_lot_side(
     if size <= 0 or not should_take_profit(side, entry, mark):
         return
 
-    size_str = _format_close_size(symbol, size)
-    pnl = _estimate_leg_pnl(side, entry, mark, size)
-    move = price_move_pct(side, entry, mark)
-    logging.info(
-        "  [%s] Lot #%d take profit %s | trigger=%s | move=%+.2f%% | size=%s",
-        symbol,
-        lot["id"],
-        side.upper(),
-        trigger,
-        move,
-        size_str,
-    )
-    close_position_side(symbol, side, size_str)
-    _verify_side_reduced(symbol, side, size)
-    db.close_lot_side(
-        int(lot["id"]),
-        side,
-        realized_pnl_usdt=pnl,
-        close_price=mark,
-    )
+    close_lot_leg(symbol, lot, side, mark, trigger)
     if reopen_pair and is_tradeable_symbol(symbol):
         _open_pair(symbol, snap, f"{trigger}_tp_lot{lot['id']}_{side}")
 

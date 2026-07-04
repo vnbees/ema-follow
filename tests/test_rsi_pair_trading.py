@@ -82,6 +82,7 @@ class TestEvaluateRsiTrade(unittest.TestCase):
         with (
             patch("src.margin_guard.should_block_new_entries", return_value=False),
             patch("src.margin_guard.effective_tp_pct", return_value=2.0),
+            patch("src.rsi_trading.MARGIN_PREFLIGHT_ENABLED", False),
             patch("src.rsi_trading._open_pair") as open_pair,
             patch("src.rsi_trading._scan_take_profits") as scan_tp,
             patch("src.rsi_trading._update_status"),
@@ -102,6 +103,7 @@ class TestEvaluateRsiTrade(unittest.TestCase):
         with (
             patch("src.margin_guard.should_block_new_entries", return_value=False),
             patch("src.margin_guard.effective_tp_pct", return_value=2.0),
+            patch("src.rsi_trading.MARGIN_PREFLIGHT_ENABLED", False),
             patch("src.rsi_trading._open_pair") as open_pair,
             patch("src.rsi_trading._scan_take_profits") as scan_tp,
             patch("src.rsi_trading._update_status"),
@@ -124,6 +126,7 @@ class TestEvaluateRsiTrade(unittest.TestCase):
         with (
             patch("src.margin_guard.should_block_new_entries", return_value=False),
             patch("src.margin_guard.effective_tp_pct", return_value=2.0),
+            patch("src.rsi_trading.MARGIN_PREFLIGHT_ENABLED", False),
             patch("src.rsi_trading._open_pair") as open_pair,
             patch("src.rsi_trading._scan_take_profits", return_value=False),
             patch("src.rsi_trading.db.symbol_has_open_lots", return_value=True),
@@ -145,6 +148,7 @@ class TestEvaluateRsiTrade(unittest.TestCase):
         with (
             patch("src.margin_guard.should_block_new_entries", return_value=False),
             patch("src.margin_guard.effective_tp_pct", return_value=2.0),
+            patch("src.rsi_trading.MARGIN_PREFLIGHT_ENABLED", False),
             patch("src.rsi_trading._open_pair") as open_pair,
             patch("src.rsi_trading._scan_take_profits", return_value=False),
             patch("src.rsi_trading.db.symbol_has_open_lots", return_value=False),

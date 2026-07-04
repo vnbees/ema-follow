@@ -49,6 +49,10 @@ MARGIN_ELEVATED_CYCLE_LIMIT = int(os.getenv("MARGIN_ELEVATED_CYCLE_LIMIT", "3"))
 MARGIN_HIGH_CYCLE_LIMIT = int(os.getenv("MARGIN_HIGH_CYCLE_LIMIT", "2"))
 MARGIN_IMPROVEMENT_PCT = float(os.getenv("MARGIN_IMPROVEMENT_PCT", "0.3"))
 
+MARGIN_PREFLIGHT_ENABLED = os.getenv("MARGIN_PREFLIGHT_ENABLED", "true").lower() in ("1", "true", "yes")
+MARGIN_PREFLIGHT_BUFFER_PCT = float(os.getenv("MARGIN_PREFLIGHT_BUFFER_PCT", "10"))
+MARGIN_PREFLIGHT_MAX_CLOSES = int(os.getenv("MARGIN_PREFLIGHT_MAX_CLOSES", "10"))
+
 
 def order_notional_usdt() -> float:
     """Legacy helper: fixed margin × leverage (prefer order_sizing module)."""
