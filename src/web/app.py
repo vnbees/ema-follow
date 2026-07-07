@@ -19,6 +19,9 @@ from src.rsi_signals import price_move_pct, should_take_profit
 from src.bot_state import (
     get_account_balance,
     get_all_statuses,
+    get_last_cycle_at,
+    is_trading_enabled,
+    set_trading_enabled,
     status_to_dict,
 )
 from src.margin_guard import get_margin_guard_state
@@ -337,6 +340,50 @@ def _build_pnl_calendar_payload(year: int, month: int) -> dict:
     return calendar
 
 
+def _build_recent_orders(limit: int = 10) -> list[dict]:
+    rows = db.get_recent_leg_events(limit)
+    orders: list[dict] = []
+    for row in rows:
+        event_type = str(row["event_type"])
+        side = str(row["side"])
+        entry = float(row["entry"] or 0)
+        size = float(row["size"] or 0)
+        pnl = None
+        if event_type == "close":
+            pnl = leg_realized_pnl(
+                side,
+                entry,
+                size,
+                realized_pnl_usdt=row["realized_pnl_usdt"],
+                close_price=row["close_price"],
+            )
+        orders.append(
+            {
+                "time_vn": format_vn_time(str(row["event_at"])),
+                "action": "Mở" if event_type == "open" else "Đóng",
+                "symbol": str(row["symbol"]),
+                "side": side.upper(),
+                "size": size,
+                "entry": entry,
+                "pnl": pnl,
+                "trigger": row["entry_trigger"] or "—",
+                "lot_id": int(row["lot_id"]),
+            }
+        )
+    return orders
+
+
+def _simple_dashboard_context() -> dict:
+    account = get_account_balance()
+    return {
+        "exchange_name": EXCHANGE_DISPLAY_NAME,
+        "account": account,
+        "recent_orders": _build_recent_orders(10),
+        "last_cycle_at": get_last_cycle_at(),
+        "trading_enabled": is_trading_enabled(),
+    }
+
+
 def _dashboard_context(
     year: int | None,
     month: int | None,
@@ -387,16 +434,11 @@ def _dashboard_context(
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard(
-    request: Request,
-    year: int | None = Query(default=None),
-    month: int | None = Query(default=None),
-    day: int | None = Query(default=None),
-) -> HTMLResponse:
+def dashboard(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
         request,
         "index.html",
-        _dashboard_context(year, month, day),
+        _simple_dashboard_context(),
     )
 
 
@@ -473,6 +515,18 @@ def api_status() -> dict:
 @app.get("/api/symbols")
 def api_symbols() -> list[str]:
     return sorted({row["symbol"] for row in db.get_all_open_pair_lots()})
+
+
+@app.post("/settings/trading/start")
+def form_start_trading() -> RedirectResponse:
+    set_trading_enabled(True)
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/settings/trading/stop")
+def form_stop_trading() -> RedirectResponse:
+    set_trading_enabled(False)
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.post("/settings/profit-take/trigger")

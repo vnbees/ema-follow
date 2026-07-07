@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass, field
 
 from src import database as db
-from src.bot_state import update_account_balance
+from src.bot_state import is_trading_enabled, update_account_balance
 from src.config import (
     MARGIN_DEPOSIT_TARGET_PCT,
     MARGIN_ELEVATED_CYCLE_LIMIT,
@@ -23,6 +23,14 @@ from src.config import (
     TRADING_ENABLED,
 )
 from src.exchange import ExchangeClientError, fetch_futures_balance, has_credentials
+
+_CONFIG_TRADING_ENABLED = TRADING_ENABLED
+
+
+def _trading_enabled() -> bool:
+    if TRADING_ENABLED != _CONFIG_TRADING_ENABLED:
+        return bool(TRADING_ENABLED)
+    return is_trading_enabled()
 
 
 @dataclass
@@ -185,7 +193,7 @@ def process_margin_guard_cycle(symbol: str) -> MarginGuardState:
     _guard_state.skip_cycle = False
     _guard_state.suggest_deposit_usdt = None
 
-    if not MARGIN_GUARD_ENABLED or not TRADING_ENABLED or not has_credentials():
+    if not MARGIN_GUARD_ENABLED or not _trading_enabled() or not has_credentials():
         _guard_state.tier = "ok"
         _guard_state.scenario = "Margin guard tắt"
         return _guard_state

@@ -17,7 +17,7 @@ from src.exchange import (
     notional_to_size,
     place_market_order,
 )
-from src.bot_state import update_symbol_status
+from src.bot_state import is_trading_enabled, update_symbol_status
 from src.config import (
     LEVERAGE,
     MARGIN_MODE,
@@ -31,6 +31,14 @@ from src.rsi import RsiSnapshot
 from src.rsi_signals import RsiSignal, detect_pair_event, price_move_pct, should_take_profit
 from src.exchange.symbols import is_tradeable_symbol
 from src.trading import _get_state, _record_market_entry, ensure_symbol_configured
+
+_CONFIG_TRADING_ENABLED = TRADING_ENABLED
+
+
+def _trading_enabled() -> bool:
+    if TRADING_ENABLED != _CONFIG_TRADING_ENABLED:
+        return bool(TRADING_ENABLED)
+    return is_trading_enabled()
 
 
 def _force_close_blocked_symbol(symbol: str, mark: float) -> bool:
@@ -154,7 +162,7 @@ def liquidate_all_hedge_pairs(symbols: list[str]) -> float:
 
 def close_all_blocked_symbols() -> int:
     """Close exchange + DB legs for every blocked symbol. Returns count closed."""
-    if not has_credentials() or not TRADING_ENABLED:
+    if not has_credentials() or not _trading_enabled():
         return 0
     symbols: set[str] = set()
     for row in db.get_all_open_pair_lots():
@@ -555,7 +563,7 @@ def evaluate_rsi_trade(
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     pair_event = signal if signal and signal.side == "pair" else detect_pair_event(snap)
 
-    if not TRADING_ENABLED:
+    if not _trading_enabled():
         mark = fetch_side_mark_price(symbol) if has_credentials() else 0.0
         try:
             _sync_lots_with_exchange(symbol)

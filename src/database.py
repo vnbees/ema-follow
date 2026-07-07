@@ -1116,6 +1116,84 @@ def symbol_has_open_lots(symbol: str) -> bool:
     return len(get_open_pair_lots(symbol)) > 0
 
 
+def get_recent_leg_events(limit: int = 10) -> list[sqlite3.Row]:
+    """Recent open/close leg events for dashboard (newest first)."""
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT
+                event_at,
+                event_type,
+                symbol,
+                side,
+                lot_id,
+                size,
+                entry,
+                close_price,
+                realized_pnl_usdt,
+                entry_trigger
+            FROM (
+                SELECT
+                    opened_at AS event_at,
+                    'open' AS event_type,
+                    symbol,
+                    'long' AS side,
+                    id AS lot_id,
+                    long_size AS size,
+                    long_entry AS entry,
+                    NULL AS close_price,
+                    NULL AS realized_pnl_usdt,
+                    entry_trigger
+                FROM rsi_pair_lots
+                UNION ALL
+                SELECT
+                    opened_at,
+                    'open',
+                    symbol,
+                    'short',
+                    id,
+                    short_size,
+                    short_entry,
+                    NULL,
+                    NULL,
+                    entry_trigger
+                FROM rsi_pair_lots
+                UNION ALL
+                SELECT
+                    long_closed_at,
+                    'close',
+                    symbol,
+                    'long',
+                    id,
+                    long_size,
+                    long_entry,
+                    long_close_price,
+                    long_realized_pnl_usdt,
+                    entry_trigger
+                FROM rsi_pair_lots
+                WHERE long_closed_at IS NOT NULL
+                UNION ALL
+                SELECT
+                    short_closed_at,
+                    'close',
+                    symbol,
+                    'short',
+                    id,
+                    short_size,
+                    short_entry,
+                    short_close_price,
+                    short_realized_pnl_usdt,
+                    entry_trigger
+                FROM rsi_pair_lots
+                WHERE short_closed_at IS NOT NULL
+            )
+            ORDER BY event_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
 def get_closed_lot_side_events() -> list[sqlite3.Row]:
     """One row per closed leg for PnL calendar and history."""
     with get_connection() as conn:

@@ -2,6 +2,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.config import TRADING_ENABLED
+
 
 @dataclass
 class BotStatus:
@@ -67,6 +69,8 @@ class AccountBalance:
 _lock = threading.Lock()
 _statuses: dict[str, BotStatus] = {}
 _account = AccountBalance()
+_last_cycle_at: str = ""
+_trading_enabled: bool = TRADING_ENABLED
 
 
 def _copy_status(status: BotStatus) -> BotStatus:
@@ -191,6 +195,28 @@ def clear_stale_signal_statuses(managed_symbols: set[str]) -> None:
         to_remove = [sym for sym in _statuses if sym not in managed_symbols]
         for sym in to_remove:
             del _statuses[sym]
+
+
+def set_last_cycle_at(ts: str) -> None:
+    with _lock:
+        global _last_cycle_at
+        _last_cycle_at = ts
+
+
+def get_last_cycle_at() -> str:
+    with _lock:
+        return _last_cycle_at
+
+
+def set_trading_enabled(enabled: bool) -> None:
+    with _lock:
+        global _trading_enabled
+        _trading_enabled = enabled
+
+
+def is_trading_enabled() -> bool:
+    with _lock:
+        return _trading_enabled
 
 
 def get_account_balance() -> AccountBalance:

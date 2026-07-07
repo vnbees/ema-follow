@@ -3,373 +3,91 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="refresh" content="60">
   <title>{{ exchange_name }} RSI Bot</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #0f1117; color: #e6edf3; }
-    h1, h2, h3 { margin-top: 0; }
-    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    h1 { margin-top: 0; font-size: 22px; }
+    .balance-line { font-size: 15px; margin: 16px 0; line-height: 1.6; }
+    .meta { color: #8b949e; font-size: 13px; margin-bottom: 16px; }
     .green { color: #3fb950; }
     .red { color: #f85149; }
-    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
-    .badge-ok { background: rgba(63,185,80,.15); color: #3fb950; }
-    .badge-tp-ready { background: rgba(227,179,65,.18); color: #e3b341; }
-    .badge-closed { background: rgba(139,148,158,.15); color: #8b949e; }
-    .badge-est { background: rgba(139,148,158,.12); color: #8b949e; font-size: 10px; margin-left: 4px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { padding: 7px 10px; border-bottom: 1px solid #30363d; text-align: left; white-space: nowrap; }
+    .controls { display: flex; align-items: center; gap: 10px; margin: 12px 0 16px; flex-wrap: wrap; }
+    .status-pill { border: 1px solid #30363d; border-radius: 999px; padding: 4px 10px; font-size: 12px; }
+    .status-pill.running { color: #3fb950; }
+    .status-pill.stopped { color: #f85149; }
+    form { margin: 0; }
+    button { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 7px 12px; cursor: pointer; }
+    button:hover { background: #30363d; }
+    button:disabled { opacity: 0.45; cursor: default; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #30363d; text-align: left; white-space: nowrap; }
     th { color: #8b949e; font-size: 11px; text-transform: uppercase; }
-    tr.leg-long { background: rgba(63, 185, 80, 0.05); }
-    tr.leg-short { background: rgba(248, 81, 73, 0.05); }
-    tr.lot-header { background: rgba(88,166,255,.08); }
-    tr.lot-header td { font-size: 12px; color: #c9d1d9; border-bottom: 1px solid #30363d; }
-    .meta { color: #8b949e; font-size: 13px; margin-bottom: 8px; }
     .table-wrap { overflow-x: auto; }
-    .counts { display: flex; gap: 16px; margin-bottom: 8px; flex-wrap: wrap; }
-    .pnl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 12px; }
-    .pnl-box { background: #0f1117; border: 1px solid #30363d; border-radius: 6px; padding: 12px; }
-    .pnl-box .label { color: #8b949e; font-size: 12px; margin-bottom: 4px; line-height: 1.4; }
-    .pnl-box .value { font-size: 18px; font-weight: 600; }
-    .cal-nav { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
-    .cal-nav a { color: #58a6ff; text-decoration: none; font-size: 14px; }
-    .cal-nav a:hover { text-decoration: underline; }
-    .cal-summary { color: #8b949e; font-size: 13px; }
-    .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; margin-bottom: 16px; }
-    .cal-head { text-align: center; font-size: 11px; color: #8b949e; padding: 4px; text-transform: uppercase; }
-    .cal-cell { min-height: 72px; background: #0f1117; border: 1px solid #30363d; border-radius: 6px; padding: 6px; font-size: 12px; }
-    .cal-cell.out-month { opacity: 0.35; }
-    .cal-cell.today { border-color: #58a6ff; box-shadow: 0 0 0 1px rgba(88,166,255,.35); }
-    .cal-cell.marked { background: rgba(88,166,255,.06); }
-    .cal-cell.selected { border-color: #3fb950; }
-    .cal-day-num { font-weight: 600; margin-bottom: 4px; }
-    .cal-day-num a { color: inherit; text-decoration: none; }
-    .cal-day-num a:hover { color: #58a6ff; }
-    .cal-pnl { font-weight: 600; font-size: 11px; }
-    .cal-count { color: #8b949e; font-size: 10px; }
-    .symbol-group { background: #0f1117; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 14px; overflow: hidden; }
-    .symbol-header { padding: 12px 14px; border-bottom: 1px solid #30363d; display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; justify-content: space-between; }
-    .symbol-title { font-size: 16px; font-weight: 700; }
-    .symbol-meta { color: #8b949e; font-size: 13px; }
-    .agg-summary { display: flex; flex-wrap: wrap; gap: 16px; padding: 10px 14px; background: rgba(88,166,255,.04); border-bottom: 1px solid #30363d; font-size: 13px; }
-    .agg-side { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    .agg-side.tp-ready { color: #e3b341; }
-    .fifo-label { font-weight: 600; color: #58a6ff; }
-    .leg-side-label { font-weight: 600; font-size: 12px; }
-    .lot-id { font-weight: 700; color: #e6edf3; }
-    .hint { font-size: 11px; color: #6e7681; margin-top: 6px; }
-    .badge-tier-ok { background: rgba(63,185,80,.15); color: #3fb950; }
-    .badge-tier-watch { background: rgba(227,179,65,.18); color: #e3b341; }
-    .badge-tier-elevated { background: rgba(227,179,65,.28); color: #e3b341; }
-    .badge-tier-high { background: rgba(248,81,73,.18); color: #f85149; }
-    .badge-tier-critical { background: rgba(248,81,73,.35); color: #f85149; }
+    .empty { color: #8b949e; font-size: 13px; }
   </style>
 </head>
 <body>
-  <h1>{{ exchange_name }} RSI Bot (14, 5m)</h1>
-  <p class="meta">
-    Hedge L+S | Chốt ≥{{ "%.0f"|format(profit_target_pct) }}% mỗi cycle 5m (đóng only) |
-    Cross 25/75: TP + mở cặp / stack |
-    Max {{ max_open_symbols }} symbol
+  <h1>{{ exchange_name }} RSI Bot</h1>
+
+  <p class="balance-line">
+    Futures balance:
+    available={{ "%.2f"|format(account.available) }} {{ account.margin_coin }}
+    | equity={{ "%.2f"|format(account.equity) }} {{ account.margin_coin }}
+    | maint={% if account.maint_margin_pct is not none %}{{ "%.2f"|format(account.maint_margin_pct) }}{% else %}—{% endif %}%
+    | initial={% if account.initial_margin_pct is not none %}{{ "%.2f"|format(account.initial_margin_pct) }}{% else %}—{% endif %}%
   </p>
 
-  <div class="card">
-    <h2>Margin & rủi ro</h2>
-    <div class="pnl-grid">
-      <div class="pnl-box">
-        <div class="label">Maintenance margin / equity</div>
-        <div class="value {% if account.maint_margin_pct is not none and account.maint_margin_pct > 20 %}red{% elif account.maint_margin_pct is not none and account.maint_margin_pct > 15 %}badge-tier-watch{% else %}green{% endif %}">
-          {% if account.maint_margin_pct is not none %}{{ "%.2f"|format(account.maint_margin_pct) }}%{% else %}—{% endif %}
-        </div>
-      </div>
-      <div class="pnl-box">
-        <div class="label">Initial margin / equity</div>
-        <div class="value">
-          {% if account.initial_margin_pct is not none %}{{ "%.2f"|format(account.initial_margin_pct) }}%{% else %}—{% endif %}
-        </div>
-      </div>
-      <div class="pnl-box">
-        <div class="label">Tier margin guard</div>
-        <div class="value">
-          {% if margin_guard.tier %}
-            <span class="badge badge-tier-{{ margin_guard.tier }}">{{ margin_guard.tier|upper }}</span>
-          {% else %}—{% endif %}
-        </div>
-      </div>
-      <div class="pnl-box">
-        <div class="label">TP hiện tại (margin guard)</div>
-        <div class="value">{{ "%.1f"|format(profit_target_pct) }}%</div>
-      </div>
-    </div>
-    {% if margin_guard.scenario %}
-      <p class="meta">{{ margin_guard.scenario }}</p>
-    {% endif %}
-    {% if account.suggest_deposit_usdt and account.suggest_deposit_usdt > 0 %}
-      <p class="meta">Gợi ý nạp thêm ~<strong>{{ "%.2f"|format(account.suggest_deposit_usdt) }} USDT</strong> Futures để hạ maint về ~18% (không đóng lệnh).</p>
-    {% endif %}
-    <p class="hint">Equity {{ "%.2f"|format(account.equity) }} USDT · Available {{ "%.2f"|format(account.available) }} USDT{% if account.last_updated %} · {{ account.last_updated | vn_time }}{% endif %}</p>
+  <p class="meta">Cycle gần nhất: {{ last_cycle_at | vn_time }}</p>
+
+  <div class="controls">
+    <span class="status-pill {% if trading_enabled %}running{% else %}stopped{% endif %}">
+      Trading: {% if trading_enabled %}ON{% else %}OFF{% endif %}
+    </span>
+    <form method="post" action="/settings/trading/start">
+      <button type="submit" {% if trading_enabled %}disabled{% endif %}>Start</button>
+    </form>
+    <form method="post" action="/settings/trading/stop">
+      <button type="submit" {% if not trading_enabled %}disabled{% endif %}>Stop</button>
+    </form>
   </div>
 
-  <div class="card">
-    <h2>Tổng PnL</h2>
-    <div class="pnl-grid">
-      <div class="pnl-box">
-        <div class="label">Đang mở (floating)<br>{{ pnl_summary.open_symbols }}/{{ max_open_symbols }} coin · {{ pnl_summary.open_count }} lot · {{ pnl_summary.open_legs }} leg</div>
-        <div class="value {% if pnl_summary.open_unrealized >= 0 %}green{% else %}red{% endif %}">
-          {{ "%+.2f"|format(pnl_summary.open_unrealized) }} USDT
-        </div>
-      </div>
-      <div class="pnl-box">
-        <div class="label">Đã chốt (realized)<br>{{ pnl_summary.closed_count }} leg đóng{% if pnl_summary.closed_with_pnl < pnl_summary.closed_count %} · {{ pnl_summary.closed_with_pnl }} có PnL chính xác{% endif %}</div>
-        <div class="value {% if pnl_summary.closed_realized >= 0 %}green{% else %}red{% endif %}">
-          {{ "%+.2f"|format(pnl_summary.closed_realized) }} USDT
-        </div>
-      </div>
-      <div class="pnl-box">
-        <div class="label">Tổng (floating + realized)</div>
-        <div class="value {% if pnl_summary.total_pnl >= 0 %}green{% else %}red{% endif %}">
-          {{ "%+.2f"|format(pnl_summary.total_pnl) }} USDT
-        </div>
-      </div>
-    </div>
-    <p class="hint">Sàn (LONG/SHORT tổng) = vị thế thực tế. Bảng lot = từng lần vào cặp (FIFO). PnL đã chốt gồm ước tính ≥{{ "%.0f"|format(profit_target_pct) }}% nếu DB thiếu giá đóng.</p>
-  </div>
-
-  <div class="card">
-    <h2>Vị thế theo symbol & lot FIFO</h2>
-    <div class="counts">
-      <span class="green"><strong>{{ pnl_summary.open_count }}</strong> lot đang mở</span>
-      <span class="meta"><strong>{{ closed_count }}</strong> lot đã đóng hết cả 2 leg</span>
-    </div>
-    <p class="meta">
-      {% if last_refreshed %}Volume rank: {{ last_refreshed | vn_time }}.{% endif %}
-      {% if last_scan_checked %} Quét: {{ last_scan_checked }} coin{% if last_signal_symbol %} — tín hiệu <strong>{{ last_signal_symbol }}</strong>{% endif %}.{% endif %}
-    </p>
-
-    {% if symbol_groups %}
-      {% for group in symbol_groups %}
-      <div class="symbol-group">
-        <div class="symbol-header">
-          <div>
-            <span class="symbol-title">{{ group.symbol }}</span>
-            <span class="symbol-meta"> — {{ group.fifo_count }} lot đang mở (FIFO)</span>
-          </div>
-          <div class="symbol-meta">
-            RSI {% if group.rsi_live %}{{ "%.1f"|format(group.rsi_live) }}{% else %}—{% endif %}
-            · Mark {% if group.mark_price %}{{ "%.4f"|format(group.mark_price) }}{% else %}—{% endif %}
-          </div>
-        </div>
-        <div class="agg-summary">
-          <div class="agg-side long {% if group.agg_long.tp_ready %}tp-ready{% endif %}">
-            <strong>LONG sàn:</strong>
-            {% if group.agg_long.size > 0 %}
-              {{ "%.4f"|format(group.agg_long.size) }} @ {{ "%.4f"|format(group.agg_long.avg_entry) }}
-              <span class="{% if group.agg_long.move_pct is not none %}{% if group.agg_long.move_pct >= 0 %}green{% else %}red{% endif %}{% endif %}">
-                {% if group.agg_long.move_pct is not none %}{{ "%+.2f"|format(group.agg_long.move_pct) }}%{% endif %}
-              </span>
-              {% if group.agg_long.pnl_usdt is not none %}({{ "%+.2f"|format(group.agg_long.pnl_usdt) }} USDT){% endif %}
-              {% if group.agg_long.tp_ready %}<span class="badge badge-tp-ready">≥{{ "%.0f"|format(profit_target_pct) }}%</span>{% endif %}
-            {% else %}<span class="meta">không có</span>{% endif %}
-          </div>
-          <div class="agg-side short {% if group.agg_short.tp_ready %}tp-ready{% endif %}">
-            <strong>SHORT sàn:</strong>
-            {% if group.agg_short.size > 0 %}
-              {{ "%.4f"|format(group.agg_short.size) }} @ {{ "%.4f"|format(group.agg_short.avg_entry) }}
-              <span class="{% if group.agg_short.move_pct is not none %}{% if group.agg_short.move_pct >= 0 %}green{% else %}red{% endif %}{% endif %}">
-                {% if group.agg_short.move_pct is not none %}{{ "%+.2f"|format(group.agg_short.move_pct) }}%{% endif %}
-              </span>
-              {% if group.agg_short.pnl_usdt is not none %}({{ "%+.2f"|format(group.agg_short.pnl_usdt) }} USDT){% endif %}
-              {% if group.agg_short.tp_ready %}<span class="badge badge-tp-ready">≥{{ "%.0f"|format(profit_target_pct) }}%</span>{% endif %}
-            {% else %}<span class="meta">không có</span>{% endif %}
-          </div>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Phía</th>
-                <th>Size</th>
-                <th>Entry</th>
-                <th>Giá đóng</th>
-                <th>Status</th>
-                <th>Move%</th>
-                <th>PnL USDT</th>
-                <th>Đóng lúc</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for lot in group.lots %}
-              <tr class="lot-header">
-                <td colspan="8">
-                  <span class="lot-id">Lot #{{ lot.lot_id }}</span>
-                  {% if lot.fifo_index %}
-                    · <span class="fifo-label">FIFO #{{ lot.fifo_index }}/{{ lot.fifo_count }}</span>
-                  {% endif %}
-                  · <span class="meta">{{ lot.lot_state }}</span>
-                  · Vào lệnh: <strong>{{ lot.entry_trigger }}</strong>
-                  · Mở: {{ lot.opened_at | vn_time }}
-                  · Margin/leg: {{ "%.2f"|format(lot.margin_usdt) }} USDT
-                  {% if lot.realized_total_usdt is not none %}
-                    · Đã chốt lot: <span class="{% if lot.realized_total_usdt >= 0 %}green{% else %}red{% endif %}">{{ "%+.2f"|format(lot.realized_total_usdt) }} USDT</span>
-                  {% endif %}
-                </td>
-              </tr>
-                {% for leg in [lot.long, lot.short] %}
-                <tr class="leg-{{ leg.side }}">
-                  <td><span class="leg-side-label {% if leg.side == 'long' %}green{% else %}red{% endif %}">{{ leg.side|upper }}</span></td>
-                  <td>{{ "%.4f"|format(leg.size) }}</td>
-                  <td>{{ "%.4f"|format(leg.entry) if leg.entry else '—' }}</td>
-                  <td>{% if leg.close_price %}{{ "%.4f"|format(leg.close_price) }}{% else %}<span class="meta">—</span>{% endif %}</td>
-                  <td>
-                    {% if leg.is_open %}
-                      {% if leg.tp_ready %}
-                        <span class="badge badge-tp-ready">Đủ {{ "%.0f"|format(profit_target_pct) }}%</span>
-                      {% else %}
-                        <span class="badge badge-ok">Đang mở</span>
-                      {% endif %}
-                    {% else %}
-                      <span class="badge badge-closed">Đã chốt</span>
-                    {% endif %}
-                  </td>
-                  <td class="{% if leg.move_pct is not none %}{% if leg.move_pct >= 0 %}green{% else %}red{% endif %}{% endif %}">
-                    {% if leg.move_pct is not none %}{{ "%+.2f"|format(leg.move_pct) }}%{% else %}—{% endif %}
-                  </td>
-                  <td class="{% if leg.pnl_usdt is not none %}{% if leg.pnl_usdt >= 0 %}green{% else %}red{% endif %}{% endif %}">
-                    {% if leg.pnl_usdt is not none %}
-                      {% if leg.pnl_estimated %}~{% endif %}{{ "%+.2f"|format(leg.pnl_usdt) }}
-                      {% if leg.pnl_estimated %}<span class="badge badge-est">ước tính</span>{% endif %}
-                    {% else %}—{% endif %}
-                  </td>
-                  <td class="meta">{% if leg.closed_at %}{{ leg.closed_at | vn_time }}{% else %}—{% endif %}</td>
-                </tr>
-                {% endfor %}
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-      </div>
-      {% endfor %}
-    {% else %}
-    <p class="meta">Chưa có lot nào trong database.</p>
-    {% endif %}
-  </div>
-
-  <div class="card">
-    <h2>Lịch PnL đã chốt</h2>
-    <div class="cal-nav">
-      <a href="/?year={{ pnl_calendar.prev_year }}&month={{ pnl_calendar.prev_month }}">← Tháng trước</a>
-      <div>
-        <strong>{{ pnl_calendar.month_label }}</strong>
-        <span class="cal-summary">
-          {% if pnl_calendar.month_summary.total_pnl is not none %}
-            — <span class="{% if pnl_calendar.month_summary.total_pnl >= 0 %}green{% else %}red{% endif %}">{{ "%+.2f"|format(pnl_calendar.month_summary.total_pnl) }} USDT</span>
-          {% else %}
-            — 0.00 USDT
-          {% endif %}
-          ({{ pnl_calendar.month_summary.total_trades }} leg)
-        </span>
-      </div>
-      <a href="/?year={{ pnl_calendar.next_year }}&month={{ pnl_calendar.next_month }}">Tháng sau →</a>
-    </div>
-
-    <div class="cal-grid">
-      {% for wd in pnl_calendar.weekdays %}
-      <div class="cal-head">{{ wd }}</div>
-      {% endfor %}
-      {% for week in pnl_calendar.weeks %}
-        {% for cell in week %}
-        <div class="cal-cell{% if not cell.in_month %} out-month{% endif %}{% if cell.is_today %} today{% endif %}{% if cell.marked %} marked{% endif %}{% if selected_day and cell.in_month and cell.day == selected_day %} selected{% endif %}">
-          {% if cell.in_month and cell.day %}
-          <div class="cal-day-num">
-            <a href="/?year={{ cal_year }}&month={{ cal_month }}&day={{ cell.day }}">{{ cell.day }}</a>
-          </div>
-          {% if cell.marked %}
-            {% if cell.daily_pnl is not none %}
-            <div class="cal-pnl {% if cell.daily_pnl >= 0 %}green{% else %}red{% endif %}">{{ "%+.2f"|format(cell.daily_pnl) }}</div>
-            {% else %}
-            <div class="cal-pnl meta">—</div>
-            {% endif %}
-            <div class="cal-count">({{ cell.trade_count }})</div>
-          {% endif %}
-          {% endif %}
-        </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Thời gian</th>
+          <th>Mở/Đóng</th>
+          <th>Symbol</th>
+          <th>Phía</th>
+          <th>Size</th>
+          <th>Entry</th>
+          <th>PnL</th>
+          <th>Trigger</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in recent_orders %}
+        <tr>
+          <td class="meta">{{ row.time_vn }}</td>
+          <td>{{ row.action }}</td>
+          <td><strong>{{ row.symbol }}</strong></td>
+          <td class="{% if row.side == 'LONG' %}green{% else %}red{% endif %}">{{ row.side }}</td>
+          <td>{{ "%.4f"|format(row.size) }}</td>
+          <td>{{ "%.4f"|format(row.entry) }}</td>
+          <td class="{% if row.pnl is not none %}{% if row.pnl >= 0 %}green{% else %}red{% endif %}{% endif %}">
+            {% if row.pnl is not none %}{{ "%+.4f"|format(row.pnl) }}{% else %}—{% endif %}
+          </td>
+          <td class="meta">{{ row.trigger }}</td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="8" class="empty">Chưa có lệnh nào.</td>
+        </tr>
         {% endfor %}
-      {% endfor %}
-    </div>
-
-    <h3>
-      {% if selected_day %}
-        Leg đã chốt ngày {{ "%02d"|format(selected_day) }}/{{ pnl_calendar.month_label }}
-        <span class="meta"> — <a href="/?year={{ cal_year }}&month={{ cal_month }}">Xem cả tháng</a></span>
-      {% else %}
-        Leg đã chốt trong tháng {{ pnl_calendar.month_label }}
-      {% endif %}
-    </h3>
-
-    {% set detail_events = pnl_calendar.month_events %}
-    {% if selected_day %}
-      {% set ns = namespace(events=[]) %}
-      {% for week in pnl_calendar.weeks %}
-        {% for cell in week %}
-          {% if cell.in_month and cell.day == selected_day %}
-            {% set ns.events = cell.events %}
-          {% endif %}
-        {% endfor %}
-      {% endfor %}
-      {% set detail_events = ns.events %}
-    {% endif %}
-
-    {% if detail_events %}
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Đóng lúc</th>
-            <th>Symbol</th>
-            <th>Lot</th>
-            <th>Phía</th>
-            <th>Size</th>
-            <th>Entry → Đóng</th>
-            <th>Move%</th>
-            <th>PnL</th>
-            <th>ROI</th>
-            <th>Lý do chốt</th>
-            <th>Vào lệnh</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for event in detail_events %}
-          <tr class="{{ event.side }}">
-            <td class="meta">{{ event.closed_at_vn }}</td>
-            <td><strong>{{ event.symbol }}</strong></td>
-            <td>#{{ event.lot_id }}</td>
-            <td class="{% if event.side == 'long' %}green{% else %}red{% endif %}">{{ event.side|upper }}</td>
-            <td>{{ "%.4f"|format(event.size) }}</td>
-            <td class="meta">
-              {{ "%.4f"|format(event.entry) }}
-              {% if event.close_price %} → {{ "%.4f"|format(event.close_price) }}{% else %} → —{% endif %}
-            </td>
-            <td class="{% if event.move_pct is not none %}{% if event.move_pct >= 0 %}green{% else %}red{% endif %}{% endif %}">
-              {% if event.move_pct is not none %}{{ "%+.2f"|format(event.move_pct) }}%{% else %}—{% endif %}
-            </td>
-            <td class="{% if event.realized_pnl_usdt is not none %}{% if event.realized_pnl_usdt >= 0 %}green{% else %}red{% endif %}{% endif %}">
-              {% if event.realized_pnl_usdt is not none %}
-                {% if event.pnl_estimated %}~{% endif %}{{ "%+.2f"|format(event.realized_pnl_usdt) }}
-                {% if event.pnl_estimated %}<span class="badge badge-est">ước tính</span>{% endif %}
-              {% else %}—{% endif %}
-            </td>
-            <td class="{% if event.roi_pct is not none %}{% if event.roi_pct >= 0 %}green{% else %}red{% endif %}{% endif %}">
-              {% if event.roi_pct is not none %}{{ "%+.1f"|format(event.roi_pct) }}%{% else %}—{% endif %}
-            </td>
-            <td>{{ event.close_label }}</td>
-            <td class="meta">{{ event.entry_trigger }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-    {% else %}
-    <p class="meta">{% if selected_day %}Không có leg đóng trong ngày này.{% else %}Chưa có leg đóng trong tháng này.{% endif %}</p>
-    {% endif %}
+      </tbody>
+    </table>
   </div>
 </body>
 </html>

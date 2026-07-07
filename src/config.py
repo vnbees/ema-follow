@@ -59,7 +59,7 @@ def order_notional_usdt() -> float:
     return ORDER_SIZE_USDT * LEVERAGE
 
 
-WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
+WEB_PORT = int(os.getenv("PORT", os.getenv("WEB_PORT", "8080")))
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0"))
 SAR_AF = float(os.getenv("SAR_AF", "0.02"))
 SAR_MAX_AF = float(os.getenv("SAR_MAX_AF", "0.2"))

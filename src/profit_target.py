@@ -8,11 +8,19 @@ from src.exchange import (
     fetch_total_unrealized_pnl,
     has_credentials,
 )
-from src.bot_state import get_account_balance, update_account_balance
+from src.bot_state import get_account_balance, is_trading_enabled, update_account_balance
 from src.config import PROFIT_TARGET_PCT, TRADING_ENABLED
 from src.rsi_positions import get_managed_symbols
 from src.market_universe import get_volume_ranked
 from src.rsi_trading import liquidate_all_hedge_pairs
+
+_CONFIG_TRADING_ENABLED = TRADING_ENABLED
+
+
+def _trading_enabled() -> bool:
+    if TRADING_ENABLED != _CONFIG_TRADING_ENABLED:
+        return bool(TRADING_ENABLED)
+    return is_trading_enabled()
 
 
 def _symbols_for_pnl() -> list[str]:
@@ -120,7 +128,7 @@ def _record_profit_take_and_reset(
 
 def check_profit_target(symbols: list[str]) -> bool:
     """Return True if unrealized PnL >= target % of equity and cycle should skip trading."""
-    if not TRADING_ENABLED:
+    if not _trading_enabled():
         return False
     if not has_credentials() or not symbols:
         return False
@@ -183,8 +191,8 @@ def check_profit_target(symbols: list[str]) -> bool:
 
 def trigger_manual_profit_take() -> dict:
     """Liquidate all, reset baseline, log to calendar — same as auto target hit."""
-    if not TRADING_ENABLED:
-        return {"ok": False, "error": "trading disabled (TRADING_ENABLED=false)"}
+    if not _trading_enabled():
+        return {"ok": False, "error": "trading disabled"}
     symbols = _symbols_for_pnl()
     if not has_credentials():
         return {"ok": False, "error": "missing API credentials"}

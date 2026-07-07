@@ -6,7 +6,12 @@ from datetime import datetime, timezone
 import uvicorn
 
 from src.exchange import ExchangeClientError, fetch_candles, fetch_futures_balance, has_credentials
-from src.bot_state import clear_stale_signal_statuses, update_account_balance
+from src.bot_state import (
+    clear_stale_signal_statuses,
+    is_trading_enabled,
+    set_last_cycle_at,
+    update_account_balance,
+)
 from src.candles import get_closed_candles, get_last_closed_candle
 from src.config import (
     CANDLE_LIMIT,
@@ -21,7 +26,6 @@ from src.config import (
     EXCHANGE_DISPLAY_NAME,
     RSI_MIN_CANDLES,
     RSI_PERIOD,
-    TRADING_ENABLED,
     WEB_PORT,
     LEVERAGE,
 )
@@ -64,6 +68,12 @@ def seconds_until_next_interval(interval_minutes: int = INTERVAL_MINUTES) -> flo
 
 def format_timestamp_ms(ts_ms: int) -> str:
     return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _complete_cycle(symbol: str) -> None:
+    log_futures_balance_once(symbol)
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    set_last_cycle_at(now_str)
 
 
 def log_futures_balance_once(symbol: str) -> None:
@@ -187,7 +197,7 @@ def run_cycle() -> None:
 
     guard = process_margin_guard_cycle(ranked[0][0])
     if guard.skip_cycle:
-        log_futures_balance_once(ranked[0][0])
+        _complete_cycle(ranked[0][0])
         logging.info("  Cycle skipped after margin critical liquidation")
         return
 
@@ -197,7 +207,7 @@ def run_cycle() -> None:
     pnl_symbols = cycle_symbols or [ranked[0][0]]
 
     if check_profit_target(pnl_symbols):
-        log_futures_balance_once(pnl_symbols[0])
+        _complete_cycle(pnl_symbols[0])
         return
 
     scanned: set[str] = set(cycle_symbols)
@@ -255,7 +265,7 @@ def run_cycle() -> None:
             len(ranked),
         )
 
-    log_futures_balance_once(pnl_symbols[0])
+    _complete_cycle(pnl_symbols[0])
 
 
 def start_web_server() -> None:
@@ -269,7 +279,7 @@ def main() -> None:
     init_db()
     restore_tracked_positions()
     ranked = refresh_volume_rank()
-    if TRADING_ENABLED and has_credentials():
+    if is_trading_enabled() and has_credentials():
         close_all_blocked_symbols()
     logging.info("%s RSI Bot started", EXCHANGE_DISPLAY_NAME)
     logging.info("Dashboard: http://localhost:%d", WEB_PORT)
@@ -279,7 +289,7 @@ def main() -> None:
         MAX_OPEN_SYMBOLS,
     )
     logging.info("Cycle: %dm | RSI period: %d", INTERVAL_MINUTES, RSI_PERIOD)
-    if TRADING_ENABLED:
+    if is_trading_enabled():
         logging.info(
             "Trading: LIVE hedged RSI — cycle TP %.1f%% | cross 25/75 pair+stack | margin/leg max(%.0f USDT, %.1f%% equity) @ %dx",
             PAIR_PROFIT_TARGET_PCT,
@@ -290,7 +300,7 @@ def main() -> None:
         logging.info("  Max open symbols: %d (hedge mode)", MAX_OPEN_SYMBOLS)
     else:
         logging.info("Trading: DISABLED — analysis and dashboard only")
-    if PROFIT_TARGET_PCT > 0 and TRADING_ENABLED:
+    if PROFIT_TARGET_PCT > 0 and is_trading_enabled():
         logging.info("Profit target: %.2f%% unrealized PnL / equity", PROFIT_TARGET_PCT)
 
     web_thread = threading.Thread(target=start_web_server, daemon=True)

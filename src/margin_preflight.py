@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 
 from src import database as db
+from src.bot_state import is_trading_enabled
 from src.config import (
     MARGIN_PREFLIGHT_BUFFER_PCT,
     MARGIN_PREFLIGHT_ENABLED,
@@ -15,6 +16,14 @@ from src.config import (
 from src.exchange import ExchangeClientError, fetch_futures_balance, fetch_side_mark_price, has_credentials
 from src.order_sizing import compute_entry_margin_usdt
 from src.rsi import RsiSnapshot
+
+_CONFIG_TRADING_ENABLED = TRADING_ENABLED
+
+
+def _trading_enabled() -> bool:
+    if TRADING_ENABLED != _CONFIG_TRADING_ENABLED:
+        return bool(TRADING_ENABLED)
+    return is_trading_enabled()
 
 
 @dataclass
@@ -114,7 +123,7 @@ def pick_best_pair(candidates: list[PairCandidate], target_symbol: str) -> PairC
 
 def ensure_available_for_pair(symbol: str, snap: RsiSnapshot, trigger: str) -> bool:
     """Close legs/pairs until available covers a new L+S pair, or give up."""
-    if not MARGIN_PREFLIGHT_ENABLED or not TRADING_ENABLED or not has_credentials():
+    if not MARGIN_PREFLIGHT_ENABLED or not _trading_enabled() or not has_credentials():
         return True
 
     from src.rsi_trading import close_hedge_symbol, close_lot_leg
