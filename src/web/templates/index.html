@@ -5,10 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="refresh" content="60">
   <title>{{ exchange_name }} RSI Bot</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
     * { box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #0f1117; color: #e6edf3; }
     h1 { margin-top: 0; font-size: 22px; }
+    h2 { font-size: 16px; margin: 24px 0 12px; }
     .balance-line { font-size: 15px; margin: 16px 0; line-height: 1.6; }
     .meta { color: #8b949e; font-size: 13px; margin-bottom: 16px; }
     .green { color: #3fb950; }
@@ -21,11 +23,16 @@
     button { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 7px 12px; cursor: pointer; }
     button:hover { background: #30363d; }
     button:disabled { opacity: 0.45; cursor: default; }
+    .range-btn.active { background: #238636; border-color: #2ea043; color: #fff; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
     th, td { padding: 8px 10px; border-bottom: 1px solid #30363d; text-align: left; white-space: nowrap; }
     th { color: #8b949e; font-size: 11px; text-transform: uppercase; }
     .table-wrap { overflow-x: auto; }
     .empty { color: #8b949e; font-size: 13px; }
+    .chart-panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    .chart-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+    .chart-wrap { position: relative; height: 280px; }
+    .chart-empty { color: #8b949e; font-size: 13px; padding: 48px 0; text-align: center; }
   </style>
 </head>
 <body>
@@ -51,6 +58,21 @@
     <form method="post" action="/settings/trading/stop">
       <button type="submit" {% if not trading_enabled %}disabled{% endif %}>Stop</button>
     </form>
+  </div>
+
+  <div class="chart-panel">
+    <div class="chart-header">
+      <h2>Biến động equity</h2>
+      <div class="controls" style="margin: 0;">
+        <button type="button" class="range-btn" data-range="24h">24h</button>
+        <button type="button" class="range-btn active" data-range="7d">7 ngày</button>
+        <button type="button" class="range-btn" data-range="30d">30 ngày</button>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="equityChart"></canvas>
+      <div id="equityChartEmpty" class="chart-empty" hidden>Chưa có dữ liệu equity — điểm đầu tiên sẽ ghi sau cycle 5 phút tiếp theo.</div>
+    </div>
   </div>
 
   <div class="table-wrap">
@@ -89,5 +111,136 @@
       </tbody>
     </table>
   </div>
+
+  <script>
+    (function () {
+      const canvas = document.getElementById("equityChart");
+      const emptyEl = document.getElementById("equityChartEmpty");
+      const rangeButtons = document.querySelectorAll(".range-btn");
+      let chart = null;
+      let currentRange = "7d";
+
+      function sparseLabels(labels) {
+        const maxTicks = 8;
+        if (labels.length <= maxTicks) return labels;
+        const step = Math.ceil(labels.length / maxTicks);
+        return labels.map((label, idx) => (idx % step === 0 ? label : ""));
+      }
+
+      function buildDatasets(data) {
+        const datasets = [{
+          label: "Equity",
+          data: data.points.map((p) => p.equity),
+          borderColor: "#3fb950",
+          backgroundColor: "rgba(63, 185, 80, 0.12)",
+          fill: true,
+          tension: 0.2,
+          pointRadius: data.points.length > 120 ? 0 : 2,
+          pointHoverRadius: 4,
+        }];
+        if (data.baseline_equity != null && data.points.length > 0) {
+          datasets.push({
+            label: "Baseline",
+            data: data.points.map(() => data.baseline_equity),
+            borderColor: "#8b949e",
+            borderDash: [6, 4],
+            pointRadius: 0,
+            fill: false,
+          });
+        }
+        return datasets;
+      }
+
+      function renderChart(data) {
+        const labels = data.points.map((p) => p.time_vn);
+        const hasPoints = data.points.length > 0;
+        canvas.hidden = !hasPoints;
+        emptyEl.hidden = hasPoints;
+
+        if (!hasPoints) {
+          if (chart) {
+            chart.destroy();
+            chart = null;
+          }
+          return;
+        }
+
+        const config = {
+          type: "line",
+          data: {
+            labels: sparseLabels(labels),
+            datasets: buildDatasets(data),
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: "index", intersect: false },
+            plugins: {
+              legend: {
+                labels: { color: "#e6edf3" },
+              },
+              tooltip: {
+                callbacks: {
+                  title: (items) => {
+                    const idx = items[0].dataIndex;
+                    return data.points[idx].time_vn;
+                  },
+                  label: (ctx) => {
+                    if (ctx.dataset.label === "Baseline") {
+                      return `Baseline: ${ctx.parsed.y.toFixed(2)} ${data.margin_coin}`;
+                    }
+                    const point = data.points[ctx.dataIndex];
+                    return [
+                      `Equity: ${point.equity.toFixed(2)} ${data.margin_coin}`,
+                      `Available: ${point.available.toFixed(2)} ${data.margin_coin}`,
+                    ];
+                  },
+                },
+              },
+            },
+            scales: {
+              x: {
+                ticks: { color: "#8b949e", maxRotation: 0, autoSkip: true },
+                grid: { color: "#21262d" },
+              },
+              y: {
+                ticks: {
+                  color: "#8b949e",
+                  callback: (value) => `${Number(value).toFixed(0)}`,
+                },
+                grid: { color: "#21262d" },
+              },
+            },
+          },
+        };
+
+        if (chart) {
+          chart.data = config.data;
+          chart.options = config.options;
+          chart.update();
+        } else {
+          chart = new Chart(canvas, config);
+        }
+      }
+
+      async function loadEquityHistory(range) {
+        currentRange = range;
+        const res = await fetch(`/api/equity-history?range=${encodeURIComponent(range)}`);
+        const data = await res.json();
+        renderChart(data);
+      }
+
+      rangeButtons.forEach((btn) => {
+        btn.addEventListener("click", () => {
+          rangeButtons.forEach((b) => b.classList.remove("active"));
+          btn.classList.add("active");
+          loadEquityHistory(btn.dataset.range);
+        });
+      });
+
+      loadEquityHistory(currentRange);
+      setInterval(() => loadEquityHistory(currentRange), 60000);
+    })();
+  </script>
 </body>
 </html>

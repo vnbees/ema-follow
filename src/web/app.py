@@ -1,5 +1,5 @@
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Form, Query, Request
@@ -41,6 +41,36 @@ templates.env.filters["dash_size"] = format_dashboard_size
 templates.env.filters["dash_pnl"] = format_dashboard_pnl
 
 app = FastAPI(title=f"{EXCHANGE_DISPLAY_NAME} RSI Bot Dashboard")
+
+_EQUITY_RANGES = {
+    "24h": timedelta(hours=24),
+    "7d": timedelta(days=7),
+    "30d": timedelta(days=30),
+}
+
+
+def _equity_since_for_range(range_key: str) -> datetime:
+    delta = _EQUITY_RANGES.get(range_key, _EQUITY_RANGES["7d"])
+    return datetime.now(timezone.utc) - delta
+
+
+def build_equity_history_payload(range_key: str) -> dict:
+    key = range_key if range_key in _EQUITY_RANGES else "7d"
+    rows = db.get_equity_snapshots(_equity_since_for_range(key))
+    account = get_account_balance()
+    return {
+        "range": key,
+        "margin_coin": account.margin_coin or "USDT",
+        "baseline_equity": db.get_baseline_equity(),
+        "points": [
+            {
+                "time_vn": format_vn_time(str(row["recorded_at"])),
+                "equity": float(row["equity"]),
+                "available": float(row["available"]),
+            }
+            for row in rows
+        ],
+    }
 
 
 def _fetch_symbol_marks(symbols: list[str]) -> dict[str, float]:
@@ -598,6 +628,11 @@ def api_status() -> dict:
             for sym, st in statuses.items()
         },
     }
+
+
+@app.get("/api/equity-history")
+def api_equity_history(range: str = Query(default="7d")) -> dict:
+    return build_equity_history_payload(range)
 
 
 @app.get("/api/symbols")

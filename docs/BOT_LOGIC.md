@@ -451,7 +451,22 @@ Dashboard: nút manual profit take / reset baseline.
 - **Symbol groups:** aggregate LONG/SHORT sàn + bảng lot **FIFO**
 - Badge **≥TP%** (`tp_ready`) trên leg sắp chốt
 - Lịch PnL theo **leg đóng** (timezone VN)
-- API: `/`, `/api/pnl-calendar`, `/api/status`, `/api/profit-takes`
+- **Biểu đồ equity:** line chart (Chart.js), nút 24h / 7 ngày / 30 ngày; cập nhật mỗi 60s
+- API: `/`, `/api/pnl-calendar`, `/api/status`, `/api/profit-takes`, `/api/equity-history`
+
+### Lịch sử equity (`equity_snapshots`)
+
+| Field | Ý nghĩa |
+|-------|---------|
+| `recorded_at` | Thời điểm snapshot (ISO UTC) |
+| `equity` | `account_equity` từ sàn |
+| `available` | Available balance |
+| `maint_margin_pct` | Maintenance margin % (nullable) |
+
+- Ghi **mỗi cycle 5 phút** trong `log_futures_balance_once()` ([`main.py`](src/main.py))
+- Tự prune bản ghi > **90 ngày** (mỗi 100 insert)
+- `GET /api/equity-history?range=24h|7d|30d` — trả `points[]` + `baseline_equity` (đường tham chiếu trên chart)
+- Xóa cùng `clear_dashboard_history()`
 
 PnL leg đóng: ưu tiên `realized_pnl_usdt` + `close_price` từ DB; nếu thiếu → ước tính theo `PAIR_PROFIT_TARGET_PCT`.
 

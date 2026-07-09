@@ -1,7 +1,7 @@
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterator
 
 from src.config import DATABASE_PATH, DEFAULT_SYMBOL
@@ -85,6 +85,7 @@ def init_db() -> None:
         _migrate_rsi_trades_sizing_pnl(conn)
         _migrate_manual_hold_symbols(conn)
         _migrate_rsi_pair_lots(conn)
+        _migrate_equity_snapshots(conn)
 
 
 def _migrate_profit_take_trigger_type(conn: sqlite3.Connection) -> None:
@@ -1436,6 +1437,90 @@ def get_rsi_closed_realized_summary(closed_limit: int = 50) -> tuple[float, int]
     return total, count
 
 
+_EQUITY_SNAPSHOT_PRUNE_EVERY = 100
+_equity_snapshot_insert_count = 0
+
+
+def _migrate_equity_snapshots(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS equity_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recorded_at TEXT NOT NULL,
+            equity REAL NOT NULL,
+            available REAL NOT NULL,
+            maint_margin_pct REAL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_equity_snapshots_recorded_at
+        ON equity_snapshots(recorded_at)
+        """
+    )
+
+
+def insert_equity_snapshot(
+    equity: float,
+    available: float,
+    *,
+    maint_margin_pct: float | None = None,
+) -> int:
+    global _equity_snapshot_insert_count
+    now = _utc_now()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO equity_snapshots (recorded_at, equity, available, maint_margin_pct)
+            VALUES (?, ?, ?, ?)
+            """,
+            (now, equity, available, maint_margin_pct),
+        )
+        row_id = int(cursor.lastrowid)
+    _equity_snapshot_insert_count += 1
+    if _equity_snapshot_insert_count % _EQUITY_SNAPSHOT_PRUNE_EVERY == 0:
+        prune_equity_snapshots()
+    return row_id
+
+
+def get_equity_snapshots(
+    since: datetime | None = None,
+    *,
+    limit: int = 10000,
+) -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        if since is not None:
+            since_iso = since.astimezone(timezone.utc).isoformat()
+            return conn.execute(
+                """
+                SELECT * FROM equity_snapshots
+                WHERE recorded_at >= ?
+                ORDER BY recorded_at ASC
+                LIMIT ?
+                """,
+                (since_iso, limit),
+            ).fetchall()
+        return conn.execute(
+            """
+            SELECT * FROM equity_snapshots
+            ORDER BY recorded_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def prune_equity_snapshots(*, older_than_days: int = 90) -> int:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM equity_snapshots WHERE recorded_at < ?",
+            (cutoff,),
+        )
+        return int(cursor.rowcount)
+
+
 def clear_dashboard_history(*, reset_baseline: bool = True) -> dict[str, int]:
     """Delete RSI lot/trade history shown on the dashboard. Keeps manual_hold_symbols."""
     tables = (
@@ -1444,6 +1529,7 @@ def clear_dashboard_history(*, reset_baseline: bool = True) -> dict[str, int]:
         "profit_takes",
         "entries",
         "trade_cycles",
+        "equity_snapshots",
     )
     counts: dict[str, int] = {}
     with get_connection() as conn:

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 import uvicorn
 
+from src import database as db
 from src.exchange import ExchangeClientError, fetch_candles, fetch_futures_balance, has_credentials
 from src.bot_state import (
     clear_stale_signal_statuses,
@@ -102,6 +103,11 @@ def log_futures_balance_once(symbol: str) -> None:
             now_str,
             maint_margin_pct=balance.maint_margin_pct,
             initial_margin_pct=balance.initial_margin_pct,
+        )
+        db.insert_equity_snapshot(
+            balance.account_equity,
+            balance.available,
+            maint_margin_pct=balance.maint_margin_pct,
         )
         refresh_margin_dashboard_fields(
             balance.available,
