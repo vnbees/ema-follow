@@ -30,7 +30,12 @@ from src.order_sizing import compute_entry_margin_usdt, margin_to_notional
 from src.rsi import RsiSnapshot
 from src.rsi_signals import RsiSignal, detect_pair_event, price_move_pct, should_take_profit
 from src.exchange.symbols import is_tradeable_symbol
-from src.trading import _get_state, _record_market_entry, ensure_symbol_configured
+from src.trading import (
+    _get_state,
+    _record_market_entry,
+    ensure_symbol_configured,
+    resolve_order_fill,
+)
 
 _CONFIG_TRADING_ENABLED = TRADING_ENABLED
 
@@ -39,6 +44,18 @@ def _trading_enabled() -> bool:
     if TRADING_ENABLED != _CONFIG_TRADING_ENABLED:
         return bool(TRADING_ENABLED)
     return is_trading_enabled()
+
+
+def _close_side_and_resolve_fill(
+    symbol: str,
+    side: str,
+    size: float,
+    fallback_price: float,
+) -> float:
+    size_str = _format_close_size(symbol, size)
+    result = close_position_side(symbol, side, size_str)
+    _verify_side_reduced(symbol, side, size)
+    return resolve_order_fill(symbol, result, fallback_price=fallback_price)
 
 
 def _force_close_blocked_symbol(symbol: str, mark: float) -> bool:
@@ -60,9 +77,8 @@ def _force_close_blocked_symbol(symbol: str, mark: float) -> bool:
             side.upper(),
             size_str,
         )
-        close_position_side(symbol, side, size_str)
-        _verify_side_reduced(symbol, side, pos.size)
-        db.close_all_lot_sides(symbol, side, mark=mark)
+        fill = _close_side_and_resolve_fill(symbol, side, pos.size, mark)
+        db.close_all_lot_sides(symbol, side, close_price=fill)
         closed_any = True
     return closed_any
 
@@ -84,9 +100,8 @@ def close_hedge_symbol(symbol: str, mark: float | None = None) -> bool:
             side.upper(),
             size_str,
         )
-        close_position_side(symbol, side, size_str)
-        _verify_side_reduced(symbol, side, pos.size)
-        db.close_all_lot_sides(symbol, side, mark=mark)
+        fill = _close_side_and_resolve_fill(symbol, side, pos.size, mark)
+        db.close_all_lot_sides(symbol, side, close_price=fill)
         closed_any = True
     return closed_any
 
@@ -211,6 +226,26 @@ def _format_close_size(symbol: str, size: float) -> str:
     return format_size(size, spec)
 
 
+def _verify_pair_opened_sizes(
+    symbol: str,
+    before: dict,
+    expected_delta: float,
+) -> None:
+    after = fetch_symbol_positions(symbol)
+    for side in ("long", "short"):
+        delta = after[side].size - before[side].size
+        if abs(delta - expected_delta) > 1e-6:
+            logging.warning(
+                "  [%s] Open %s size mismatch: expected +%.4f, got +%.4f (before=%.4f after=%.4f)",
+                symbol,
+                side.upper(),
+                expected_delta,
+                delta,
+                before[side].size,
+                after[side].size,
+            )
+
+
 def _open_pair(symbol: str, snap: RsiSnapshot, trigger: str) -> int | None:
     if not is_tradeable_symbol(symbol):
         logging.info("  [%s] Blocked symbol — skip open pair", symbol)
@@ -230,6 +265,9 @@ def _open_pair(symbol: str, snap: RsiSnapshot, trigger: str) -> int | None:
     margin_usdt = compute_entry_margin_usdt(balance.account_equity)
     price = snap.close if snap.close > 0 else fetch_side_mark_price(symbol)
     size_str = _size_for_margin(symbol, margin_usdt, price)
+    size_val = float(size_str)
+
+    positions_before = fetch_symbol_positions(symbol)
 
     logging.info(
         "  [%s] Open pair L+S | trigger=%s | margin/leg=%.2f USDT | size=%s | available=%.2f",
@@ -273,27 +311,30 @@ def _open_pair(symbol: str, snap: RsiSnapshot, trigger: str) -> int | None:
 
     long_fill = _record_market_entry(
         symbol, "long", long_oid, long_coid, size_str, price, trade_state.open_cycle_id,
+        order_result=long_result,
     )
-    _record_market_entry(
+    short_fill = _record_market_entry(
         symbol, "short", short_oid, short_coid, size_str, price, trade_state.open_cycle_id,
+        order_result=short_result,
     )
 
-    size_val = float(size_str)
+    _verify_pair_opened_sizes(symbol, positions_before, size_val)
+
     lot_id = db.insert_pair_lot(
         symbol,
         long_size=size_val,
-        long_entry=long_fill or price,
+        long_entry=long_fill,
         short_size=size_val,
-        short_entry=price,
+        short_entry=short_fill,
         margin_usdt=margin_usdt,
         entry_trigger=trigger,
     )
     logging.info(
-        "  [%s] Pair opened lot #%d | long fill=%.4f short ref=%.4f",
+        "  [%s] Pair opened lot #%d | long fill=%.4f short fill=%.4f",
         symbol,
         lot_id,
-        long_fill or price,
-        price,
+        long_fill,
+        short_fill,
     )
     return lot_id
 
@@ -341,9 +382,8 @@ def _take_profit_aggregate_side(
         size_str,
         pnl,
     )
-    close_position_side(symbol, side, size_str)
-    _verify_side_reduced(symbol, side, pos.size)
-    db.close_all_lot_sides(symbol, side, mark=mark)
+    fill = _close_side_and_resolve_fill(symbol, side, pos.size, mark)
+    db.close_all_lot_sides(symbol, side, close_price=fill)
     if reopen_pair and is_tradeable_symbol(symbol):
         _open_pair(symbol, snap, f"{trigger}_tp_agg_{side}")
 
@@ -375,25 +415,31 @@ def close_lot_leg(
         return
 
     size_str = _format_close_size(symbol, size)
-    pnl = _estimate_leg_pnl(side, entry, mark, size)
     move = price_move_pct(side, entry, mark)
     logging.info(
-        "  [%s] Lot #%d close %s | trigger=%s | move=%+.2f%% | size=%s | pnl≈%+.2f",
+        "  [%s] Lot #%d close %s | trigger=%s | move=%+.2f%% | size=%s | pnl≈(pending fill)",
         symbol,
         lot["id"],
         side.upper(),
         trigger,
         move,
         size_str,
+    )
+    fill = _close_side_and_resolve_fill(symbol, side, size, mark)
+    pnl = _estimate_leg_pnl(side, entry, fill, size)
+    logging.info(
+        "  [%s] Lot #%d close %s fill=%.6f | pnl≈%+.2f",
+        symbol,
+        lot["id"],
+        side.upper(),
+        fill,
         pnl,
     )
-    close_position_side(symbol, side, size_str)
-    _verify_side_reduced(symbol, side, size)
     db.close_lot_side(
         int(lot["id"]),
         side,
         realized_pnl_usdt=pnl,
-        close_price=mark,
+        close_price=fill,
     )
 
 

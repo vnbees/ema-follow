@@ -74,10 +74,10 @@
           <td>{{ row.action }}</td>
           <td><strong>{{ row.symbol }}</strong></td>
           <td class="{% if row.side == 'LONG' %}green{% else %}red{% endif %}">{{ row.side }}</td>
-          <td>{{ "%.4f"|format(row.size) }}</td>
-          <td>{{ "%.4f"|format(row.entry) }}</td>
+          <td>{{ row.size | dash_size }}</td>
+          <td>{{ row.entry | dash_price }}</td>
           <td class="{% if row.pnl is not none %}{% if row.pnl >= 0 %}green{% else %}red{% endif %}{% endif %}">
-            {% if row.pnl is not none %}{{ "%+.4f"|format(row.pnl) }}{% else %}—{% endif %}
+            {% if row.pnl is not none %}{{ row.pnl | dash_pnl }}{% else %}—{% endif %}
           </td>
           <td class="meta">{{ row.trigger }}</td>
         </tr>

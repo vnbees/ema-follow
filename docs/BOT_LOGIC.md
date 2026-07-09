@@ -242,10 +242,24 @@ Margin **tính lại mỗi lần** `_open_pair` theo **equity** (không phải a
 1. is_tradeable_symbol? — không → skip
 2. ensure_available_for_pair (preflight) — không đủ → skip
 3. fetch balance → tính margin/leg, size
-4. Market open LONG
-5. Market open SHORT (nếu fail → rollback đóng long, không ghi DB)
-6. insert_pair_lot (long + short open)
+4. Snapshot position size (trước mở)
+5. Market open LONG → resolve avgPrice fill từ sàn
+6. Market open SHORT → resolve avgPrice fill từ sàn (nếu fail → rollback đóng long)
+7. Verify size tăng đúng trên sàn
+8. insert_pair_lot (long_entry + short_entry = fill thực)
 ```
+
+### Nguồn giá (đồng bộ sàn)
+
+| Sự kiện | Nguồn giá ghi DB / hiển thị |
+|---------|------------------------------|
+| Mở lot mới — `long_entry` / `short_entry` | `avgPrice` từ order response → poll `fetch_order_detail` nếu cần |
+| Quyết định chốt aggregate | `positionRisk.entryPrice` + `markPrice` / `unRealizedProfit` |
+| Đóng leg / aggregate — `close_price` | `avgPrice` fill lệnh đóng (không dùng mark) |
+| Dashboard unrealized | `unRealizedProfit` sàn, chia theo tỷ lệ size lot |
+| Lot cũ (trước deploy) | Entry DB **không** sửa; chỉ `close_price` fill khi đóng sau deploy |
+
+Helper: `resolve_order_fill()` trong [`trading.py`](src/trading.py).
 
 ### Margin preflight ([`margin_preflight.py`](src/margin_preflight.py))
 

@@ -30,11 +30,15 @@ from src.orderflow import live_state_to_dict
 from src.pnl import estimate_tp_pnl_usdt, leg_realized_pnl, leg_unrealized_pnl, roi_pct
 from src.profit_target import reset_baseline_to_current_equity, trigger_manual_profit_take
 from src.web.calendar_build import VN_TZ, build_rsi_pnl_calendar
+from src.web.number_format import format_dashboard_pnl, format_dashboard_price, format_dashboard_size
 from src.web.time_format import format_vn_time
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.filters["vn_time"] = format_vn_time
+templates.env.filters["dash_price"] = format_dashboard_price
+templates.env.filters["dash_size"] = format_dashboard_size
+templates.env.filters["dash_pnl"] = format_dashboard_pnl
 
 app = FastAPI(title=f"{EXCHANGE_DISPLAY_NAME} RSI Bot Dashboard")
 
@@ -69,7 +73,14 @@ def _lot_is_open(lot) -> bool:
     return lot["long_status"] == "open" or lot["short_status"] == "open"
 
 
-def _build_agg_side(side: str, size: float, avg_entry: float, mark: float) -> dict:
+def _build_agg_side(
+    side: str,
+    size: float,
+    avg_entry: float,
+    mark: float,
+    *,
+    exchange_pnl: float | None = None,
+) -> dict:
     if size <= 0 or mark <= 0:
         return {
             "size": size,
@@ -79,7 +90,9 @@ def _build_agg_side(side: str, size: float, avg_entry: float, mark: float) -> di
             "tp_ready": False,
         }
     move = price_move_pct(side, avg_entry, mark)
-    if side == "long":
+    if exchange_pnl is not None:
+        pnl = exchange_pnl
+    elif side == "long":
         pnl = (mark - avg_entry) * size
     else:
         pnl = (avg_entry - mark) * size
@@ -129,6 +142,8 @@ def _leg_fields(
     side: str,
     lot,
     mark: float,
+    *,
+    exchange_leg_pnl: float | None = None,
 ) -> dict:
     is_long = side == "long"
     status = lot["long_status"] if is_long else lot["short_status"]
@@ -146,7 +161,10 @@ def _leg_fields(
     pnl_estimated = False
     if is_open and mark > 0:
         move_pct = price_move_pct(side, entry, mark)
-        pnl = leg_unrealized_pnl(side, entry, size, mark)
+        if exchange_leg_pnl is not None:
+            pnl = exchange_leg_pnl
+        else:
+            pnl = leg_unrealized_pnl(side, entry, size, mark)
     elif not is_open:
         if close_price and close_price > 0:
             move_pct = price_move_pct(side, entry, close_price)
@@ -169,10 +187,46 @@ def _leg_fields(
     }
 
 
-def _build_lot_detail(lot, mark: float, fifo_index: int | None, fifo_count: int) -> dict:
+def _exchange_leg_pnl_share(
+    side: str,
+    lot,
+    side_pnl: float,
+    side_open_size: float,
+) -> float | None:
+    status_col = f"{side}_status"
+    size_col = f"{side}_size"
+    if lot[status_col] != "open" or side_open_size <= 0:
+        return None
+    lot_size = float(lot[size_col])
+    if lot_size <= 0:
+        return None
+    return side_pnl * (lot_size / side_open_size)
+
+
+def _build_lot_detail(
+    lot,
+    mark: float,
+    fifo_index: int | None,
+    fifo_count: int,
+    *,
+    long_side_pnl: float = 0.0,
+    short_side_pnl: float = 0.0,
+    long_open_size: float = 0.0,
+    short_open_size: float = 0.0,
+) -> dict:
     open_legs, total_legs = _lot_open_leg_count(lot)
-    long_leg = _leg_fields("long", lot, mark)
-    short_leg = _leg_fields("short", lot, mark)
+    long_leg = _leg_fields(
+        "long",
+        lot,
+        mark,
+        exchange_leg_pnl=_exchange_leg_pnl_share("long", lot, long_side_pnl, long_open_size),
+    )
+    short_leg = _leg_fields(
+        "short",
+        lot,
+        mark,
+        exchange_leg_pnl=_exchange_leg_pnl_share("short", lot, short_side_pnl, short_open_size),
+    )
     realized_total = 0.0
     has_realized = False
     for leg in (long_leg, short_leg):
@@ -204,9 +258,23 @@ def _fetch_agg_for_symbol(symbol: str, mark: float) -> tuple[dict, dict]:
         )
     try:
         positions = fetch_symbol_positions(symbol)
+        long_pnl = fetch_side_unrealized_pnl(symbol, "long")
+        short_pnl = fetch_side_unrealized_pnl(symbol, "short")
         return (
-            _build_agg_side("long", positions["long"].size, positions["long"].avg_price, mark),
-            _build_agg_side("short", positions["short"].size, positions["short"].avg_price, mark),
+            _build_agg_side(
+                "long",
+                positions["long"].size,
+                positions["long"].avg_price,
+                mark,
+                exchange_pnl=long_pnl,
+            ),
+            _build_agg_side(
+                "short",
+                positions["short"].size,
+                positions["short"].avg_price,
+                mark,
+                exchange_pnl=short_pnl,
+            ),
         )
     except ExchangeClientError:
         return (
@@ -229,6 +297,15 @@ def build_symbol_groups(lots, statuses: dict, mark_map: dict[str, float]) -> lis
         fifo_count = len(open_lots)
         agg_long, agg_short = _fetch_agg_for_symbol(symbol, mark)
 
+        long_open_size = sum(
+            float(row["long_size"]) for row in open_lots if row["long_status"] == "open"
+        )
+        short_open_size = sum(
+            float(row["short_size"]) for row in open_lots if row["short_status"] == "open"
+        )
+        long_side_pnl = agg_long.get("pnl_usdt") or 0.0
+        short_side_pnl = agg_short.get("pnl_usdt") or 0.0
+
         lot_details: list[dict] = []
         fifo_n = 0
         for lot in symbol_lots:
@@ -236,7 +313,18 @@ def build_symbol_groups(lots, statuses: dict, mark_map: dict[str, float]) -> lis
             if _lot_is_open(lot):
                 fifo_n += 1
                 fifo_index = fifo_n
-            lot_details.append(_build_lot_detail(lot, mark, fifo_index, fifo_count))
+            lot_details.append(
+                _build_lot_detail(
+                    lot,
+                    mark,
+                    fifo_index,
+                    fifo_count,
+                    long_side_pnl=long_side_pnl,
+                    short_side_pnl=short_side_pnl,
+                    long_open_size=long_open_size,
+                    short_open_size=short_open_size,
+                ),
+            )
 
         groups.append(
             {

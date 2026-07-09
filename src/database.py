@@ -1064,9 +1064,11 @@ def close_all_lot_sides(
     symbol: str,
     side: str,
     *,
+    close_price: float | None = None,
     mark: float | None = None,
 ) -> None:
     side = side.lower()
+    price = close_price if close_price is not None else mark
     for lot in get_open_pair_lots(symbol.upper()):
         status_col = "long_status" if side == "long" else "short_status"
         if lot[status_col] != "open":
@@ -1074,16 +1076,16 @@ def close_all_lot_sides(
         entry = float(lot["long_entry"] if side == "long" else lot["short_entry"])
         size = float(lot["long_size"] if side == "long" else lot["short_size"])
         realized = None
-        if mark and mark > 0 and entry > 0 and size > 0:
+        if price and price > 0 and entry > 0 and size > 0:
             if side == "long":
-                realized = (mark - entry) * size
+                realized = (price - entry) * size
             else:
-                realized = (entry - mark) * size
+                realized = (entry - price) * size
         close_lot_side(
             int(lot["id"]),
             side,
             realized_pnl_usdt=realized,
-            close_price=mark,
+            close_price=price,
         )
 
 

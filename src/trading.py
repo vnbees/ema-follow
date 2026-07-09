@@ -1,4 +1,5 @@
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -17,7 +18,12 @@ from src.bitget_client import (
     notional_to_size,
     place_market_order,
 )
-from src.exchange import ExchangeClientError, configure_symbol_trading, fetch_order_detail as exchange_fetch_order_detail
+from src.exchange import (
+    ExchangeClientError,
+    configure_symbol_trading,
+    fetch_order_detail as exchange_fetch_order_detail,
+    fetch_side_mark_price,
+)
 from src.bot_state import update_symbol_status
 from src.config import LEVERAGE, MARGIN_MODE, ORDER_SIZE_USDT, TRADING_ENABLED
 from src.database import get_symbols, update_entry_by_order_id
@@ -138,6 +144,10 @@ def liquidate_all_and_reset(symbols: list[str]) -> float:
     return balance.account_equity
 
 
+_FILL_POLL_ATTEMPTS = 3
+_FILL_POLL_DELAY_SEC = 0.15
+
+
 def _parse_fill_price(detail: dict) -> float | None:
     raw = (
         detail.get("priceAvg")
@@ -152,6 +162,76 @@ def _parse_fill_price(detail: dict) -> float | None:
     except (TypeError, ValueError):
         return None
     return price if price > 0 else None
+
+
+def resolve_order_fill(
+    symbol: str,
+    order_result: dict,
+    *,
+    fallback_price: float,
+) -> float:
+    """Resolve average fill price from order response or order detail API."""
+    parsed = _parse_fill_price(order_result)
+    if parsed is not None:
+        return parsed
+
+    order_id = str(
+        order_result.get("orderId")
+        or order_result.get("order_id")
+        or "",
+    )
+    if not order_id:
+        if fallback_price > 0:
+            logging.warning(
+                "  [%s] No orderId for fill resolution — using fallback %.6f",
+                symbol,
+                fallback_price,
+            )
+            return fallback_price
+        return 0.0
+
+    for attempt in range(_FILL_POLL_ATTEMPTS):
+        try:
+            detail = exchange_fetch_order_detail(symbol, order_id)
+            parsed = _parse_fill_price(detail)
+            if parsed is not None:
+                return parsed
+            state = (detail.get("state") or detail.get("status") or "").lower()
+            if state in {"filled", "partially_filled", "partial-fill"}:
+                break
+        except ExchangeClientError as exc:
+            logging.warning(
+                "  [%s] Fill poll %d failed for order %s: %s",
+                symbol,
+                attempt + 1,
+                order_id,
+                exc,
+            )
+        if attempt < _FILL_POLL_ATTEMPTS - 1:
+            time.sleep(_FILL_POLL_DELAY_SEC)
+
+    try:
+        mark = fetch_side_mark_price(symbol)
+        if mark > 0:
+            logging.warning(
+                "  [%s] Order %s fill unknown — using mark fallback %.6f",
+                symbol,
+                order_id,
+                mark,
+            )
+            return mark
+    except ExchangeClientError:
+        pass
+
+    if fallback_price > 0:
+        logging.warning(
+            "  [%s] Order %s fill unknown — using price fallback %.6f",
+            symbol,
+            order_id,
+            fallback_price,
+        )
+        return fallback_price
+    return 0.0
 
 
 def _resolve_avg_entry(
@@ -315,20 +395,23 @@ def _record_market_entry(
     size_str: str,
     fallback_price: float,
     cycle_id: int | None,
+    *,
+    order_result: dict | None = None,
 ) -> float:
-    fill_price = fallback_price
+    base = dict(order_result or {})
+    if order_id:
+        base.setdefault("orderId", order_id)
+    fill_price = resolve_order_fill(symbol, base, fallback_price=fallback_price)
     filled = False
     if order_id:
         try:
             detail = exchange_fetch_order_detail(symbol, order_id)
             state = (detail.get("state") or detail.get("status") or "").lower()
-            parsed = _parse_fill_price(detail)
-            if parsed is not None:
-                fill_price = parsed
             if state in {"filled", "partially_filled", "partial-fill", "partially_filled"}:
                 filled = True
         except ExchangeClientError as exc:
             logging.warning("  [%s] Could not resolve market fill for %s: %s", symbol, order_id, exc)
+            filled = fill_price > 0
 
     db.insert_entry(
         symbol,
