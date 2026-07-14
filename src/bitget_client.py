@@ -779,3 +779,40 @@ def close_positions(
     if hold_side:
         body["holdSide"] = hold_side
     _private_post(CLOSE_POSITIONS_ENDPOINT, body)
+
+
+def transfer_futures_to_spot(asset: str, amount: float) -> dict:
+    """Transfer from USDT futures to spot wallet."""
+    if amount <= 0:
+        raise BitgetClientError("Transfer amount must be positive")
+    client_oid = f"spot_{uuid.uuid4().hex[:16]}"
+    result = _private_post(
+        "/api/v2/spot/wallet/transfer",
+        {
+            "fromType": "usdt_futures",
+            "toType": "spot",
+            "amount": str(amount),
+            "coin": asset.upper(),
+            "clientOid": client_oid,
+        },
+    )
+    return {
+        "tranId": str(result.get("transferId") or result.get("orderId") or ""),
+        "clientOid": str(result.get("clientOid") or client_oid),
+        "raw": result,
+    }
+
+
+def fetch_spot_balance(asset: str = "USDT") -> float:
+    asset = asset.upper()
+    data = _private_get("/api/v2/spot/account/assets", {"coin": asset})
+    rows = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+    total = 0.0
+    for row in rows:
+        if str(row.get("coin") or row.get("coinName") or "").upper() != asset:
+            continue
+        available = float(row.get("available") or row.get("availableAmount") or 0)
+        frozen = float(row.get("frozen") or row.get("locked") or 0)
+        total += available + frozen
+    return total
+

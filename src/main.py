@@ -5,8 +5,31 @@ from datetime import datetime, timezone
 
 import uvicorn
 
-from src import database as db
-from src.exchange import ExchangeClientError, fetch_candles, fetch_futures_balance, has_credentials
+from src.config import (
+    CANDLE_LIMIT,
+    EXCHANGE_DISPLAY_NAME,
+    GRANULARITY,
+    INTERVAL_MINUTES,
+    LEVERAGE,
+    LOG_DIR,
+    MARGIN_COIN,
+    MAX_OPEN_SYMBOLS,
+    ORDER_MARGIN_MIN_USDT,
+    ORDER_MARGIN_PCT,
+    PAIR_PROFIT_TARGET_PCT,
+    PROFIT_TARGET_PCT,
+    RSI_MIN_CANDLES,
+    RSI_PERIOD,
+    WEB_PORT,
+)
+from src.database import init_db
+from src.exchange import (
+    ExchangeClientError,
+    fetch_candles,
+    fetch_futures_balance,
+    fetch_spot_balance,
+    has_credentials,
+)
 from src.bot_state import (
     clear_stale_signal_statuses,
     is_trading_enabled,
@@ -14,23 +37,6 @@ from src.bot_state import (
     update_account_balance,
 )
 from src.candles import get_closed_candles, get_last_closed_candle
-from src.config import (
-    CANDLE_LIMIT,
-    GRANULARITY,
-    INTERVAL_MINUTES,
-    LOG_DIR,
-    MAX_OPEN_SYMBOLS,
-    ORDER_MARGIN_MIN_USDT,
-    ORDER_MARGIN_PCT,
-    PAIR_PROFIT_TARGET_PCT,
-    PROFIT_TARGET_PCT,
-    EXCHANGE_DISPLAY_NAME,
-    RSI_MIN_CANDLES,
-    RSI_PERIOD,
-    WEB_PORT,
-    LEVERAGE,
-)
-from src.database import init_db
 from src.market_universe import refresh_volume_rank, set_scan_progress
 from src.profit_target import check_profit_target, refresh_account_profit_info
 from src.rsi import get_rsi_snapshot
@@ -39,9 +45,11 @@ from src.rsi_trading import can_open_new_symbol, close_all_blocked_symbols, eval
 from src.exchange.symbols import is_tradeable_symbol
 from src.margin_guard import get_margin_guard_state, process_margin_guard_cycle, refresh_margin_dashboard_fields
 from src.rsi_positions import get_managed_symbols, get_open_position_count, restore_tracked_positions
+from src.spot_transfer import process_daily_spot_transfer
 from src.trend import candle_color
 from src.web.app import app as web_app
 
+from src import database as db
 
 def setup_logging() -> None:
     LOG_DIR.mkdir(exist_ok=True)
@@ -109,6 +117,11 @@ def log_futures_balance_once(symbol: str) -> None:
             balance.available,
             maint_margin_pct=balance.maint_margin_pct,
         )
+        try:
+            spot_bal = fetch_spot_balance(MARGIN_COIN)
+            db.insert_spot_snapshot(spot_bal)
+        except ExchangeClientError as exc:
+            logging.warning("  Spot balance snapshot skipped: %s", exc)
         refresh_margin_dashboard_fields(
             balance.available,
             balance.account_equity,
@@ -215,6 +228,8 @@ def run_cycle() -> None:
     if check_profit_target(pnl_symbols):
         _complete_cycle(pnl_symbols[0])
         return
+
+    process_daily_spot_transfer(pnl_symbols[0])
 
     scanned: set[str] = set(cycle_symbols)
 

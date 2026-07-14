@@ -144,6 +144,16 @@ def close_position_side(symbol: str, hold_side: str, size: str, **kwargs) -> dic
     return _client().close_position_side(symbol, hold_side, size)
 
 
+def transfer_futures_to_spot(asset: str, amount: float, **kwargs) -> dict:
+    _ = kwargs
+    return _client().transfer_futures_to_spot(asset, amount)
+
+
+def fetch_spot_balance(asset: str = "USDT", **kwargs) -> float:
+    _ = kwargs
+    return _client().fetch_spot_balance(asset)
+
+
 __all__ = [
     "BitgetClientError",
     "Candle",
@@ -163,6 +173,7 @@ __all__ = [
     "fetch_order_detail",
     "fetch_side_mark_price",
     "fetch_side_unrealized_pnl",
+    "fetch_spot_balance",
     "fetch_symbol_positions",
     "fetch_top_futures_by_volume",
     "fetch_total_unrealized_pnl",
@@ -171,4 +182,5 @@ __all__ = [
     "has_credentials",
     "notional_to_size",
     "place_market_order",
+    "transfer_futures_to_spot",
 ]

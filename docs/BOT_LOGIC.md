@@ -452,7 +452,8 @@ Dashboard: nút manual profit take / reset baseline.
 - Badge **≥TP%** (`tp_ready`) trên leg sắp chốt
 - Lịch PnL theo **leg đóng** (timezone VN)
 - **Biểu đồ equity:** line chart (Chart.js), nút 24h / 7 ngày / 30 ngày; cập nhật mỗi 60s
-- API: `/`, `/api/pnl-calendar`, `/api/status`, `/api/profit-takes`, `/api/equity-history`
+- **Rút spot hàng ngày:** bật/tắt + số USDT trên dashboard; lịch sử chuyển; biểu đồ spot
+- API: `/`, `/api/pnl-calendar`, `/api/status`, `/api/profit-takes`, `/api/equity-history`, `/api/spot-history`, `/api/spot-transfers`
 
 ### Lịch sử equity (`equity_snapshots`)
 
@@ -467,6 +468,19 @@ Dashboard: nút manual profit take / reset baseline.
 - Tự prune bản ghi > **90 ngày** (mỗi 100 insert)
 - `GET /api/equity-history?range=24h|7d|30d` — trả `points[]` + `baseline_equity` (đường tham chiếu trên chart)
 - Xóa cùng `clear_dashboard_history()`
+
+### Rút futures → spot hàng ngày ([`spot_transfer.py`](src/spot_transfer.py))
+
+| Mốc (giờ VN) | Hành động |
+|--------------|-----------|
+| `06:55` | Nếu `available < amount` → đóng leg lãi / lỗ ít nhất (giống margin preflight) |
+| `≥ 07:00` | Free nếu thiếu → transfer **1 lần success / ngày** (catch-up nếu miss 7h) |
+
+- Số tiền mặc định `SPOT_TRANSFER_AMOUNT=4`, chỉnh qua dashboard (`settings.spot_transfer_amount`)
+- Trong cùng cycle: **rút spot trước**, mở lệnh sau
+- Binance: `POST /sapi/v1/asset/transfer` type `UMFUTURE_MAIN` (cần quyền Universal Transfer + Spot trên API key)
+- Bitget: `POST /api/v2/spot/wallet/transfer` `usdt_futures` → `spot`
+- Bảng `spot_transfers` + `spot_snapshots`; chart `/api/spot-history`
 
 PnL leg đóng: ưu tiên `realized_pnl_usdt` + `close_price` từ DB; nếu thiếu → ước tính theo `PAIR_PROFIT_TARGET_PCT`.
 
@@ -526,6 +540,12 @@ MARGIN_IMPROVEMENT_PCT=0.3
 MARGIN_PREFLIGHT_ENABLED=true
 MARGIN_PREFLIGHT_BUFFER_PCT=10
 MARGIN_PREFLIGHT_MAX_CLOSES=10
+
+# Rút futures → spot (giờ VN)
+SPOT_TRANSFER_ENABLED=true
+SPOT_TRANSFER_AMOUNT=4
+SPOT_TRANSFER_PREPARE_HHMM=0655
+SPOT_TRANSFER_EXECUTE_HHMM=0700
 
 # App
 WEB_PORT=8080

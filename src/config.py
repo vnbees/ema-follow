@@ -105,5 +105,11 @@ EXCHANGE = _EXCHANGE_RAW
 EXCHANGE_DISPLAY_NAME = "Binance" if EXCHANGE == "binance" else "Bitget"
 
 BINANCE_API_BASE = os.getenv("BINANCE_API_BASE", "https://fapi.binance.com")
+BINANCE_SPOT_API_BASE = os.getenv("BINANCE_SPOT_API_BASE", "https://api.binance.com")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
+
+SPOT_TRANSFER_ENABLED = os.getenv("SPOT_TRANSFER_ENABLED", "true").lower() in ("1", "true", "yes")
+SPOT_TRANSFER_AMOUNT = float(os.getenv("SPOT_TRANSFER_AMOUNT", "4"))
+SPOT_TRANSFER_PREPARE_HHMM = os.getenv("SPOT_TRANSFER_PREPARE_HHMM", "0655").strip()
+SPOT_TRANSFER_EXECUTE_HHMM = os.getenv("SPOT_TRANSFER_EXECUTE_HHMM", "0700").strip()

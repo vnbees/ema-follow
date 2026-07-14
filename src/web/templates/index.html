@@ -24,6 +24,11 @@
     button:hover { background: #30363d; }
     button:disabled { opacity: 0.45; cursor: default; }
     .range-btn.active { background: #238636; border-color: #2ea043; color: #fff; }
+    input[type="number"] {
+      background: #0f1117; color: #e6edf3; border: 1px solid #30363d;
+      border-radius: 6px; padding: 7px 10px; width: 100px;
+    }
+    label { font-size: 13px; color: #8b949e; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
     th, td { padding: 8px 10px; border-bottom: 1px solid #30363d; text-align: left; white-space: nowrap; }
     th { color: #8b949e; font-size: 11px; text-transform: uppercase; }
@@ -33,6 +38,7 @@
     .chart-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
     .chart-wrap { position: relative; height: 280px; }
     .chart-empty { color: #8b949e; font-size: 13px; padding: 48px 0; text-align: center; }
+    .settings-panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 16px 0; }
   </style>
 </head>
 <body>
@@ -60,13 +66,39 @@
     </form>
   </div>
 
+  <div class="settings-panel">
+    <h2>Rút spot hàng ngày</h2>
+    <p class="meta">
+      Hôm nay ({{ spot_transfer.date }}):
+      {% if spot_transfer.success %}
+        <span class="green">đã chuyển</span>
+      {% elif spot_transfer.latest_status %}
+        lần gần nhất: {{ spot_transfer.latest_status }}
+      {% else %}
+        chưa chuyển
+      {% endif %}
+      | prepare {{ spot_transfer.prepare_hhmm }} · execute {{ spot_transfer.execute_hhmm }} (giờ VN)
+    </p>
+    <form method="post" action="/settings/spot-transfer" class="controls">
+      <label>
+        <input type="checkbox" name="enabled" value="on" {% if spot_transfer.enabled %}checked{% endif %}>
+        Bật rút spot
+      </label>
+      <label>
+        Số USDT / ngày
+        <input type="number" name="amount" step="0.01" min="0.01" value="{{ '%.2f'|format(spot_transfer.amount) }}">
+      </label>
+      <button type="submit">Lưu</button>
+    </form>
+  </div>
+
   <div class="chart-panel">
     <div class="chart-header">
       <h2>Biến động equity</h2>
       <div class="controls" style="margin: 0;">
-        <button type="button" class="range-btn" data-range="24h">24h</button>
-        <button type="button" class="range-btn active" data-range="7d">7 ngày</button>
-        <button type="button" class="range-btn" data-range="30d">30 ngày</button>
+        <button type="button" class="range-btn equity-range" data-range="24h">24h</button>
+        <button type="button" class="range-btn equity-range active" data-range="7d">7 ngày</button>
+        <button type="button" class="range-btn equity-range" data-range="30d">30 ngày</button>
       </div>
     </div>
     <div class="chart-wrap">
@@ -75,6 +107,56 @@
     </div>
   </div>
 
+  <div class="chart-panel">
+    <div class="chart-header">
+      <h2>Biến động spot</h2>
+      <div class="controls" style="margin: 0;">
+        <button type="button" class="range-btn spot-range" data-range="24h">24h</button>
+        <button type="button" class="range-btn spot-range active" data-range="7d">7 ngày</button>
+        <button type="button" class="range-btn spot-range" data-range="30d">30 ngày</button>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="spotChart"></canvas>
+      <div id="spotChartEmpty" class="chart-empty" hidden>Chưa có dữ liệu spot — điểm đầu tiên sẽ ghi sau cycle 5 phút tiếp theo.</div>
+    </div>
+  </div>
+
+  <h2>Lịch sử chuyển spot</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Thời gian</th>
+          <th>Ngày</th>
+          <th>Amount</th>
+          <th>Status</th>
+          <th>Legs closed</th>
+          <th>Spot after</th>
+          <th>Error</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in spot_transfers %}
+        <tr>
+          <td class="meta">{{ row.time_vn }}</td>
+          <td>{{ row.transfer_date }}</td>
+          <td>{{ "%.2f"|format(row.amount) }}</td>
+          <td class="{% if row.status == 'success' %}green{% elif row.status == 'failed' %}red{% endif %}">{{ row.status }}</td>
+          <td>{{ row.legs_closed }}</td>
+          <td>{% if row.spot_after is not none %}{{ "%.4f"|format(row.spot_after) }}{% else %}—{% endif %}</td>
+          <td class="meta">{{ row.error }}</td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="7" class="empty">Chưa có lần chuyển nào.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Lệnh gần đây</h2>
   <div class="table-wrap">
     <table>
       <thead>
@@ -114,12 +196,6 @@
 
   <script>
     (function () {
-      const canvas = document.getElementById("equityChart");
-      const emptyEl = document.getElementById("equityChartEmpty");
-      const rangeButtons = document.querySelectorAll(".range-btn");
-      let chart = null;
-      let currentRange = "7d";
-
       function sparseLabels(labels) {
         const maxTicks = 8;
         if (labels.length <= maxTicks) return labels;
@@ -127,119 +203,132 @@
         return labels.map((label, idx) => (idx % step === 0 ? label : ""));
       }
 
-      function buildDatasets(data) {
-        const datasets = [{
-          label: "Equity",
-          data: data.points.map((p) => p.equity),
-          borderColor: "#3fb950",
-          backgroundColor: "rgba(63, 185, 80, 0.12)",
-          fill: true,
-          tension: 0.2,
-          pointRadius: data.points.length > 120 ? 0 : 2,
-          pointHoverRadius: 4,
-        }];
-        if (data.baseline_equity != null && data.points.length > 0) {
-          datasets.push({
-            label: "Baseline",
-            data: data.points.map(() => data.baseline_equity),
-            borderColor: "#8b949e",
-            borderDash: [6, 4],
-            pointRadius: 0,
-            fill: false,
-          });
-        }
-        return datasets;
-      }
-
-      function renderChart(data) {
-        const labels = data.points.map((p) => p.time_vn);
-        const hasPoints = data.points.length > 0;
-        canvas.hidden = !hasPoints;
-        emptyEl.hidden = hasPoints;
-
-        if (!hasPoints) {
-          if (chart) {
-            chart.destroy();
-            chart = null;
+      function makeLineChart({ canvas, emptyEl, valueKey, label, color, points, marginCoin, getTooltipLines }) {
+        let chart = null;
+        function render(data) {
+          const labels = data.points.map((p) => p.time_vn);
+          const hasPoints = data.points.length > 0;
+          canvas.hidden = !hasPoints;
+          emptyEl.hidden = hasPoints;
+          if (!hasPoints) {
+            if (chart) { chart.destroy(); chart = null; }
+            return;
           }
-          return;
-        }
-
-        const config = {
-          type: "line",
-          data: {
-            labels: sparseLabels(labels),
-            datasets: buildDatasets(data),
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            interaction: { mode: "index", intersect: false },
-            plugins: {
-              legend: {
-                labels: { color: "#e6edf3" },
-              },
-              tooltip: {
-                callbacks: {
-                  title: (items) => {
-                    const idx = items[0].dataIndex;
-                    return data.points[idx].time_vn;
-                  },
-                  label: (ctx) => {
-                    if (ctx.dataset.label === "Baseline") {
-                      return `Baseline: ${ctx.parsed.y.toFixed(2)} ${data.margin_coin}`;
-                    }
-                    const point = data.points[ctx.dataIndex];
-                    return [
-                      `Equity: ${point.equity.toFixed(2)} ${data.margin_coin}`,
-                      `Available: ${point.available.toFixed(2)} ${data.margin_coin}`,
-                    ];
+          const config = {
+            type: "line",
+            data: {
+              labels: sparseLabels(labels),
+              datasets: [{
+                label,
+                data: data.points.map((p) => p[valueKey]),
+                borderColor: color,
+                backgroundColor: color.replace(")", ", 0.12)").replace("rgb", "rgba"),
+                fill: true,
+                tension: 0.2,
+                pointRadius: data.points.length > 120 ? 0 : 2,
+                pointHoverRadius: 4,
+              }],
+            },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              interaction: { mode: "index", intersect: false },
+              plugins: {
+                legend: { labels: { color: "#e6edf3" } },
+                tooltip: {
+                  callbacks: {
+                    title: (items) => data.points[items[0].dataIndex].time_vn,
+                    label: (ctx) => getTooltipLines(data.points[ctx.dataIndex], marginCoin || data.margin_coin),
                   },
                 },
               },
-            },
-            scales: {
-              x: {
-                ticks: { color: "#8b949e", maxRotation: 0, autoSkip: true },
-                grid: { color: "#21262d" },
-              },
-              y: {
-                ticks: {
-                  color: "#8b949e",
-                  callback: (value) => `${Number(value).toFixed(0)}`,
+              scales: {
+                x: { ticks: { color: "#8b949e", maxRotation: 0, autoSkip: true }, grid: { color: "#21262d" } },
+                y: {
+                  ticks: { color: "#8b949e", callback: (value) => `${Number(value).toFixed(0)}` },
+                  grid: { color: "#21262d" },
                 },
-                grid: { color: "#21262d" },
               },
             },
-          },
-        };
-
-        if (chart) {
-          chart.data = config.data;
-          chart.options = config.options;
-          chart.update();
-        } else {
-          chart = new Chart(canvas, config);
+          };
+          if (data.baseline_equity != null && data.points.length > 0) {
+            config.data.datasets.push({
+              label: "Baseline",
+              data: data.points.map(() => data.baseline_equity),
+              borderColor: "#8b949e",
+              borderDash: [6, 4],
+              pointRadius: 0,
+              fill: false,
+            });
+          }
+          if (chart) {
+            chart.data = config.data;
+            chart.options = config.options;
+            chart.update();
+          } else {
+            chart = new Chart(canvas, config);
+          }
         }
+        return { render };
       }
 
-      async function loadEquityHistory(range) {
-        currentRange = range;
+      const equityChart = makeLineChart({
+        canvas: document.getElementById("equityChart"),
+        emptyEl: document.getElementById("equityChartEmpty"),
+        valueKey: "equity",
+        label: "Equity",
+        color: "rgb(63, 185, 80)",
+        getTooltipLines: (point, coin) => [
+          `Equity: ${point.equity.toFixed(2)} ${coin}`,
+          `Available: ${point.available.toFixed(2)} ${coin}`,
+        ],
+      });
+
+      const spotChart = makeLineChart({
+        canvas: document.getElementById("spotChart"),
+        emptyEl: document.getElementById("spotChartEmpty"),
+        valueKey: "balance",
+        label: "Spot",
+        color: "rgb(88, 166, 255)",
+        getTooltipLines: (point, coin) => [`Spot: ${point.balance.toFixed(4)} ${coin}`],
+      });
+
+      let equityRange = "7d";
+      let spotRange = "7d";
+
+      async function loadEquity(range) {
+        equityRange = range;
         const res = await fetch(`/api/equity-history?range=${encodeURIComponent(range)}`);
-        const data = await res.json();
-        renderChart(data);
+        equityChart.render(await res.json());
       }
 
-      rangeButtons.forEach((btn) => {
+      async function loadSpot(range) {
+        spotRange = range;
+        const res = await fetch(`/api/spot-history?range=${encodeURIComponent(range)}`);
+        spotChart.render(await res.json());
+      }
+
+      document.querySelectorAll(".equity-range").forEach((btn) => {
         btn.addEventListener("click", () => {
-          rangeButtons.forEach((b) => b.classList.remove("active"));
+          document.querySelectorAll(".equity-range").forEach((b) => b.classList.remove("active"));
           btn.classList.add("active");
-          loadEquityHistory(btn.dataset.range);
+          loadEquity(btn.dataset.range);
+        });
+      });
+      document.querySelectorAll(".spot-range").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          document.querySelectorAll(".spot-range").forEach((b) => b.classList.remove("active"));
+          btn.classList.add("active");
+          loadSpot(btn.dataset.range);
         });
       });
 
-      loadEquityHistory(currentRange);
-      setInterval(() => loadEquityHistory(currentRange), 60000);
+      loadEquity(equityRange);
+      loadSpot(spotRange);
+      setInterval(() => {
+        loadEquity(equityRange);
+        loadSpot(spotRange);
+      }, 60000);
     })();
   </script>
 </body>

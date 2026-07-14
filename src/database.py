@@ -86,6 +86,7 @@ def init_db() -> None:
         _migrate_manual_hold_symbols(conn)
         _migrate_rsi_pair_lots(conn)
         _migrate_equity_snapshots(conn)
+        _migrate_spot_transfer_tables(conn)
 
 
 def _migrate_profit_take_trigger_type(conn: sqlite3.Connection) -> None:
@@ -1521,6 +1522,199 @@ def prune_equity_snapshots(*, older_than_days: int = 90) -> int:
         return int(cursor.rowcount)
 
 
+_SPOT_SNAPSHOT_PRUNE_EVERY = 100
+_spot_snapshot_insert_count = 0
+
+
+def _migrate_spot_transfer_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS spot_transfers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            transfer_date TEXT NOT NULL,
+            amount REAL NOT NULL,
+            status TEXT NOT NULL,
+            tran_id TEXT,
+            available_before REAL,
+            spot_after REAL,
+            legs_closed INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_spot_transfers_date_status
+        ON spot_transfers(transfer_date, status)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS spot_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recorded_at TEXT NOT NULL,
+            balance REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_spot_snapshots_recorded_at
+        ON spot_snapshots(recorded_at)
+        """
+    )
+
+
+def insert_spot_transfer(
+    *,
+    transfer_date: str,
+    amount: float,
+    status: str,
+    tran_id: str | None = None,
+    available_before: float | None = None,
+    spot_after: float | None = None,
+    legs_closed: int = 0,
+    error: str | None = None,
+) -> int:
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO spot_transfers (
+                transfer_date, amount, status, tran_id,
+                available_before, spot_after, legs_closed, error, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transfer_date,
+                amount,
+                status,
+                tran_id,
+                available_before,
+                spot_after,
+                legs_closed,
+                error,
+                _utc_now(),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def get_spot_transfers(limit: int = 50) -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM spot_transfers
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def has_successful_transfer_on_date(transfer_date: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM spot_transfers
+            WHERE transfer_date = ? AND status = 'success'
+            LIMIT 1
+            """,
+            (transfer_date,),
+        ).fetchone()
+        return row is not None
+
+
+def get_setting_bool(key: str, default: bool) -> bool:
+    raw = get_setting(key, "")
+    if not raw:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def set_setting_bool(key: str, value: bool) -> None:
+    set_setting(key, "true" if value else "false")
+
+
+def get_spot_transfer_amount(default: float) -> float:
+    raw = get_setting("spot_transfer_amount", "")
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def set_spot_transfer_amount(amount: float) -> None:
+    set_setting("spot_transfer_amount", str(amount))
+
+
+def is_spot_transfer_enabled(default: bool = True) -> bool:
+    return get_setting_bool("spot_transfer_enabled", default)
+
+
+def set_spot_transfer_enabled(enabled: bool) -> None:
+    set_setting_bool("spot_transfer_enabled", enabled)
+
+
+def insert_spot_snapshot(balance: float) -> int:
+    global _spot_snapshot_insert_count
+    now = _utc_now()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO spot_snapshots (recorded_at, balance)
+            VALUES (?, ?)
+            """,
+            (now, balance),
+        )
+        row_id = int(cursor.lastrowid)
+    _spot_snapshot_insert_count += 1
+    if _spot_snapshot_insert_count % _SPOT_SNAPSHOT_PRUNE_EVERY == 0:
+        prune_spot_snapshots()
+    return row_id
+
+
+def get_spot_snapshots(
+    since: datetime | None = None,
+    *,
+    limit: int = 10000,
+) -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        if since is not None:
+            since_iso = since.astimezone(timezone.utc).isoformat()
+            return conn.execute(
+                """
+                SELECT * FROM spot_snapshots
+                WHERE recorded_at >= ?
+                ORDER BY recorded_at ASC
+                LIMIT ?
+                """,
+                (since_iso, limit),
+            ).fetchall()
+        return conn.execute(
+            """
+            SELECT * FROM spot_snapshots
+            ORDER BY recorded_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def prune_spot_snapshots(*, older_than_days: int = 90) -> int:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM spot_snapshots WHERE recorded_at < ?",
+            (cutoff,),
+        )
+        return int(cursor.rowcount)
+
+
 def clear_dashboard_history(*, reset_baseline: bool = True) -> dict[str, int]:
     """Delete RSI lot/trade history shown on the dashboard. Keeps manual_hold_symbols."""
     tables = (
@@ -1530,6 +1724,8 @@ def clear_dashboard_history(*, reset_baseline: bool = True) -> dict[str, int]:
         "entries",
         "trade_cycles",
         "equity_snapshots",
+        "spot_transfers",
+        "spot_snapshots",
     )
     counts: dict[str, int] = {}
     with get_connection() as conn:

@@ -14,7 +14,14 @@ from src.exchange import (
     fetch_symbol_positions,
     has_credentials,
 )
-from src.config import EXCHANGE_DISPLAY_NAME, MAX_OPEN_LEGS, MAX_OPEN_SYMBOLS, PAIR_PROFIT_TARGET_PCT, PROFIT_TARGET_PCT
+from src.config import (
+    EXCHANGE_DISPLAY_NAME,
+    MARGIN_COIN,
+    MAX_OPEN_LEGS,
+    MAX_OPEN_SYMBOLS,
+    PAIR_PROFIT_TARGET_PCT,
+    PROFIT_TARGET_PCT,
+)
 from src.rsi_signals import price_move_pct, should_take_profit
 from src.bot_state import (
     get_account_balance,
@@ -29,6 +36,11 @@ from src.market_universe import get_last_refreshed, get_scan_stats
 from src.orderflow import live_state_to_dict
 from src.pnl import estimate_tp_pnl_usdt, leg_realized_pnl, leg_unrealized_pnl, roi_pct
 from src.profit_target import reset_baseline_to_current_equity, trigger_manual_profit_take
+from src.spot_transfer import (
+    set_enabled as set_spot_transfer_enabled,
+    set_transfer_amount,
+    today_transfer_status,
+)
 from src.web.calendar_build import VN_TZ, build_rsi_pnl_calendar
 from src.web.number_format import format_dashboard_pnl, format_dashboard_price, format_dashboard_size
 from src.web.time_format import format_vn_time
@@ -71,6 +83,41 @@ def build_equity_history_payload(range_key: str) -> dict:
             for row in rows
         ],
     }
+
+
+def build_spot_history_payload(range_key: str) -> dict:
+    key = range_key if range_key in _EQUITY_RANGES else "7d"
+    rows = db.get_spot_snapshots(_equity_since_for_range(key))
+    return {
+        "range": key,
+        "margin_coin": MARGIN_COIN,
+        "points": [
+            {
+                "time_vn": format_vn_time(str(row["recorded_at"])),
+                "balance": float(row["balance"]),
+            }
+            for row in rows
+        ],
+    }
+
+
+def _build_spot_transfer_rows(limit: int = 20) -> list[dict]:
+    rows = db.get_spot_transfers(limit)
+    return [
+        {
+            "time_vn": format_vn_time(str(row["created_at"])),
+            "transfer_date": str(row["transfer_date"]),
+            "amount": float(row["amount"]),
+            "status": str(row["status"]),
+            "legs_closed": int(row["legs_closed"] or 0),
+            "tran_id": row["tran_id"] or "—",
+            "error": row["error"] or "—",
+            "spot_after": (
+                float(row["spot_after"]) if row["spot_after"] is not None else None
+            ),
+        }
+        for row in rows
+    ]
 
 
 def _fetch_symbol_marks(symbols: list[str]) -> dict[str, float]:
@@ -493,12 +540,16 @@ def _build_recent_orders(limit: int = 10) -> list[dict]:
 
 def _simple_dashboard_context() -> dict:
     account = get_account_balance()
+    spot_status = today_transfer_status()
     return {
         "exchange_name": EXCHANGE_DISPLAY_NAME,
         "account": account,
         "recent_orders": _build_recent_orders(10),
         "last_cycle_at": get_last_cycle_at(),
         "trading_enabled": is_trading_enabled(),
+        "spot_transfer": spot_status,
+        "spot_transfers": _build_spot_transfer_rows(15),
+        "margin_coin": MARGIN_COIN,
     }
 
 
@@ -633,6 +684,27 @@ def api_status() -> dict:
 @app.get("/api/equity-history")
 def api_equity_history(range: str = Query(default="7d")) -> dict:
     return build_equity_history_payload(range)
+
+
+@app.get("/api/spot-history")
+def api_spot_history(range: str = Query(default="7d")) -> dict:
+    return build_spot_history_payload(range)
+
+
+@app.get("/api/spot-transfers")
+def api_spot_transfers(limit: int = Query(default=50, ge=1, le=200)) -> list[dict]:
+    return _build_spot_transfer_rows(limit)
+
+
+@app.post("/settings/spot-transfer")
+def form_spot_transfer_settings(
+    enabled: str = Form(default="off"),
+    amount: float = Form(default=4.0),
+) -> RedirectResponse:
+    set_spot_transfer_enabled(enabled.lower() in ("1", "true", "yes", "on"))
+    if amount > 0:
+        set_transfer_amount(amount)
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.get("/api/symbols")

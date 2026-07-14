@@ -8,6 +8,7 @@ from src.config import (
     BINANCE_API_BASE,
     BINANCE_API_KEY,
     BINANCE_SECRET_KEY,
+    BINANCE_SPOT_API_BASE,
     CANDLE_LIMIT,
     GRANULARITY,
     LEVERAGE,
@@ -99,6 +100,76 @@ def _private_get(path: str, params: dict[str, str | int | float | bool], max_ret
 
 def _private_post(path: str, params: dict[str, str | int | float | bool], max_retries: int = 3) -> Any:
     return _private_request("POST", path, params, max_retries=max_retries)
+
+
+def _spot_private_request(
+    method: str,
+    path: str,
+    params: dict[str, str | int | float | bool],
+    max_retries: int = 3,
+) -> Any:
+    _ensure_credentials()
+    signed = signed_params(BINANCE_API_KEY, BINANCE_SECRET_KEY, params)
+    url = f"{BINANCE_SPOT_API_BASE}{path}"
+    headers = auth_headers(BINANCE_API_KEY)
+    last_error: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            if method == "GET":
+                response = requests.get(url, params=signed, headers=headers, timeout=10)
+            else:
+                response = requests.post(url, params=signed, headers=headers, timeout=10)
+            if not response.ok:
+                raise ExchangeClientError(f"HTTP {response.status_code}: {_parse_api_error(response)}")
+            if not response.text:
+                return {}
+            return response.json()
+        except (requests.RequestException, ExchangeClientError, ValueError) as exc:
+            last_error = exc
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+    raise ExchangeClientError(f"{method} {path} failed after {max_retries} attempts: {last_error}")
+
+
+def transfer_futures_to_spot(asset: str, amount: float) -> dict:
+    """Transfer from USDT-M futures wallet to spot (UMFUTURE_MAIN)."""
+    if amount <= 0:
+        raise ExchangeClientError("Transfer amount must be positive")
+    result = _spot_private_request(
+        "POST",
+        "/sapi/v1/asset/transfer",
+        {
+            "type": "UMFUTURE_MAIN",
+            "asset": asset.upper(),
+            "amount": amount,
+        },
+    )
+    return {
+        "tranId": str(result.get("tranId", "")),
+        "clientOid": str(result.get("clientTranId", "") or result.get("tranId", "")),
+        "raw": result,
+    }
+
+
+def fetch_spot_balance(asset: str = "USDT") -> float:
+    asset = asset.upper()
+    rows = _spot_private_request(
+        "POST",
+        "/sapi/v3/asset/getUserAsset",
+        {"asset": asset},
+    )
+    if isinstance(rows, list):
+        for row in rows:
+            if str(row.get("asset", "")).upper() == asset:
+                free = float(row.get("free") or 0)
+                locked = float(row.get("locked") or 0)
+                return free + locked
+        return 0.0
+    if isinstance(rows, dict):
+        free = float(rows.get("free") or 0)
+        locked = float(rows.get("locked") or 0)
+        return free + locked
+    return 0.0
 
 
 def _decimals_from_step(step: str) -> int:
@@ -489,3 +560,5 @@ class BinanceExchange:
     configure_symbol_trading = staticmethod(configure_symbol_trading)
     place_market_order = staticmethod(place_market_order)
     close_position_side = staticmethod(close_position_side)
+    transfer_futures_to_spot = staticmethod(transfer_futures_to_spot)
+    fetch_spot_balance = staticmethod(fetch_spot_balance)

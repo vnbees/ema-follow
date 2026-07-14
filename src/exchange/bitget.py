@@ -66,6 +66,18 @@ class BitgetExchange:
     def close_position_side(self, symbol: str, hold_side: str, size: str) -> dict:
         return bg.close_position_side(symbol, hold_side, size)
 
+    def transfer_futures_to_spot(self, asset: str, amount: float) -> dict:
+        try:
+            return bg.transfer_futures_to_spot(asset, amount)
+        except bg.BitgetClientError as exc:
+            raise ExchangeClientError(str(exc)) from exc
+
+    def fetch_spot_balance(self, asset: str = "USDT") -> float:
+        try:
+            return bg.fetch_spot_balance(asset)
+        except bg.BitgetClientError as exc:
+            raise ExchangeClientError(str(exc)) from exc
+
 
 def _wrap_error(exc: Exception) -> ExchangeClientError:
     if isinstance(exc, bg.BitgetClientError):
