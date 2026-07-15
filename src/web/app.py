@@ -38,7 +38,7 @@ from src.pnl import estimate_tp_pnl_usdt, leg_realized_pnl, leg_unrealized_pnl, 
 from src.profit_target import reset_baseline_to_current_equity, trigger_manual_profit_take
 from src.spot_transfer import (
     set_enabled as set_spot_transfer_enabled,
-    set_transfer_amount,
+    set_transfer_pct,
     today_transfer_status,
 )
 from src.web.calendar_build import VN_TZ, build_rsi_pnl_calendar
@@ -699,11 +699,11 @@ def api_spot_transfers(limit: int = Query(default=50, ge=1, le=200)) -> list[dic
 @app.post("/settings/spot-transfer")
 def form_spot_transfer_settings(
     enabled: str = Form(default="off"),
-    amount: float = Form(default=4.0),
+    pct: float = Form(default=1.0),
 ) -> RedirectResponse:
     set_spot_transfer_enabled(enabled.lower() in ("1", "true", "yes", "on"))
-    if amount > 0:
-        set_transfer_amount(amount)
+    if pct > 0:
+        set_transfer_pct(pct)
     return RedirectResponse(url="/", status_code=303)
 
 

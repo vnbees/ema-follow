@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -10,9 +11,9 @@ from src import database as db
 from src.config import (
     MARGIN_COIN,
     MARGIN_PREFLIGHT_MAX_CLOSES,
-    SPOT_TRANSFER_AMOUNT,
     SPOT_TRANSFER_ENABLED,
     SPOT_TRANSFER_EXECUTE_HHMM,
+    SPOT_TRANSFER_PCT,
     SPOT_TRANSFER_PREPARE_HHMM,
 )
 from src.exchange import (
@@ -31,6 +32,7 @@ from src.margin_preflight import (
 )
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+_MIN_TRANSFER_USDT = 0.01
 
 _PREPARED_DATES: set[str] = set()
 
@@ -65,14 +67,22 @@ def _hhmm_to_minutes(raw: str, fallback: tuple[int, int]) -> int:
     return hour * 60 + minute
 
 
-def get_transfer_amount() -> float:
-    return db.get_spot_transfer_amount(SPOT_TRANSFER_AMOUNT)
+def get_transfer_pct() -> float:
+    return db.get_spot_transfer_pct(SPOT_TRANSFER_PCT)
 
 
-def set_transfer_amount(amount: float) -> None:
-    if amount <= 0:
-        raise ValueError("amount must be positive")
-    db.set_spot_transfer_amount(amount)
+def set_transfer_pct(pct: float) -> None:
+    if pct <= 0:
+        raise ValueError("pct must be positive")
+    db.set_spot_transfer_pct(pct)
+
+
+def compute_transfer_amount(equity: float, pct: float | None = None) -> float:
+    """Return floor(equity * pct / 100, 2 decimals)."""
+    rate = get_transfer_pct() if pct is None else pct
+    if equity <= 0 or rate <= 0:
+        return 0.0
+    return math.floor(equity * rate / 100.0 * 100) / 100.0
 
 
 def is_enabled() -> bool:
@@ -173,6 +183,13 @@ def ensure_available_for_transfer(required: float, ref_symbol: str) -> tuple[boo
     return ok, closes
 
 
+def _resolve_amount(ref_symbol: str) -> tuple[float, float]:
+    """Return (amount_usdt, equity)."""
+    balance = fetch_futures_balance(ref_symbol)
+    amount = compute_transfer_amount(balance.account_equity)
+    return amount, balance.account_equity
+
+
 def _prepare_for_transfer(ref_symbol: str, amount: float, transfer_date: str) -> None:
     if transfer_date in _PREPARED_DATES:
         return
@@ -196,6 +213,20 @@ def _prepare_for_transfer(ref_symbol: str, amount: float, transfer_date: str) ->
 
 def _execute_transfer(ref_symbol: str, amount: float, transfer_date: str) -> None:
     if db.has_successful_transfer_on_date(transfer_date):
+        return
+
+    if amount < _MIN_TRANSFER_USDT:
+        db.insert_spot_transfer(
+            transfer_date=transfer_date,
+            amount=amount,
+            status="skipped",
+            error=f"amount below minimum ({amount:.4f} < {_MIN_TRANSFER_USDT})",
+        )
+        logging.info(
+            "  Spot transfer skipped for %s — amount %.4f below minimum",
+            transfer_date,
+            amount,
+        )
         return
 
     ok, closes = ensure_available_for_transfer(amount, ref_symbol)
@@ -231,12 +262,13 @@ def _execute_transfer(ref_symbol: str, amount: float, transfer_date: str) -> Non
             legs_closed=closes,
         )
         logging.info(
-            "  Spot transfer success: %.2f %s futures→spot (date=%s, tranId=%s, closes=%d)",
+            "  Spot transfer success: %.2f %s futures→spot (date=%s, tranId=%s, closes=%d, pct=%.2f%%)",
             amount,
             MARGIN_COIN,
             transfer_date,
             result.get("tranId"),
             closes,
+            get_transfer_pct(),
         )
         if spot_after is not None:
             try:
@@ -267,16 +299,26 @@ def process_daily_spot_transfer(ref_symbol: str) -> None:
     if db.has_successful_transfer_on_date(transfer_date):
         return
 
-    amount = get_transfer_amount()
-    if amount <= 0:
+    try:
+        amount, equity = _resolve_amount(ref_symbol)
+    except ExchangeClientError as exc:
+        logging.warning("  Spot transfer skipped — balance fetch failed: %s", exc)
         return
+
+    logging.info(
+        "  Spot transfer target: %.2f USDT (%.2f%% of equity %.2f)",
+        amount,
+        get_transfer_pct(),
+        equity,
+    )
 
     now_mins = _minutes_of_day(now)
     prepare_mins = _hhmm_to_minutes(SPOT_TRANSFER_PREPARE_HHMM, (6, 55))
     execute_mins = _hhmm_to_minutes(SPOT_TRANSFER_EXECUTE_HHMM, (7, 0))
 
     if now_mins >= prepare_mins and now_mins < execute_mins:
-        _prepare_for_transfer(ref_symbol, amount, transfer_date)
+        if amount >= _MIN_TRANSFER_USDT:
+            _prepare_for_transfer(ref_symbol, amount, transfer_date)
         return
 
     if now_mins >= execute_mins:
@@ -292,10 +334,21 @@ def today_transfer_status() -> dict:
     ]
     success = next((row for row in rows if row["status"] == "success"), None)
     latest = rows[0] if rows else None
+    pct = get_transfer_pct()
+    amount_preview = 0.0
+    try:
+        from src.bot_state import get_account_balance
+
+        equity = get_account_balance().equity
+        if equity > 0:
+            amount_preview = compute_transfer_amount(equity, pct)
+    except Exception:  # noqa: BLE001
+        pass
     return {
         "date": transfer_date,
         "enabled": is_enabled(),
-        "amount": get_transfer_amount(),
+        "pct": pct,
+        "amount_preview": amount_preview,
         "success": success is not None,
         "latest_status": str(latest["status"]) if latest else None,
         "prepare_hhmm": SPOT_TRANSFER_PREPARE_HHMM,

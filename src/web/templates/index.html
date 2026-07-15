@@ -85,11 +85,15 @@
         Bật rút spot
       </label>
       <label>
-        Số USDT / ngày
-        <input type="number" name="amount" step="0.01" min="0.01" value="{{ '%.2f'|format(spot_transfer.amount) }}">
+        % equity / ngày
+        <input type="number" name="pct" step="0.01" min="0.01" value="{{ '%.2f'|format(spot_transfer.pct) }}">
       </label>
       <button type="submit">Lưu</button>
     </form>
+    <p class="meta">
+      Preview hôm nay: ≈ {{ "%.2f"|format(spot_transfer.amount_preview) }} {{ margin_coin }}
+      ({{ "%.2f"|format(spot_transfer.pct) }}% equity hiện tại)
+    </p>
   </div>
 
   <div class="chart-panel">

@@ -8,12 +8,21 @@ from zoneinfo import ZoneInfo
 from src import database as db
 from src.spot_transfer import (
     _PREPARED_DATES,
+    compute_transfer_amount,
     ensure_available_for_transfer,
     process_daily_spot_transfer,
 )
 
 
 VN = ZoneInfo("Asia/Ho_Chi_Minh")
+
+
+class TestComputeTransferAmount(unittest.TestCase):
+    def test_floor_two_decimals(self) -> None:
+        self.assertAlmostEqual(compute_transfer_amount(437.75, 1.0), 4.37)
+        self.assertAlmostEqual(compute_transfer_amount(100.0, 1.0), 1.0)
+        self.assertAlmostEqual(compute_transfer_amount(50.0, 2.0), 1.0)
+        self.assertEqual(compute_transfer_amount(0.5, 1.0), 0.0)
 
 
 class TestSpotTransfer(unittest.TestCase):
@@ -24,7 +33,7 @@ class TestSpotTransfer(unittest.TestCase):
         self.patcher.start()
         db.init_db()
         db.set_spot_transfer_enabled(True)
-        db.set_spot_transfer_amount(4.0)
+        db.set_spot_transfer_pct(1.0)
         _PREPARED_DATES.clear()
 
     def tearDown(self) -> None:
@@ -48,20 +57,23 @@ class TestSpotTransfer(unittest.TestCase):
     def test_execute_once_per_day(
         self,
         mock_now,
-        _ensure,
+        ensure,
         fetch_bal,
         _spot_bal,
         transfer,
         _creds,
     ) -> None:
         mock_now.return_value = datetime(2026, 7, 13, 8, 0, tzinfo=VN)
-        fetch_bal.return_value = MagicMock(available=20.0)
+        fetch_bal.return_value = MagicMock(available=20.0, account_equity=400.0)
         transfer.return_value = {"tranId": "abc", "clientOid": "c1"}
 
         process_daily_spot_transfer("BTCUSDT")
         process_daily_spot_transfer("BTCUSDT")
 
         self.assertEqual(transfer.call_count, 1)
+        ensure.assert_called()
+        # 1% of 400 = 4.0
+        self.assertAlmostEqual(ensure.call_args[0][0], 4.0)
         self.assertTrue(db.has_successful_transfer_on_date("2026-07-13"))
         rows = db.get_spot_transfers(5)
         self.assertEqual(len(rows), 1)
@@ -71,20 +83,24 @@ class TestSpotTransfer(unittest.TestCase):
     @patch("src.spot_transfer.has_credentials", return_value=True)
     @patch("src.spot_transfer.transfer_futures_to_spot")
     @patch("src.spot_transfer.ensure_available_for_transfer")
+    @patch("src.spot_transfer.fetch_futures_balance")
     @patch("src.spot_transfer._vn_now")
-    def test_prepare_window_does_not_transfer(
+    def test_prepare_window_frees_but_does_not_transfer(
         self,
         mock_now,
+        fetch_bal,
         ensure,
         transfer,
         _creds,
     ) -> None:
         mock_now.return_value = datetime(2026, 7, 13, 6, 55, tzinfo=VN)
+        fetch_bal.return_value = MagicMock(available=1.0, account_equity=400.0)
         ensure.return_value = (True, 1)
 
         process_daily_spot_transfer("BTCUSDT")
 
         ensure.assert_called_once()
+        self.assertAlmostEqual(ensure.call_args[0][0], 4.0)
         transfer.assert_not_called()
         self.assertFalse(db.has_successful_transfer_on_date("2026-07-13"))
 
@@ -92,22 +108,46 @@ class TestSpotTransfer(unittest.TestCase):
     @patch("src.spot_transfer.fetch_futures_balance")
     @patch("src.spot_transfer.ensure_available_for_transfer", return_value=(False, 2))
     @patch("src.spot_transfer._vn_now")
-    def test_failed_transfer_recorded(
+    def test_failed_when_cannot_free_enough(
         self,
         mock_now,
-        _ensure,
+        ensure,
         fetch_bal,
         _creds,
     ) -> None:
         mock_now.return_value = datetime(2026, 7, 13, 7, 5, tzinfo=VN)
-        fetch_bal.return_value = MagicMock(available=1.0)
+        fetch_bal.return_value = MagicMock(available=1.0, account_equity=400.0)
 
         process_daily_spot_transfer("BTCUSDT")
 
+        ensure.assert_called_once()
         rows = db.get_spot_transfers(5)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "failed")
         self.assertEqual(int(rows[0]["legs_closed"]), 2)
+
+    @patch("src.spot_transfer.has_credentials", return_value=True)
+    @patch("src.spot_transfer.transfer_futures_to_spot")
+    @patch("src.spot_transfer.ensure_available_for_transfer")
+    @patch("src.spot_transfer.fetch_futures_balance")
+    @patch("src.spot_transfer._vn_now")
+    def test_skip_when_amount_too_small(
+        self,
+        mock_now,
+        fetch_bal,
+        ensure,
+        transfer,
+        _creds,
+    ) -> None:
+        mock_now.return_value = datetime(2026, 7, 13, 8, 0, tzinfo=VN)
+        fetch_bal.return_value = MagicMock(available=10.0, account_equity=0.5)
+
+        process_daily_spot_transfer("BTCUSDT")
+
+        transfer.assert_not_called()
+        ensure.assert_not_called()
+        rows = db.get_spot_transfers(5)
+        self.assertEqual(rows[0]["status"], "skipped")
 
 
 class TestSpotSnapshots(unittest.TestCase):

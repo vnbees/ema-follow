@@ -476,7 +476,8 @@ Dashboard: nút manual profit take / reset baseline.
 | `06:55` | Nếu `available < amount` → đóng leg lãi / lỗ ít nhất (giống margin preflight) |
 | `≥ 07:00` | Free nếu thiếu → transfer **1 lần success / ngày** (catch-up nếu miss 7h) |
 
-- Số tiền mặc định `SPOT_TRANSFER_AMOUNT=4`, chỉnh qua dashboard (`settings.spot_transfer_amount`)
+- Số tiền = `SPOT_TRANSFER_PCT` % futures equity (mặc định **1%**), chỉnh qua dashboard (`settings.spot_transfer_pct`)
+- `amount = floor(equity × pct / 100, 2 dp)`; nếu `available < amount` → đóng leg lãi / lỗ ít nhất rồi cả cặp (giống margin preflight)
 - Trong cùng cycle: **rút spot trước**, mở lệnh sau
 - Binance: `POST /sapi/v1/asset/transfer` type `UMFUTURE_MAIN` (cần quyền Universal Transfer + Spot trên API key)
 - Bitget: `POST /api/v2/spot/wallet/transfer` `usdt_futures` → `spot`
@@ -543,7 +544,7 @@ MARGIN_PREFLIGHT_MAX_CLOSES=10
 
 # Rút futures → spot (giờ VN)
 SPOT_TRANSFER_ENABLED=true
-SPOT_TRANSFER_AMOUNT=4
+SPOT_TRANSFER_PCT=1
 SPOT_TRANSFER_PREPARE_HHMM=0655
 SPOT_TRANSFER_EXECUTE_HHMM=0700
 

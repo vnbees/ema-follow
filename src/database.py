@@ -1637,8 +1637,8 @@ def set_setting_bool(key: str, value: bool) -> None:
     set_setting(key, "true" if value else "false")
 
 
-def get_spot_transfer_amount(default: float) -> float:
-    raw = get_setting("spot_transfer_amount", "")
+def get_spot_transfer_pct(default: float) -> float:
+    raw = get_setting("spot_transfer_pct", "")
     if not raw:
         return default
     try:
@@ -1648,8 +1648,8 @@ def get_spot_transfer_amount(default: float) -> float:
     return value if value > 0 else default
 
 
-def set_spot_transfer_amount(amount: float) -> None:
-    set_setting("spot_transfer_amount", str(amount))
+def set_spot_transfer_pct(pct: float) -> None:
+    set_setting("spot_transfer_pct", str(pct))
 
 
 def is_spot_transfer_enabled(default: bool = True) -> bool:
