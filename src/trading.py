@@ -47,13 +47,44 @@ def _get_state(symbol: str) -> SymbolTradingState:
     return _states[symbol]
 
 
+def _expected_margin_mode() -> str:
+    mode = MARGIN_MODE.lower().strip()
+    if mode in ("crossed", "cross"):
+        return "crossed"
+    return "isolated"
+
+
 def ensure_symbol_configured(symbol: str) -> None:
     state = _get_state(symbol)
     if state.configured:
         return
+
+    symbol = symbol.upper()
+    expected_margin = _expected_margin_mode()
+    row = db.get_symbol_trading_config(symbol)
+    if row is not None:
+        if (
+            str(row["margin_mode"]).lower() == expected_margin
+            and int(row["leverage"]) == LEVERAGE
+        ):
+            state.configured = True
+            logging.info(
+                "  Trading config: symbol=%s margin=%s leverage=%dx (persisted)",
+                symbol,
+                expected_margin,
+                LEVERAGE,
+            )
+            return
+
     configure_symbol_trading(symbol)
+    db.upsert_symbol_trading_config(symbol, expected_margin, LEVERAGE)
     state.configured = True
-    logging.info("  Trading config: symbol=%s margin=%s leverage=%dx", symbol, MARGIN_MODE, LEVERAGE)
+    logging.info(
+        "  Trading config: symbol=%s margin=%s leverage=%dx",
+        symbol,
+        expected_margin,
+        LEVERAGE,
+    )
 
 
 def configure_all_symbols(symbols: list[str]) -> None:
@@ -66,11 +97,6 @@ def configure_all_symbols(symbols: list[str]) -> None:
 
 def on_symbol_added(symbol: str) -> None:
     _get_state(symbol)
-    if TRADING_ENABLED:
-        try:
-            ensure_symbol_configured(symbol)
-        except BitgetClientError as exc:
-            logging.warning("  [%s] Trading config failed on add: %s", symbol, exc)
 
 
 def on_symbol_removed(symbol: str) -> None:

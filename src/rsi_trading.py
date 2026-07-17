@@ -80,6 +80,10 @@ def _force_close_blocked_symbol(symbol: str, mark: float) -> bool:
         fill = _close_side_and_resolve_fill(symbol, side, pos.size, mark)
         db.close_all_lot_sides(symbol, side, close_price=fill)
         closed_any = True
+    if closed_any:
+        from src.notify import notify_close
+
+        notify_close(symbol, "L+S")
     return closed_any
 
 
@@ -103,6 +107,10 @@ def close_hedge_symbol(symbol: str, mark: float | None = None) -> bool:
         fill = _close_side_and_resolve_fill(symbol, side, pos.size, mark)
         db.close_all_lot_sides(symbol, side, close_price=fill)
         closed_any = True
+    if closed_any:
+        from src.notify import notify_close
+
+        notify_close(symbol, "L+S")
     return closed_any
 
 
@@ -251,6 +259,8 @@ def _open_pair(symbol: str, snap: RsiSnapshot, trigger: str) -> int | None:
         logging.info("  [%s] Blocked symbol — skip open pair", symbol)
         return None
 
+    ensure_symbol_configured(symbol)
+
     if MARGIN_PREFLIGHT_ENABLED:
         from src.margin_preflight import ensure_available_for_pair
 
@@ -384,6 +394,9 @@ def _take_profit_aggregate_side(
     )
     fill = _close_side_and_resolve_fill(symbol, side, pos.size, mark)
     db.close_all_lot_sides(symbol, side, close_price=fill)
+    from src.notify import notify_close
+
+    notify_close(symbol, side.upper())
     if reopen_pair and is_tradeable_symbol(symbol):
         _open_pair(symbol, snap, f"{trigger}_tp_agg_{side}")
 
@@ -441,6 +454,9 @@ def close_lot_leg(
         realized_pnl_usdt=pnl,
         close_price=fill,
     )
+    from src.notify import notify_close
+
+    notify_close(symbol, side.upper())
 
 
 def _take_profit_lot_side(
@@ -630,7 +646,6 @@ def evaluate_rsi_trade(
         _force_close_blocked_symbol(symbol, mark)
         return
 
-    ensure_symbol_configured(symbol)
     mark = fetch_side_mark_price(symbol)
     if mark <= 0:
         mark = snap.close

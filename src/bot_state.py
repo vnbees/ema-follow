@@ -209,14 +209,23 @@ def get_last_cycle_at() -> str:
 
 
 def set_trading_enabled(enabled: bool) -> None:
+    from src import database as db
+
     with _lock:
         global _trading_enabled
         _trading_enabled = enabled
+    db.set_setting_bool("trading_enabled", enabled)
 
 
 def is_trading_enabled() -> bool:
-    with _lock:
-        return _trading_enabled
+    from src import database as db
+
+    try:
+        return db.get_setting_bool("trading_enabled", TRADING_ENABLED)
+    except Exception:
+        # DB unavailable (e.g. early startup) — fall back to in-memory state.
+        with _lock:
+            return _trading_enabled
 
 
 def get_account_balance() -> AccountBalance:

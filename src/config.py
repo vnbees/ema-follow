@@ -60,6 +60,20 @@ def order_notional_usdt() -> float:
 
 
 WEB_PORT = int(os.getenv("PORT", os.getenv("WEB_PORT", "8080")))
+
+DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "").strip()
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+DASHBOARD_SESSION_SECRET = os.getenv("DASHBOARD_SESSION_SECRET", "").strip()
+DASHBOARD_COOKIE_SECURE = os.getenv("DASHBOARD_COOKIE_SECURE", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY", "").strip()
+VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "").strip()
+VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "mailto:dashboard@localhost").strip()
+
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0"))
 SAR_AF = float(os.getenv("SAR_AF", "0.02"))
 SAR_MAX_AF = float(os.getenv("SAR_MAX_AF", "0.2"))

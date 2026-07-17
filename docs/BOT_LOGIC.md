@@ -376,7 +376,7 @@ Config: `MARGIN_GUARD_ENABLED`, `MARGIN_MAINT_*_PCT`, `MARGIN_HIGH_TP_PCT`, `MAR
 1. TRADING_ENABLED? — false → sync + dashboard only
 2. snap.ready? — false → skip
 3. is_tradeable_symbol? — false → _force_close_blocked_symbol
-4. ensure_symbol_configured (leverage, hedge, margin type)
+4. ensure_symbol_configured — **chỉ trong `_open_pair`** (lazy; DB persist margin/leverage)
 5. _sync_lots_with_exchange (warning nếu lệch size)
 6. _update_status (RSI, mark, positions → dashboard)
 7. _scan_take_profits(cycle, reopen=False, tp=effective_tp_pct)
@@ -385,10 +385,12 @@ Nếu có RSI cross 25/75:
 8. margin guard block? — yes → return (không stack/entry)
 9. _scan_take_profits(cross, reopen=True, tp=effective_tp_pct)
 10. Nếu đã chốt → return
-11. symbol_has_open_lots → _open_pair(stack)  [preflight bên trong]
+11. symbol_has_open_lots → _open_pair(stack)  [preflight + ensure config bên trong]
 12. can_open_new_symbol → _open_pair(entry)
 13. else → log max symbols
 ```
+
+**Cấu hình symbol (lazy + DB):** `ensure_symbol_configured` chỉ chạy trước khi mở cặp mới (`_open_pair`). Nếu bảng `symbol_trading_config` đã ghi đúng `MARGIN_MODE` + `LEVERAGE` hiện tại thì bỏ qua gọi API Binance. Restart/deploy không setup hàng loạt 20 symbol mỗi cycle; TP/đóng lệnh không cần re-config.
 
 ---
 
@@ -452,8 +454,35 @@ Dashboard: nút manual profit take / reset baseline.
 - Badge **≥TP%** (`tp_ready`) trên leg sắp chốt
 - Lịch PnL theo **leg đóng** (timezone VN)
 - **Biểu đồ equity:** line chart (Chart.js), nút 24h / 7 ngày / 30 ngày; cập nhật mỗi 60s
-- **Rút spot hàng ngày:** bật/tắt + số USDT trên dashboard; lịch sử chuyển; biểu đồ spot
-- API: `/`, `/api/pnl-calendar`, `/api/status`, `/api/profit-takes`, `/api/equity-history`, `/api/spot-history`, `/api/spot-transfers`
+- **Rút spot hàng ngày:** bật/tắt + % equity trên dashboard; lịch sử chuyển; biểu đồ spot
+- **Đăng nhập bắt buộc:** cookie session; chỉ tài khoản `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` (env)
+- **Web Push đóng lệnh:** khi đóng leg/hedge, điện thoại (PWA) nhận title `COIN đóng LONG|SHORT|L+S` + body Futures balance (available / equity / maint / initial)
+- API: `/`, `/api/pnl-calendar`, `/api/status`, `/api/profit-takes`, `/api/equity-history`, `/api/spot-history`, `/api/spot-transfers`, `/api/push/*`
+
+Env auth:
+
+```env
+DASHBOARD_USERNAME=you@example.com
+DASHBOARD_PASSWORD=...
+DASHBOARD_SESSION_SECRET=<random ≥32 chars>
+DASHBOARD_COOKIE_SECURE=true   # Railway HTTPS
+```
+
+Env Web Push (VAPID):
+
+```env
+VAPID_PUBLIC_KEY=...
+VAPID_PRIVATE_KEY=...
+VAPID_SUBJECT=mailto:you@example.com
+```
+
+Cách bật trên điện thoại:
+
+1. Add to Home Screen (Safari iOS 16.4+ / Chrome Android)
+2. Mở từ **icon** (không phải tab browser thường trên iOS)
+3. Đăng nhập dashboard → bấm **Bật thông báo** → Allow
+
+Bot trading **không** phụ thuộc đăng nhập dashboard / push subscription.
 
 ### Lịch sử equity (`equity_snapshots`)
 
@@ -541,6 +570,17 @@ MARGIN_IMPROVEMENT_PCT=0.3
 MARGIN_PREFLIGHT_ENABLED=true
 MARGIN_PREFLIGHT_BUFFER_PCT=10
 MARGIN_PREFLIGHT_MAX_CLOSES=10
+
+# Dashboard login
+DASHBOARD_USERNAME=
+DASHBOARD_PASSWORD=
+DASHBOARD_SESSION_SECRET=
+DASHBOARD_COOKIE_SECURE=true
+
+# Web Push (đóng lệnh)
+VAPID_PUBLIC_KEY=
+VAPID_PRIVATE_KEY=
+VAPID_SUBJECT=mailto:you@example.com
 
 # Rút futures → spot (giờ VN)
 SPOT_TRANSFER_ENABLED=true

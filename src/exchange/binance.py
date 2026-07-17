@@ -1,3 +1,6 @@
+import logging
+import re
+import threading
 import time
 import uuid
 from typing import Any
@@ -49,15 +52,76 @@ def _parse_api_error(response: requests.Response) -> str:
         return response.text[:200]
 
 
+class RateLimitError(ExchangeClientError):
+    """HTTP 429/418 from Binance — must NOT be retried."""
+
+
+# Cooldown window: while active, all REST calls fail fast without hitting Binance.
+_rate_limit_lock = threading.Lock()
+_rate_limited_until_ms = 0.0
+
+
+def _now_ms() -> float:
+    return time.time() * 1000
+
+
+def _set_rate_limited_until(until_ms: float) -> None:
+    global _rate_limited_until_ms
+    with _rate_limit_lock:
+        if until_ms > _rate_limited_until_ms:
+            _rate_limited_until_ms = until_ms
+            logging.warning(
+                "Binance rate limited — pausing REST calls for %.0fs",
+                max(0.0, until_ms - _now_ms()) / 1000,
+            )
+
+
+def _check_rate_limit_pause() -> None:
+    with _rate_limit_lock:
+        until_ms = _rate_limited_until_ms
+    if _now_ms() < until_ms:
+        remaining = (until_ms - _now_ms()) / 1000
+        raise RateLimitError(
+            f"Rate-limit cooldown active — {remaining:.0f}s remaining, request skipped"
+        )
+
+
+def _handle_rate_limit_response(response: requests.Response) -> None:
+    """Register cooldown for HTTP 429/418 and raise RateLimitError."""
+    if response.status_code not in (429, 418):
+        return
+    detail = _parse_api_error(response)
+    until_ms = 0.0
+    match = re.search(r"banned until (\d{13})", detail)
+    if match:
+        until_ms = float(match.group(1))
+    else:
+        try:
+            retry_after_sec = float(response.headers.get("Retry-After", ""))
+        except ValueError:
+            retry_after_sec = 0.0
+        if retry_after_sec > 0:
+            until_ms = _now_ms() + retry_after_sec * 1000
+    if until_ms <= _now_ms():
+        # No usable hint: back off for a full minute (weight window).
+        until_ms = _now_ms() + 60_000
+    _set_rate_limited_until(until_ms)
+    raise RateLimitError(f"HTTP {response.status_code}: {detail}")
+
+
 def _public_get(path: str, params: dict[str, str], max_retries: int = 3) -> Any:
     url = f"{BINANCE_API_BASE}{path}"
     last_error: Exception | None = None
     for attempt in range(max_retries):
+        _check_rate_limit_pause()
         try:
             response = requests.get(url, params=params, timeout=10)
+            _handle_rate_limit_response(response)
             if not response.ok:
                 raise ExchangeClientError(f"HTTP {response.status_code}: {_parse_api_error(response)}")
             return response.json()
+        except RateLimitError:
+            raise
         except (requests.RequestException, ExchangeClientError, ValueError) as exc:
             last_error = exc
             if attempt < max_retries - 1:
@@ -72,21 +136,26 @@ def _private_request(
     max_retries: int = 3,
 ) -> Any:
     _ensure_credentials()
-    signed = signed_params(BINANCE_API_KEY, BINANCE_SECRET_KEY, params)
     url = f"{BINANCE_API_BASE}{path}"
     headers = auth_headers(BINANCE_API_KEY)
     last_error: Exception | None = None
     for attempt in range(max_retries):
+        _check_rate_limit_pause()
+        # Re-sign each attempt so timestamp stays inside recvWindow after backoff sleeps.
+        signed = signed_params(BINANCE_API_KEY, BINANCE_SECRET_KEY, params)
         try:
             if method == "GET":
                 response = requests.get(url, params=signed, headers=headers, timeout=10)
             else:
                 response = requests.post(url, params=signed, headers=headers, timeout=10)
+            _handle_rate_limit_response(response)
             if not response.ok:
                 raise ExchangeClientError(f"HTTP {response.status_code}: {_parse_api_error(response)}")
             if not response.text:
                 return {}
             return response.json()
+        except RateLimitError:
+            raise
         except (requests.RequestException, ExchangeClientError, ValueError) as exc:
             last_error = exc
             if attempt < max_retries - 1:
@@ -109,21 +178,25 @@ def _spot_private_request(
     max_retries: int = 3,
 ) -> Any:
     _ensure_credentials()
-    signed = signed_params(BINANCE_API_KEY, BINANCE_SECRET_KEY, params)
     url = f"{BINANCE_SPOT_API_BASE}{path}"
     headers = auth_headers(BINANCE_API_KEY)
     last_error: Exception | None = None
     for attempt in range(max_retries):
+        _check_rate_limit_pause()
+        signed = signed_params(BINANCE_API_KEY, BINANCE_SECRET_KEY, params)
         try:
             if method == "GET":
                 response = requests.get(url, params=signed, headers=headers, timeout=10)
             else:
                 response = requests.post(url, params=signed, headers=headers, timeout=10)
+            _handle_rate_limit_response(response)
             if not response.ok:
                 raise ExchangeClientError(f"HTTP {response.status_code}: {_parse_api_error(response)}")
             if not response.text:
                 return {}
             return response.json()
+        except RateLimitError:
+            raise
         except (requests.RequestException, ExchangeClientError, ValueError) as exc:
             last_error = exc
             if attempt < max_retries - 1:

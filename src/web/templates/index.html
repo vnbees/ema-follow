@@ -3,8 +3,10 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#0f1117">
   <meta http-equiv="refresh" content="60">
   <title>{{ exchange_name }} RSI Bot</title>
+  <link rel="manifest" href="/manifest.webmanifest">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
     * { box-sizing: border-box; }
@@ -64,7 +66,19 @@
     <form method="post" action="/settings/trading/stop">
       <button type="submit" {% if not trading_enabled %}disabled{% endif %}>Stop</button>
     </form>
+    <form method="post" action="/logout">
+      <button type="submit">Logout</button>
+    </form>
+    {% if push_enabled %}
+    <button type="button" id="push-enable-btn">Bật thông báo</button>
+    <span id="push-status" class="meta" style="margin:0"></span>
+    {% endif %}
   </div>
+  {% if push_enabled %}
+  <p class="meta" id="push-hint">
+    iPhone: mở từ icon Home Screen rồi bấm «Bật thông báo». Android/Chrome: bấm nút và cho phép.
+  </p>
+  {% endif %}
 
   <div class="settings-panel">
     <h2>Rút spot hàng ngày</h2>
@@ -335,5 +349,93 @@
       }, 60000);
     })();
   </script>
+  {% if push_enabled %}
+  <script>
+    (function () {
+      const btn = document.getElementById("push-enable-btn");
+      const statusEl = document.getElementById("push-status");
+      if (!btn || !("serviceWorker" in navigator) || !("PushManager" in window)) {
+        if (statusEl) statusEl.textContent = "Trình duyệt không hỗ trợ Web Push.";
+        if (btn) btn.disabled = true;
+        return;
+      }
+
+      function urlBase64ToUint8Array(base64String) {
+        const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+        const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+        const raw = atob(base64);
+        const out = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+        return out;
+      }
+
+      function setStatus(text) {
+        if (statusEl) statusEl.textContent = text;
+      }
+
+      function markEnabled() {
+        btn.textContent = "Đã bật";
+        btn.disabled = true;
+        setStatus("Đã bật thông báo đóng lệnh.");
+      }
+
+      navigator.serviceWorker.register("/sw.js").catch(() => {
+        setStatus("Không đăng ký được Service Worker.");
+      });
+
+      // On load: if this device already has a subscription, reflect it and re-sync to server.
+      (async () => {
+        try {
+          if (Notification.permission !== "granted") return;
+          const reg = await navigator.serviceWorker.ready;
+          const sub = await reg.pushManager.getSubscription();
+          if (!sub) return;
+          markEnabled();
+          fetch("/api/push/subscribe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(sub.toJSON()),
+          }).catch(() => {});
+        } catch (_err) {
+          // ignore — user can still click the button
+        }
+      })();
+
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        try {
+          const perm = await Notification.requestPermission();
+          if (perm !== "granted") {
+            setStatus("Chưa được phép thông báo.");
+            btn.disabled = false;
+            return;
+          }
+          const keyRes = await fetch("/api/push/vapid-public-key");
+          if (!keyRes.ok) throw new Error("VAPID key unavailable");
+          const { publicKey } = await keyRes.json();
+          const reg = await navigator.serviceWorker.ready;
+          let sub = await reg.pushManager.getSubscription();
+          if (!sub) {
+            sub = await reg.pushManager.subscribe({
+              userVisibleOnly: true,
+              applicationServerKey: urlBase64ToUint8Array(publicKey),
+            });
+          }
+          const res = await fetch("/api/push/subscribe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(sub.toJSON()),
+          });
+          if (!res.ok) throw new Error("Subscribe failed");
+          markEnabled();
+        } catch (err) {
+          console.error(err);
+          setStatus("Bật thông báo thất bại.");
+          btn.disabled = false;
+        }
+      });
+    })();
+  </script>
+  {% endif %}
 </body>
 </html>

@@ -87,6 +87,8 @@ def init_db() -> None:
         _migrate_rsi_pair_lots(conn)
         _migrate_equity_snapshots(conn)
         _migrate_spot_transfer_tables(conn)
+        _migrate_push_subscriptions(conn)
+        _migrate_symbol_trading_config(conn)
 
 
 def _migrate_profit_take_trigger_type(conn: sqlite3.Connection) -> None:
@@ -1738,6 +1740,111 @@ def clear_dashboard_history(*, reset_baseline: bool = True) -> dict[str, int]:
                 "DELETE FROM settings WHERE key IN ('baseline_equity', 'baseline_updated_at')"
             )
     return counts
+
+
+def _migrate_push_subscriptions(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
+            endpoint TEXT PRIMARY KEY,
+            p256dh TEXT NOT NULL,
+            auth TEXT NOT NULL,
+            user_agent TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def upsert_push_subscription(
+    endpoint: str,
+    p256dh: str,
+    auth: str,
+    user_agent: str | None = None,
+) -> None:
+    now = _utc_now()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO push_subscriptions (
+                endpoint, p256dh, auth, user_agent, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(endpoint) DO UPDATE SET
+                p256dh = excluded.p256dh,
+                auth = excluded.auth,
+                user_agent = excluded.user_agent,
+                updated_at = excluded.updated_at
+            """,
+            (endpoint, p256dh, auth, user_agent, now, now),
+        )
+
+
+def list_push_subscriptions() -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        return list(
+            conn.execute(
+                """
+                SELECT endpoint, p256dh, auth, user_agent, created_at, updated_at
+                FROM push_subscriptions
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+        )
+
+
+def delete_push_subscription(endpoint: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM push_subscriptions WHERE endpoint = ?",
+            (endpoint,),
+        )
+
+
+def _migrate_symbol_trading_config(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS symbol_trading_config (
+            symbol TEXT PRIMARY KEY,
+            margin_mode TEXT NOT NULL,
+            leverage INTEGER NOT NULL,
+            configured_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def get_symbol_trading_config(symbol: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT symbol, margin_mode, leverage, configured_at
+            FROM symbol_trading_config
+            WHERE symbol = ?
+            """,
+            (symbol.upper(),),
+        ).fetchone()
+
+
+def upsert_symbol_trading_config(
+    symbol: str,
+    margin_mode: str,
+    leverage: int,
+) -> None:
+    now = _utc_now()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO symbol_trading_config (
+                symbol, margin_mode, leverage, configured_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                margin_mode = excluded.margin_mode,
+                leverage = excluded.leverage,
+                configured_at = excluded.configured_at
+            """,
+            (symbol.upper(), margin_mode, leverage, now),
+        )
 
 
 @dataclass

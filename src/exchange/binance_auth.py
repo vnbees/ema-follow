@@ -12,7 +12,7 @@ def sign_params(secret_key: str, params: dict[str, str]) -> str:
 def signed_params(api_key: str, secret_key: str, params: dict[str, str | int | float | bool]) -> dict[str, str]:
     payload: dict[str, str] = {k: str(v) for k, v in params.items()}
     payload["timestamp"] = str(int(time.time() * 1000))
-    payload["recvWindow"] = "5000"
+    payload["recvWindow"] = "10000"
     payload["signature"] = sign_params(secret_key, payload)
     return payload
 
