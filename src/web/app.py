@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Form, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -27,9 +27,7 @@ from src.config import (
     MAX_OPEN_SYMBOLS,
     PAIR_PROFIT_TARGET_PCT,
     PROFIT_TARGET_PCT,
-    VAPID_PUBLIC_KEY,
 )
-from src.notify import vapid_configured
 from src.rsi_signals import price_move_pct, should_take_profit
 from src.bot_state import (
     get_account_balance,
@@ -54,7 +52,6 @@ from src.web.number_format import format_dashboard_pnl, format_dashboard_price, 
 from src.web.time_format import format_vn_time
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
-STATIC_DIR = Path(__file__).resolve().parent / "static"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.filters["vn_time"] = format_vn_time
 templates.env.filters["dash_price"] = format_dashboard_price
@@ -63,7 +60,7 @@ templates.env.filters["dash_pnl"] = format_dashboard_pnl
 
 app = FastAPI(title=f"{EXCHANGE_DISPLAY_NAME} RSI Bot Dashboard")
 
-_PUBLIC_PATHS = frozenset({"/login", "/manifest.webmanifest", "/sw.js"})
+_PUBLIC_PATHS = frozenset({"/login"})
 _SESSION_SECRET = DASHBOARD_SESSION_SECRET or secrets.token_urlsafe(48)
 
 
@@ -147,66 +144,6 @@ def login_submit(
 def logout(request: Request) -> RedirectResponse:
     request.session.clear()
     return RedirectResponse(url="/login", status_code=303)
-
-
-@app.get("/manifest.webmanifest")
-def pwa_manifest():
-    return FileResponse(
-        STATIC_DIR / "manifest.webmanifest",
-        media_type="application/manifest+json",
-    )
-
-
-@app.get("/sw.js")
-def service_worker():
-    return FileResponse(
-        STATIC_DIR / "sw.js",
-        media_type="application/javascript",
-        headers={"Cache-Control": "no-cache"},
-    )
-
-
-@app.get("/api/push/vapid-public-key")
-def push_vapid_public_key():
-    if not vapid_configured():
-        return JSONResponse({"detail": "VAPID not configured"}, status_code=503)
-    return {"publicKey": VAPID_PUBLIC_KEY}
-
-
-@app.post("/api/push/subscribe")
-async def push_subscribe(request: Request):
-    if not vapid_configured():
-        return JSONResponse({"detail": "VAPID not configured"}, status_code=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
-    endpoint = str(body.get("endpoint") or "").strip()
-    keys = body.get("keys") or {}
-    p256dh = str(keys.get("p256dh") or "").strip()
-    auth = str(keys.get("auth") or "").strip()
-    if not endpoint or not p256dh or not auth:
-        return JSONResponse({"detail": "Missing subscription fields"}, status_code=400)
-    db.upsert_push_subscription(
-        endpoint=endpoint,
-        p256dh=p256dh,
-        auth=auth,
-        user_agent=request.headers.get("user-agent"),
-    )
-    return {"ok": True}
-
-
-@app.delete("/api/push/subscribe")
-async def push_unsubscribe(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
-    endpoint = str(body.get("endpoint") or "").strip()
-    if not endpoint:
-        return JSONResponse({"detail": "Missing endpoint"}, status_code=400)
-    db.delete_push_subscription(endpoint)
-    return {"ok": True}
 
 
 _EQUITY_RANGES = {
@@ -705,7 +642,6 @@ def _simple_dashboard_context() -> dict:
         "spot_transfer": spot_status,
         "spot_transfers": _build_spot_transfer_rows(15),
         "margin_coin": MARGIN_COIN,
-        "push_enabled": vapid_configured(),
     }
 
 

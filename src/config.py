@@ -70,9 +70,7 @@ DASHBOARD_COOKIE_SECURE = os.getenv("DASHBOARD_COOKIE_SECURE", "false").lower() 
     "yes",
 )
 
-VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY", "").strip()
-VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "").strip()
-VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "mailto:dashboard@localhost").strip()
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0"))
 SAR_AF = float(os.getenv("SAR_AF", "0.02"))

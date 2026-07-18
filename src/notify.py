@@ -1,23 +1,21 @@
-"""Web Push notifications for close actions (fail-soft)."""
+"""Close-action notifications via Discord webhook (fail-soft)."""
 
 from __future__ import annotations
 
-import json
 import logging
 
-from src import database as db
+import requests
+
 from src.config import (
     DEFAULT_SYMBOL,
+    DISCORD_WEBHOOK_URL,
     MARGIN_COIN,
-    VAPID_PRIVATE_KEY,
-    VAPID_PUBLIC_KEY,
-    VAPID_SUBJECT,
 )
 from src.exchange import ExchangeClientError, fetch_futures_balance, has_credentials
 
 
-def vapid_configured() -> bool:
-    return bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY and VAPID_SUBJECT)
+def discord_configured() -> bool:
+    return bool(DISCORD_WEBHOOK_URL)
 
 
 def _format_balance_body() -> str:
@@ -32,58 +30,37 @@ def _format_balance_body() -> str:
             f" | initial={balance.initial_margin_pct:.2f}%"
         )
     except ExchangeClientError as exc:
-        logging.warning("Push notify: balance fetch failed (%s)", exc)
+        logging.warning("Discord notify: balance fetch failed (%s)", exc)
         return f"Futures balance: fetch failed ({MARGIN_COIN})"
 
 
-def _send_to_subscription(subscription: dict, payload: str) -> None:
-    from pywebpush import WebPushException, webpush
-
-    webpush(
-        subscription_info=subscription,
-        data=payload,
-        vapid_private_key=VAPID_PRIVATE_KEY,
-        vapid_claims={"sub": VAPID_SUBJECT},
+def _send_discord(title: str, body: str) -> None:
+    content = f"**{title}**\n{body}"
+    if len(content) > 2000:
+        content = content[:1997] + "..."
+    response = requests.post(
+        DISCORD_WEBHOOK_URL,
+        json={"content": content},
+        timeout=10,
     )
+    if not response.ok:
+        raise RuntimeError(
+            f"Discord webhook HTTP {response.status_code}: {response.text[:200]}"
+        )
 
 
 def notify_close(symbol: str, detail: str) -> None:
-    """Send close notification to all push subscriptions. Never raises to callers."""
+    """Send close notification to Discord. Never raises to callers."""
     try:
-        if not vapid_configured():
-            logging.debug("Push notify skipped: VAPID not configured")
-            return
-
-        subs = db.list_push_subscriptions()
-        if not subs:
-            logging.debug("Push notify skipped: no subscriptions")
+        if not discord_configured():
+            logging.debug("Discord notify skipped: DISCORD_WEBHOOK_URL not set")
             return
 
         title = f"{symbol.upper()} đóng {detail}"
         body = _format_balance_body()
-        payload = json.dumps({"title": title, "body": body}, ensure_ascii=False)
-
-        from pywebpush import WebPushException
-
-        for row in subs:
-            endpoint = str(row["endpoint"])
-            subscription = {
-                "endpoint": endpoint,
-                "keys": {
-                    "p256dh": str(row["p256dh"]),
-                    "auth": str(row["auth"]),
-                },
-            }
-            try:
-                _send_to_subscription(subscription, payload)
-            except WebPushException as exc:
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status in (404, 410):
-                    logging.info("Push endpoint gone (%s) — removing", status)
-                    db.delete_push_subscription(endpoint)
-                else:
-                    logging.warning("Push send failed for %s: %s", endpoint[:48], exc)
-            except Exception as exc:  # noqa: BLE001 — fail-soft
-                logging.warning("Push send error for %s: %s", endpoint[:48], exc)
+        try:
+            _send_discord(title, body)
+        except Exception as exc:  # noqa: BLE001 — fail-soft
+            logging.warning("Discord notify send failed: %s", exc)
     except Exception as exc:  # noqa: BLE001 — never break trading
-        logging.warning("Push notify_close failed: %s", exc)
+        logging.warning("Discord notify_close failed: %s", exc)

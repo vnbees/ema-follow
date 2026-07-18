@@ -456,8 +456,8 @@ Dashboard: nút manual profit take / reset baseline.
 - **Biểu đồ equity:** line chart (Chart.js), nút 24h / 7 ngày / 30 ngày; cập nhật mỗi 60s
 - **Rút spot hàng ngày:** bật/tắt + % equity trên dashboard; lịch sử chuyển; biểu đồ spot
 - **Đăng nhập bắt buộc:** cookie session; chỉ tài khoản `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` (env)
-- **Web Push đóng lệnh:** khi đóng leg/hedge, điện thoại (PWA) nhận title `COIN đóng LONG|SHORT|L+S` + body Futures balance (available / equity / maint / initial)
-- API: `/`, `/api/pnl-calendar`, `/api/status`, `/api/profit-takes`, `/api/equity-history`, `/api/spot-history`, `/api/spot-transfers`, `/api/push/*`
+- **Discord notify đóng lệnh:** webhook; title `COIN đóng LONG|SHORT|L+S` + body Futures balance (available / equity / maint / initial)
+- API: `/`, `/api/pnl-calendar`, `/api/status`, `/api/profit-takes`, `/api/equity-history`, `/api/spot-history`, `/api/spot-transfers`
 
 Env auth:
 
@@ -468,21 +468,19 @@ DASHBOARD_SESSION_SECRET=<random ≥32 chars>
 DASHBOARD_COOKIE_SECURE=true   # Railway HTTPS
 ```
 
-Env Web Push (VAPID):
+Env Discord notify:
 
 ```env
-VAPID_PUBLIC_KEY=...
-VAPID_PRIVATE_KEY=...
-VAPID_SUBJECT=mailto:you@example.com
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 ```
 
 Cách bật trên điện thoại:
 
-1. Add to Home Screen (Safari iOS 16.4+ / Chrome Android)
-2. Mở từ **icon** (không phải tab browser thường trên iOS)
-3. Đăng nhập dashboard → bấm **Bật thông báo** → Allow
+1. Cài Discord, vào channel nhận webhook
+2. Bật thông báo channel (mobile app)
+3. Lần đóng lệnh tiếp theo sẽ hiện tin trong channel
 
-Bot trading **không** phụ thuộc đăng nhập dashboard / push subscription.
+Bot trading **không** phụ thuộc đăng nhập dashboard / Discord.
 
 ### Lịch sử equity (`equity_snapshots`)
 
@@ -577,10 +575,8 @@ DASHBOARD_PASSWORD=
 DASHBOARD_SESSION_SECRET=
 DASHBOARD_COOKIE_SECURE=true
 
-# Web Push (đóng lệnh)
-VAPID_PUBLIC_KEY=
-VAPID_PRIVATE_KEY=
-VAPID_SUBJECT=mailto:you@example.com
+# Discord notify (đóng lệnh)
+DISCORD_WEBHOOK_URL=
 
 # Rút futures → spot (giờ VN)
 SPOT_TRANSFER_ENABLED=true
