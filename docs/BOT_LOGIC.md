@@ -303,7 +303,7 @@ Preflight **chỉ** gọi từ `_open_pair`, **không** gọi từ reopen sau TP
 
 ## 9. Chốt lãi — hai tầng, hai thời điểm
 
-Ngưỡng: `PAIR_PROFIT_TARGET_PCT` (2%) hoặc `MARGIN_HIGH_TP_PCT` (1%) khi margin guard tier **high**.
+Ngưỡng: `PAIR_PROFIT_TARGET_PCT` (2%) hoặc `MARGIN_HIGH_TP_PCT` (1%) khi margin guard tier **high**. Cả aggregate **và** lot-level đều nhận `tp_target_pct` từ `effective_tp_pct()` (tránh lot-level vô tình fallback 2% khi margin high).
 
 ### 9a. Mỗi cycle 5 phút (`trigger=cycle`, `reopen_pair=False`)
 
@@ -411,6 +411,8 @@ Mỗi lần `_open_pair` = **1 lot** (1 row):
 - `count_open_legs()` — tổng leg `open`
 
 **Sync (`_sync_lots_with_exchange`):** so tổng size lot vs sàn; lệch → **log warning**, **không** tự sửa DB.
+
+**REST cache (Binance, chống IP ban):** `positionRisk` / `account` cache TTL ~2.5s trong process; tái sử dụng trong cùng lần evaluate 1 symbol. Invalidate ngay sau `place_market_order` / close. `fetch_total_unrealized_pnl` = **một** `positionRisk` (all). Cycle: nghỉ ~80ms giữa các symbol; `ticker/24hr` TTL **15 phút** khi đã đủ `MAX_OPEN_SYMBOLS`, **5 phút** khi còn slot scan.
 
 **Adopt:** vị thế sàn không có lot DB → tạo lot `adopted` (`LEGACY_MARGIN_USDT`).
 

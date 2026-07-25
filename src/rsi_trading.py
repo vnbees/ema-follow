@@ -468,6 +468,7 @@ def _take_profit_lot_side(
     trigger: str,
     *,
     reopen_pair: bool,
+    tp_target_pct: float | None = None,
 ) -> None:
     if side == "long":
         if lot["long_status"] != "open":
@@ -479,7 +480,7 @@ def _take_profit_lot_side(
             return
         entry = float(lot["short_entry"])
         size = float(lot["short_size"])
-    if size <= 0 or not should_take_profit(side, entry, mark):
+    if size <= 0 or not should_take_profit(side, entry, mark, target_pct=tp_target_pct):
         return
 
     close_lot_leg(symbol, lot, side, mark, trigger)
@@ -529,7 +530,8 @@ def _scan_take_profits(
             entry = float(lot["long_entry"])
             if should_take_profit("long", entry, mark, target_pct=tp_target_pct):
                 _take_profit_lot_side(
-                    symbol, lot, "long", mark, snap, trigger, reopen_pair=reopen_pair,
+                    symbol, lot, "long", mark, snap, trigger,
+                    reopen_pair=reopen_pair, tp_target_pct=tp_target_pct,
                 )
                 took_action = True
 
@@ -540,7 +542,8 @@ def _scan_take_profits(
             entry = float(lot["short_entry"])
             if should_take_profit("short", entry, mark, target_pct=tp_target_pct):
                 _take_profit_lot_side(
-                    symbol, lot, "short", mark, snap, trigger, reopen_pair=reopen_pair,
+                    symbol, lot, "short", mark, snap, trigger,
+                    reopen_pair=reopen_pair, tp_target_pct=tp_target_pct,
                 )
                 took_action = True
 

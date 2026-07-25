@@ -53,6 +53,7 @@ class Position:
     side: str | None
     size: float
     avg_price: float
+    unrealized_pnl: float = 0.0
 
 
 @dataclass

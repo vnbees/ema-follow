@@ -34,6 +34,25 @@ from src.exchange.types import (
 _SPEC_CACHE: dict[str, ContractSpec] = {}
 _EXCHANGE_INFO_CACHE: dict | None = None
 
+# Short-TTL REST caches — reuse within a symbol evaluation; invalidate after orders.
+_REST_CACHE_TTL_MS = 2500.0
+_rest_cache_lock = threading.Lock()
+_position_by_symbol: dict[str, tuple[float, dict[str, Position]]] = {}
+_positions_all: tuple[float, list[Position]] | None = None
+_account_cache: tuple[float, FuturesAccountBalance] | None = None
+
+
+def _invalidate_position_cache(symbol: str | None = None) -> None:
+    """Drop cached positionRisk (and account). Call after any order that changes size."""
+    global _positions_all, _account_cache
+    with _rest_cache_lock:
+        _positions_all = None
+        _account_cache = None
+        if symbol is None:
+            _position_by_symbol.clear()
+        else:
+            _position_by_symbol.pop(symbol.upper(), None)
+
 
 def has_credentials() -> bool:
     return bool(BINANCE_API_KEY and BINANCE_SECRET_KEY)
@@ -366,13 +385,20 @@ def fetch_top_futures_by_volume(limit: int | None = None) -> list[tuple[str, flo
 
 
 def fetch_futures_balance(symbol: str = SYMBOL) -> FuturesAccountBalance:
+    global _account_cache
     _ = symbol
+    now = _now_ms()
+    with _rest_cache_lock:
+        cached = _account_cache
+        if cached is not None and now - cached[0] < _REST_CACHE_TTL_MS:
+            return cached[1]
+
     data = _private_get("/fapi/v2/account", {})
     available = float(data.get("availableBalance", 0))
     equity = float(data.get("totalMarginBalance", data.get("totalWalletBalance", 0)))
     maint = float(data.get("totalMaintMargin", 0) or 0)
     initial = float(data.get("totalInitialMargin", 0) or 0)
-    return FuturesAccountBalance(
+    balance = FuturesAccountBalance(
         margin_coin=MARGIN_COIN,
         available=available,
         account_equity=equity,
@@ -380,10 +406,25 @@ def fetch_futures_balance(symbol: str = SYMBOL) -> FuturesAccountBalance:
         total_maint_margin=maint,
         total_initial_margin=initial,
     )
+    with _rest_cache_lock:
+        _account_cache = (now, balance)
+    return balance
 
 
 def _empty_position(symbol: str) -> Position:
-    return Position(symbol=symbol, side=None, size=0.0, avg_price=0.0)
+    return Position(symbol=symbol, side=None, size=0.0, avg_price=0.0, unrealized_pnl=0.0)
+
+
+def _unrealized_from_row(row: dict, side: str, size: float, entry: float) -> float:
+    pnl = float(row.get("unRealizedProfit", 0) or 0)
+    if pnl != 0:
+        return pnl
+    mark = float(row.get("markPrice", 0) or 0)
+    if mark <= 0 or entry <= 0 or size <= 0:
+        return 0.0
+    if side == "long":
+        return (mark - entry) * size
+    return (entry - mark) * size
 
 
 def _parse_position_row(symbol: str, row: dict) -> Position | None:
@@ -394,43 +435,83 @@ def _parse_position_row(symbol: str, row: dict) -> Position | None:
     if size <= 0:
         return None
     side = position_side.lower()
+    entry = float(row.get("entryPrice", 0) or 0)
     return Position(
         symbol=symbol,
         side=side,
         size=size,
-        avg_price=float(row.get("entryPrice", 0) or 0),
+        avg_price=entry,
+        unrealized_pnl=_unrealized_from_row(row, side, size, entry),
     )
 
 
-def fetch_symbol_positions(symbol: str) -> dict[str, Position]:
-    symbol = symbol.upper()
-    rows = _private_get("/fapi/v2/positionRisk", {"symbol": symbol})
+def _positions_dict_from_rows(symbol: str, rows: list) -> dict[str, Position]:
     result = {
         "long": _empty_position(symbol),
         "short": _empty_position(symbol),
     }
-    if not isinstance(rows, list):
-        return result
     for row in rows:
+        if not isinstance(row, dict):
+            continue
         pos = _parse_position_row(symbol, row)
         if pos and pos.side in result:
             result[pos.side] = pos
     return result
 
 
+def fetch_symbol_positions(symbol: str) -> dict[str, Position]:
+    symbol = symbol.upper()
+    now = _now_ms()
+    with _rest_cache_lock:
+        cached = _position_by_symbol.get(symbol)
+        if cached is not None and now - cached[0] < _REST_CACHE_TTL_MS:
+            return {
+                "long": cached[1]["long"],
+                "short": cached[1]["short"],
+            }
+
+    rows = _private_get("/fapi/v2/positionRisk", {"symbol": symbol})
+    if not isinstance(rows, list):
+        rows = []
+    result = _positions_dict_from_rows(symbol, rows)
+    with _rest_cache_lock:
+        _position_by_symbol[symbol] = (now, result)
+    return result
+
+
 def fetch_all_open_positions() -> list[Position]:
+    global _positions_all
+    now = _now_ms()
+    with _rest_cache_lock:
+        if _positions_all is not None and now - _positions_all[0] < _REST_CACHE_TTL_MS:
+            return list(_positions_all[1])
+
     rows = _private_get("/fapi/v2/positionRisk", {})
     positions: list[Position] = []
-    if not isinstance(rows, list):
-        return positions
-    for row in rows:
-        symbol = str(row.get("symbol", "")).upper()
-        if not symbol:
-            continue
-        pos = _parse_position_row(symbol, row)
-        if pos:
+    by_symbol: dict[str, dict[str, Position]] = {}
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            pos = _parse_position_row(symbol, row)
+            if not pos:
+                continue
             positions.append(pos)
-    return positions
+            bucket = by_symbol.setdefault(
+                symbol,
+                {"long": _empty_position(symbol), "short": _empty_position(symbol)},
+            )
+            if pos.side in bucket:
+                bucket[pos.side] = pos
+
+    with _rest_cache_lock:
+        _positions_all = (now, positions)
+        for sym, sides in by_symbol.items():
+            _position_by_symbol[sym] = (now, sides)
+    return list(positions)
 
 
 def fetch_side_mark_price(symbol: str) -> float:
@@ -441,44 +522,29 @@ def fetch_side_mark_price(symbol: str) -> float:
 
 
 def fetch_side_unrealized_pnl(symbol: str, hold_side: str) -> float:
-    symbol = symbol.upper()
     hold_side = hold_side.lower()
-    rows = _private_get("/fapi/v2/positionRisk", {"symbol": symbol})
-    if not isinstance(rows, list):
+    positions = fetch_symbol_positions(symbol)
+    pos = positions.get(hold_side)
+    if pos is None or pos.size <= 0:
         return 0.0
-    for row in rows:
-        pos_side = str(row.get("positionSide", "")).lower()
-        if pos_side != hold_side:
-            continue
-        size = abs(float(row.get("positionAmt", 0) or 0))
-        if size <= 0:
-            return 0.0
-        pnl = float(row.get("unRealizedProfit", 0) or 0)
-        if pnl != 0:
-            return pnl
-        mark = float(row.get("markPrice", 0) or 0)
-        entry = float(row.get("entryPrice", 0) or 0)
-        if mark <= 0 or entry <= 0:
-            return 0.0
-        if hold_side == "long":
-            return (mark - entry) * size
-        return (entry - mark) * size
-    return 0.0
+    return float(pos.unrealized_pnl or 0.0)
 
 
 def fetch_total_unrealized_pnl(symbols: list[str]) -> tuple[float, int]:
+    wanted = {s.upper() for s in symbols if s}
     total = 0.0
     open_count = 0
-    for symbol in symbols:
-        try:
-            positions = fetch_symbol_positions(symbol)
-            for hold_side in ("long", "short"):
-                if positions[hold_side].size <= 0:
-                    continue
-                total += fetch_side_unrealized_pnl(symbol, hold_side)
-                open_count += 1
-        except ExchangeClientError:
+    try:
+        all_positions = fetch_all_open_positions()
+    except ExchangeClientError:
+        return 0.0, 0
+    for pos in all_positions:
+        if wanted and pos.symbol.upper() not in wanted:
             continue
+        if pos.size <= 0:
+            continue
+        total += float(pos.unrealized_pnl or 0.0)
+        open_count += 1
     return total, open_count
 
 
@@ -598,6 +664,7 @@ def place_market_order(
         if reduce_only:
             params["reduceOnly"] = "true"
     result = _private_post("/fapi/v1/order", params)
+    _invalidate_position_cache(symbol)
     return {
         "orderId": str(result.get("orderId", "")),
         "clientOid": str(result.get("clientOrderId", client_oid)),

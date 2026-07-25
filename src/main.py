@@ -79,13 +79,17 @@ def format_timestamp_ms(ts_ms: int) -> str:
     return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def _complete_cycle(symbol: str) -> None:
-    log_futures_balance_once(symbol)
+def _complete_cycle(symbol: str, managed_symbols: list[str] | None = None) -> None:
+    log_futures_balance_once(symbol, managed_symbols=managed_symbols)
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     set_last_cycle_at(now_str)
 
 
-def log_futures_balance_once(symbol: str) -> None:
+def log_futures_balance_once(
+    symbol: str,
+    *,
+    managed_symbols: list[str] | None = None,
+) -> None:
     if not has_credentials():
         logging.info(
             "  Futures balance: skipped (set BITGET_API_KEY, SECRET, PASSPHRASE in .env)"
@@ -128,8 +132,9 @@ def log_futures_balance_once(symbol: str) -> None:
             balance.margin_coin,
             now_str,
         )
+        symbols_for_pnl = managed_symbols if managed_symbols is not None else get_managed_symbols()
         refresh_account_profit_info(
-            get_managed_symbols() or ["BTCUSDT"],
+            symbols_for_pnl or ["BTCUSDT"],
             balance.available,
             balance.account_equity,
             balance.margin_coin,
@@ -207,7 +212,10 @@ def run_analysis_for_symbol(
 
 
 def run_cycle() -> None:
-    ranked = refresh_volume_rank()
+    open_symbol_count = db.count_open_symbols()
+    # Full book: reuse ticker rank up to 15m. Still scanning: refresh at least every 5m.
+    rank_max_age = 900.0 if open_symbol_count >= MAX_OPEN_SYMBOLS else 300.0
+    ranked = refresh_volume_rank(max_age_sec=rank_max_age)
     if not ranked:
         logging.warning("Volume rank empty — could not fetch tickers")
         return
@@ -226,14 +234,16 @@ def run_cycle() -> None:
     pnl_symbols = cycle_symbols or [ranked[0][0]]
 
     if check_profit_target(pnl_symbols):
-        _complete_cycle(pnl_symbols[0])
+        _complete_cycle(pnl_symbols[0], managed_symbols=pnl_symbols)
         return
 
     process_daily_spot_transfer(pnl_symbols[0])
 
     scanned: set[str] = set(cycle_symbols)
 
-    for symbol in cycle_symbols:
+    for idx, symbol in enumerate(cycle_symbols):
+        if idx > 0:
+            time.sleep(0.08)
         try:
             run_analysis_for_symbol(symbol)
         except ExchangeClientError as exc:
@@ -286,7 +296,7 @@ def run_cycle() -> None:
             len(ranked),
         )
 
-    _complete_cycle(pnl_symbols[0])
+    _complete_cycle(pnl_symbols[0], managed_symbols=pnl_symbols)
 
 
 def start_web_server() -> None:
