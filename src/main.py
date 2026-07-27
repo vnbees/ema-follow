@@ -45,6 +45,7 @@ from src.rsi_trading import can_open_new_symbol, close_all_blocked_symbols, eval
 from src.exchange.symbols import is_tradeable_symbol
 from src.margin_guard import get_margin_guard_state, process_margin_guard_cycle, refresh_margin_dashboard_fields
 from src.rsi_positions import get_managed_symbols, get_open_position_count, restore_tracked_positions
+from src.notify import notify_error
 from src.spot_transfer import process_daily_spot_transfer
 from src.trend import candle_color
 from src.web.app import app as web_app
@@ -205,6 +206,7 @@ def run_analysis_for_symbol(
         evaluate_rsi_trade(symbol, snap, signal)
     except ExchangeClientError as exc:
         logging.error("  [%s] Trading failed: %s", symbol, exc)
+        notify_error(f"{symbol} Trading failed", str(exc))
 
     if signal_side:
         return (signal_side, signal.entry_trigger)
@@ -248,6 +250,7 @@ def run_cycle() -> None:
             run_analysis_for_symbol(symbol)
         except ExchangeClientError as exc:
             logging.error("[%s] Position management failed: %s", symbol, exc)
+            notify_error(f"{symbol} Position management failed", str(exc))
 
     signal_symbol = ""
     checked = 0
@@ -263,6 +266,7 @@ def run_cycle() -> None:
                 result = run_analysis_for_symbol(symbol, scan_only=True, scan_rank=rank)
             except ExchangeClientError as exc:
                 logging.error("[%s] Scan failed: %s", symbol, exc)
+                notify_error(f"{symbol} Scan failed", str(exc))
                 continue
             if result:
                 signal_side, signal_trigger = result
@@ -311,7 +315,10 @@ def main() -> None:
     restore_tracked_positions()
     ranked = refresh_volume_rank()
     if is_trading_enabled() and has_credentials():
-        close_all_blocked_symbols()
+        try:
+            close_all_blocked_symbols()
+        except ExchangeClientError as exc:
+            logging.warning("Startup blocked-symbol close skipped: %s", exc)
     logging.info("%s RSI Bot started", EXCHANGE_DISPLAY_NAME)
     logging.info("Dashboard: http://localhost:%d", WEB_PORT)
     logging.info(
@@ -342,6 +349,7 @@ def main() -> None:
             run_cycle()
         except Exception as exc:
             logging.error("Cycle failed: %s", exc)
+            notify_error("Cycle failed", str(exc))
 
         sleep_seconds = seconds_until_next_interval()
         logging.info("Sleeping %.0f seconds until next %dm boundary...", sleep_seconds, INTERVAL_MINUTES)

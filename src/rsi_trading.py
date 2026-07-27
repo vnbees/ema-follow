@@ -192,9 +192,12 @@ def close_all_blocked_symbols() -> int:
         sym = str(row["symbol"]).upper()
         if not is_tradeable_symbol(sym):
             symbols.add(sym)
-    for pos in fetch_all_open_positions():
-        if not is_tradeable_symbol(pos.symbol):
-            symbols.add(pos.symbol.upper())
+    try:
+        for pos in fetch_all_open_positions():
+            if not is_tradeable_symbol(pos.symbol):
+                symbols.add(pos.symbol.upper())
+    except ExchangeClientError as exc:
+        logging.warning("  Skip exchange scan for blocked symbols: %s", exc)
     closed = 0
     for symbol in sorted(symbols):
         try:

@@ -1,8 +1,9 @@
-"""Close-action notifications via Discord webhook (fail-soft)."""
+"""Discord webhook notifications (close + errors). Fail-soft — never breaks trading."""
 
 from __future__ import annotations
 
 import logging
+import time
 
 import requests
 
@@ -12,6 +13,10 @@ from src.config import (
     MARGIN_COIN,
 )
 from src.exchange import ExchangeClientError, fetch_futures_balance, has_credentials
+
+# Same error context: at most one Discord ping per cooldown window.
+_ERROR_NOTIFY_COOLDOWN_SEC = 180.0
+_last_error_notify_at: dict[str, float] = {}
 
 
 def discord_configured() -> bool:
@@ -64,3 +69,29 @@ def notify_close(symbol: str, detail: str) -> None:
             logging.warning("Discord notify send failed: %s", exc)
     except Exception as exc:  # noqa: BLE001 — never break trading
         logging.warning("Discord notify_close failed: %s", exc)
+
+
+def notify_error(context: str, detail: str, *, cooldown_sec: float | None = None) -> None:
+    """Send bot-error notification to Discord. Never raises; no balance fetch (avoid API during bans)."""
+    try:
+        if not discord_configured():
+            logging.debug("Discord notify skipped: DISCORD_WEBHOOK_URL not set")
+            return
+
+        window = _ERROR_NOTIFY_COOLDOWN_SEC if cooldown_sec is None else max(0.0, cooldown_sec)
+        key = context.strip() or "error"
+        now = time.monotonic()
+        last = _last_error_notify_at.get(key, 0.0)
+        if window > 0 and (now - last) < window:
+            logging.debug("Discord error notify cooldown: %s", key)
+            return
+        _last_error_notify_at[key] = now
+
+        title = f"Bot lỗi: {key}"
+        body = str(detail).strip() or "(no detail)"
+        try:
+            _send_discord(title, body)
+        except Exception as exc:  # noqa: BLE001 — fail-soft
+            logging.warning("Discord notify send failed: %s", exc)
+    except Exception as exc:  # noqa: BLE001 — never break trading
+        logging.warning("Discord notify_error failed: %s", exc)

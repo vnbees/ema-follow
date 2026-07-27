@@ -459,6 +459,7 @@ Dashboard: nút manual profit take / reset baseline.
 - **Rút spot hàng ngày:** bật/tắt + % equity trên dashboard; lịch sử chuyển; biểu đồ spot
 - **Đăng nhập bắt buộc:** cookie session; chỉ tài khoản `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` (env)
 - **Discord notify đóng lệnh:** webhook; title `COIN đóng LONG|SHORT|L+S` + body Futures balance (available / equity / maint / initial)
+- **Discord notify lỗi chạy bot:** cùng webhook; title `Bot lỗi: …` + body message lỗi (Cycle failed / Trading failed / Position management / Scan); cooldown ~3 phút/context; không fetch balance (tránh gọi API lúc rate-limit)
 - API: `/`, `/api/pnl-calendar`, `/api/status`, `/api/profit-takes`, `/api/equity-history`, `/api/spot-history`, `/api/spot-transfers`
 
 Env auth:
@@ -480,7 +481,7 @@ Cách bật trên điện thoại:
 
 1. Cài Discord, vào channel nhận webhook
 2. Bật thông báo channel (mobile app)
-3. Lần đóng lệnh tiếp theo sẽ hiện tin trong channel
+3. Lần đóng lệnh / lỗi cycle tiếp theo sẽ hiện tin trong channel
 
 Bot trading **không** phụ thuộc đăng nhập dashboard / Discord.
 
@@ -577,7 +578,7 @@ DASHBOARD_PASSWORD=
 DASHBOARD_SESSION_SECRET=
 DASHBOARD_COOKIE_SECURE=true
 
-# Discord notify (đóng lệnh)
+# Discord notify (đóng lệnh + lỗi cycle)
 DISCORD_WEBHOOK_URL=
 
 # Rút futures → spot (giờ VN)
