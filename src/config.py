@@ -120,6 +120,26 @@ BINANCE_API_BASE = os.getenv("BINANCE_API_BASE", "https://fapi.binance.com")
 BINANCE_SPOT_API_BASE = os.getenv("BINANCE_SPOT_API_BASE", "https://api.binance.com")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
+BINANCE_WS_ENABLED = os.getenv("BINANCE_WS_ENABLED", "true").lower() in ("1", "true", "yes")
+BINANCE_WS_MARKET_URL = os.getenv(
+    "BINANCE_WS_MARKET_URL",
+    "wss://fstream.binance.com/ws",
+)
+BINANCE_WS_STREAM_BASE = os.getenv(
+    "BINANCE_WS_STREAM_BASE",
+    "wss://fstream.binance.com/stream",
+)
+BINANCE_WS_STALE_SEC = float(os.getenv("BINANCE_WS_STALE_SEC", "45"))
+BINANCE_WS_RECONCILE_SEC = float(os.getenv("BINANCE_WS_RECONCILE_SEC", "300"))
+BINANCE_WS_DISCONNECT_NOTIFY_SEC = float(os.getenv("BINANCE_WS_DISCONNECT_NOTIFY_SEC", "120"))
+# Skip heavy ticker/24hr seed when WS market is on (miniTicker fills rank).
+BINANCE_WS_REST_TICKER_SEED = os.getenv("BINANCE_WS_REST_TICKER_SEED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# Min interval between ticker/24hr volume-rank fallbacks when WS miniTicker is empty.
+BINANCE_VOLUME_RANK_REST_SEC = float(os.getenv("BINANCE_VOLUME_RANK_REST_SEC", "300"))
 
 SPOT_TRANSFER_ENABLED = os.getenv("SPOT_TRANSFER_ENABLED", "true").lower() in ("1", "true", "yes")
 SPOT_TRANSFER_PCT = float(os.getenv("SPOT_TRANSFER_PCT", "1"))

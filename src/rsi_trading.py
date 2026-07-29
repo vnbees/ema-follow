@@ -349,6 +349,7 @@ def _open_pair(symbol: str, snap: RsiSnapshot, trigger: str) -> int | None:
         long_fill,
         short_fill,
     )
+    _flush_post_order_reconcile()
     return lot_id
 
 
@@ -473,6 +474,7 @@ def _take_profit_lot_side(
     reopen_pair: bool,
     tp_target_pct: float | None = None,
 ) -> None:
+    """Single-lot TP helper (tests / callers). Prefer batched path in _scan_take_profits."""
     if side == "long":
         if lot["long_status"] != "open":
             return
@@ -489,6 +491,123 @@ def _take_profit_lot_side(
     close_lot_leg(symbol, lot, side, mark, trigger)
     if reopen_pair and is_tradeable_symbol(symbol):
         _open_pair(symbol, snap, f"{trigger}_tp_lot{lot['id']}_{side}")
+
+
+def _lot_side_fields(lot, side: str) -> tuple[float, float] | None:
+    if side == "long":
+        if lot["long_status"] != "open":
+            return None
+        entry = float(lot["long_entry"])
+        size = float(lot["long_size"])
+    else:
+        if lot["short_status"] != "open":
+            return None
+        entry = float(lot["short_entry"])
+        size = float(lot["short_size"])
+    if size <= 0:
+        return None
+    return entry, size
+
+
+def _take_profit_lots_side_batched(
+    symbol: str,
+    mark: float,
+    snap: RsiSnapshot,
+    trigger: str,
+    side: str,
+    *,
+    reopen_pair: bool,
+    tp_target_pct: float | None = None,
+) -> bool:
+    """Close all lots on one side that hit TP with a single exchange order."""
+    positions = fetch_symbol_positions(symbol)
+    exchange_size = positions[side].size
+    if exchange_size <= 0:
+        # Phantom lot sides (e.g. DB restored after exchange already flat).
+        n = _trim_lot_side_to_exchange(symbol, side, 0.0)
+        if n:
+            logging.info(
+                "  [%s] Skip batch TP %s — exchange flat, closed %d phantom lot side(s)",
+                symbol,
+                side.upper(),
+                n,
+            )
+        return False
+
+    candidates: list[tuple[object, float, float]] = []
+    for lot in db.get_open_pair_lots(symbol):
+        fields = _lot_side_fields(lot, side)
+        if fields is None:
+            continue
+        entry, size = fields
+        if should_take_profit(side, entry, mark, target_pct=tp_target_pct):
+            candidates.append((lot, entry, size))
+
+    if not candidates:
+        return False
+
+    # Cap to live exchange size — never send reduceOnly larger than position.
+    selected: list[tuple[object, float, float]] = []
+    selected_size = 0.0
+    for lot, entry, size in candidates:
+        if selected_size + size > exchange_size + 1e-9:
+            continue
+        selected.append((lot, entry, size))
+        selected_size += size
+    if not selected:
+        logging.warning(
+            "  [%s] Skip batch TP %s — TP lots exceed exchange size %.4f (sync will trim)",
+            symbol,
+            side.upper(),
+            exchange_size,
+        )
+        _trim_lot_side_to_exchange(symbol, side, exchange_size)
+        return False
+
+    size_str = _format_close_size(symbol, selected_size)
+    lot_ids = [int(lot["id"]) for lot, _, _ in selected]  # type: ignore[index]
+    logging.info(
+        "  [%s] Batch take profit %s | trigger=%s | lots=%s | size=%s | n=%d",
+        symbol,
+        side.upper(),
+        trigger,
+        lot_ids,
+        size_str,
+        len(selected),
+    )
+    fill = _close_side_and_resolve_fill(symbol, side, selected_size, mark)
+    for lot, entry, size in selected:
+        pnl = _estimate_leg_pnl(side, entry, fill, size)
+        logging.info(
+            "  [%s] Lot #%d batch-close %s fill=%.6f | pnl≈%+.2f",
+            symbol,
+            int(lot["id"]),  # type: ignore[index]
+            side.upper(),
+            fill,
+            pnl,
+        )
+        db.close_lot_side(
+            int(lot["id"]),  # type: ignore[index]
+            side,
+            realized_pnl_usdt=pnl,
+            close_price=fill,
+        )
+
+    from src.notify import notify_close
+
+    notify_close(symbol, f"{side.upper()}×{len(selected)}")
+    if reopen_pair and is_tradeable_symbol(symbol):
+        _open_pair(symbol, snap, f"{trigger}_tp_batch_{side}")
+    return True
+
+
+def _flush_post_order_reconcile() -> None:
+    try:
+        from src.exchange.binance_ws import flush_pending_reconcile
+
+        flush_pending_reconcile()
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Post-order reconcile flush skipped: %s", exc)
 
 
 def _scan_take_profits(
@@ -527,47 +646,107 @@ def _scan_take_profits(
         short_agg_closed = True
 
     if not long_agg_closed:
-        for lot in db.get_open_pair_lots(symbol):
-            if lot["long_status"] != "open":
-                continue
-            entry = float(lot["long_entry"])
-            if should_take_profit("long", entry, mark, target_pct=tp_target_pct):
-                _take_profit_lot_side(
-                    symbol, lot, "long", mark, snap, trigger,
-                    reopen_pair=reopen_pair, tp_target_pct=tp_target_pct,
-                )
-                took_action = True
+        if _take_profit_lots_side_batched(
+            symbol, mark, snap, trigger, "long",
+            reopen_pair=reopen_pair, tp_target_pct=tp_target_pct,
+        ):
+            took_action = True
 
     if not short_agg_closed:
-        for lot in db.get_open_pair_lots(symbol):
-            if lot["short_status"] != "open":
-                continue
-            entry = float(lot["short_entry"])
-            if should_take_profit("short", entry, mark, target_pct=tp_target_pct):
-                _take_profit_lot_side(
-                    symbol, lot, "short", mark, snap, trigger,
-                    reopen_pair=reopen_pair, tp_target_pct=tp_target_pct,
-                )
-                took_action = True
+        if _take_profit_lots_side_batched(
+            symbol, mark, snap, trigger, "short",
+            reopen_pair=reopen_pair, tp_target_pct=tp_target_pct,
+        ):
+            took_action = True
 
+    if took_action:
+        _flush_post_order_reconcile()
     return took_action
 
 
+def _trim_lot_side_to_exchange(symbol: str, side: str, exchange_size: float) -> int:
+    """Close oldest open lot sides until DB total <= exchange size. Returns # sides closed."""
+    side = side.lower()
+    status_key = "long_status" if side == "long" else "short_status"
+    size_key = "long_size" if side == "long" else "short_size"
+    closed = 0
+    closed_ids: set[int] = set()
+    while True:
+        open_lots = db.get_open_pair_lots(symbol)
+        lot_total = sum(
+            float(r[size_key]) for r in open_lots if r[status_key] == "open"
+        )
+        if lot_total <= exchange_size + 1e-6:
+            break
+        # FIFO by opened_at (get_open_pair_lots already ASC).
+        target = next(
+            (
+                r
+                for r in open_lots
+                if r[status_key] == "open" and int(r["id"]) not in closed_ids
+            ),
+            None,
+        )
+        if target is None:
+            logging.error(
+                "  [%s] Lot sync stuck — %s lots still %.4f > exchange %.4f after closes",
+                symbol,
+                side.upper(),
+                lot_total,
+                exchange_size,
+            )
+            break
+        lot_id = int(target["id"])
+        lot_size = float(target[size_key])
+        logging.warning(
+            "  [%s] Sync-close phantom %s lot #%d size=%.4f (lots=%.4f > exchange=%.4f)",
+            symbol,
+            side.upper(),
+            lot_id,
+            lot_size,
+            lot_total,
+            exchange_size,
+        )
+        db.close_lot_side(lot_id, side, realized_pnl_usdt=0.0, close_price=None)
+        closed_ids.add(lot_id)
+        closed += 1
+    return closed
+
+
 def _sync_lots_with_exchange(symbol: str) -> None:
+    """Align DB lots to exchange. Trim phantom oversize; warn when exchange has extra size."""
     positions = fetch_symbol_positions(symbol)
     long_size = positions["long"].size
     short_size = positions["short"].size
+    trimmed_long = _trim_lot_side_to_exchange(symbol, "long", long_size)
+    trimmed_short = _trim_lot_side_to_exchange(symbol, "short", short_size)
+
     open_lots = db.get_open_pair_lots(symbol)
     lot_long = sum(float(r["long_size"]) for r in open_lots if r["long_status"] == "open")
     lot_short = sum(float(r["short_size"]) for r in open_lots if r["short_status"] == "open")
     if abs(lot_long - long_size) > 1e-6 or abs(lot_short - short_size) > 1e-6:
         logging.warning(
-            "  [%s] Lot/exchange size mismatch: lots L=%.4f S=%.4f vs exchange L=%.4f S=%.4f",
+            "  [%s] Lot/exchange size mismatch: lots L=%.4f S=%.4f vs exchange L=%.4f S=%.4f"
+            "%s",
             symbol,
             lot_long,
             lot_short,
             long_size,
             short_size,
+            (
+                f" (trimmed L={trimmed_long} S={trimmed_short})"
+                if trimmed_long or trimmed_short
+                else " (exchange larger than lots — cannot invent lot rows)"
+            ),
+        )
+    elif trimmed_long or trimmed_short:
+        logging.info(
+            "  [%s] Lot sync OK after trim L=%d S=%d → L=%.4f S=%.4f",
+            symbol,
+            trimmed_long,
+            trimmed_short,
+            lot_long,
+            lot_short,
         )
 
 

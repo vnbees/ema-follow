@@ -311,16 +311,16 @@ Chạy cho **mọi** symbol managed — **không cần RSI cross**.
 
 Thứ tự `_scan_take_profits`:
 
-1. **Aggregate LONG** trên sàn ≥ ngưỡng → đóng **hết** long + `close_all_lot_sides(long)`
+1. **Aggregate LONG** trên sàn ≥ ngưỡng → đóng **hết** long + `close_all_lot_sides(long)` (1 order)
 2. **Aggregate SHORT** — tương tự (nếu long chưa aggregate-close)
-3. **Lot FIFO long** — từng lot đủ ngưỡng → `close_lot_leg`
-4. **Lot FIFO short** — tương tự
+3. **Lot-level LONG** — mọi lot đủ ngưỡng → **một** order `sum(size)`, cập nhật DB từng lot
+4. **Lot-level SHORT** — tương tự
 
 - **Không** `_open_pair` sau chốt
 
 ### 9b. Khi RSI cross (`reopen_pair=True`)
 
-Cùng logic, nhưng **sau mỗi chốt** → `_open_pair` (có preflight).
+Cùng logic batch/aggregate, nhưng sau chốt → `_open_pair` **một lần** / side (có preflight; không nhân reopen theo số lot).
 
 Nếu **có chốt** trên cross → return, **không** stack.
 
@@ -336,7 +336,7 @@ Nếu **không chốt**:
 |---|--------------|-----------|
 | Chốt aggregate/lot | Có | Có |
 | Ngưỡng TP | `effective_tp_pct()` | `effective_tp_pct()` |
-| Sau chốt | Không mở cặp | `_open_pair` (+ preflight) |
+| Sau chốt | Không mở cặp | `_open_pair` ×1 (+ preflight) |
 | Không chốt | — | Stack hoặc entry |
 
 ---
@@ -413,6 +413,23 @@ Mỗi lần `_open_pair` = **1 lot** (1 row):
 **Sync (`_sync_lots_with_exchange`):** so tổng size lot vs sàn; lệch → **log warning**, **không** tự sửa DB.
 
 **REST cache (Binance, chống IP ban):** `positionRisk` / `account` cache TTL ~2.5s trong process; tái sử dụng trong cùng lần evaluate 1 symbol. Invalidate ngay sau `place_market_order` / close. `fetch_total_unrealized_pnl` = **một** `positionRisk` (all). Cycle: nghỉ ~80ms giữa các symbol; `ticker/24hr` TTL **15 phút** khi đã đủ `MAX_OPEN_SYMBOLS`, **5 phút** khi còn slot scan.
+
+**WebSocket (Binance, mặc định bật `BINANCE_WS_ENABLED=true`):** giảm REST poll bằng push streams; facade `ExchangeClient` không đổi; Bitget không dùng path này.
+
+| REST | WS / hành vi |
+|------|----------------|
+| `klines` | `{symbol}@kline_5m` + REST lazy **từng** symbol (không bootstrap hàng loạt) |
+| `ticker/24hr` | `!miniTicker@arr` (REST seed **tắt** mặc định) |
+| `premiumIndex` | `!markPrice@arr@1s` |
+| `positionRisk` / `account` | UDS + REST reconcile **hoãn** sau khi market WS healthy; sau order: **debounce** (`on_order_placed` chỉ dirty) → `flush_pending_reconcile` đợi UDS hoặc reconcile **1 lần**/burst |
+| `POST /order`, dual/margin/leverage, spot | **Vẫn REST** |
+| Lot-level TP nhiều lot cùng side | **1** `POST /order` (`sum` size), không N lệnh |
+
+**Chống ban lặp khi redeploy:** cooldown 418 ghi file cạnh DB (`binance_rate_limit_until_ms` trên volume). Process mới đọc file → **không** gọi REST khi IP còn ban (tránh Binance gia hạn ban). Boot WS **không** gọi `ticker/24hr` + force reconcile. Chỉ subscribe kline cho **managed** symbols.
+
+**WS khi REST đang ban:** Market streams (kline / miniTicker / markPrice) vẫn chạy. User Data Stream tái dùng `listenKey` đã lưu disk (không POST create). Nến + positions snapshot trên volume để RSI/uPnL đọc được. **Không thể** đặt/đóng lệnh (order vẫn REST / cùng IP ban). Keepalive PUT bị skip khi ban — listenKey hết hạn ~60 phút nếu ban kéo dài.
+
+Module: [`src/exchange/binance_ws/`](src/exchange/binance_ws/). Stale > `BINANCE_WS_STALE_SEC` → fallback REST. Disconnect lâu → Discord `notify_error`.
 
 **Adopt:** vị thế sàn không có lot DB → tạo lot `adopted` (`LEGACY_MARGIN_USDT`).
 
@@ -532,6 +549,10 @@ BITGET_PASSPHRASE=
 BINANCE_API_KEY=
 BINANCE_SECRET_KEY=
 BINANCE_API_BASE=https://fapi.binance.com
+BINANCE_WS_ENABLED=true
+BINANCE_WS_STALE_SEC=45
+BINANCE_WS_RECONCILE_SEC=300
+BINANCE_WS_DISCONNECT_NOTIFY_SEC=120
 
 TRADING_ENABLED=true
 
@@ -632,6 +653,7 @@ Bot **mỗi 5 phút**:
 | `src/order_sizing.py` | `compute_entry_margin_usdt` |
 | `src/exchange/__init__.py` | Facade exchange |
 | `src/exchange/binance.py` | Binance hedge API |
+| `src/exchange/binance_ws/` | Market + User Data WebSocket cache |
 | `src/exchange/bitget.py` | Bitget adapter |
 | `src/bitget_client.py` | Bitget REST implementation |
 | `src/database.py` | `rsi_pair_lots`, migrations |

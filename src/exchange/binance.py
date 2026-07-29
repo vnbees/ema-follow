@@ -3,6 +3,7 @@ import re
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -13,6 +14,7 @@ from src.config import (
     BINANCE_SECRET_KEY,
     BINANCE_SPOT_API_BASE,
     CANDLE_LIMIT,
+    DATABASE_PATH,
     GRANULARITY,
     LEVERAGE,
     MARGIN_COIN,
@@ -40,6 +42,8 @@ _rest_cache_lock = threading.Lock()
 _position_by_symbol: dict[str, tuple[float, dict[str, Position]]] = {}
 _positions_all: tuple[float, list[Position]] | None = None
 _account_cache: tuple[float, FuturesAccountBalance] | None = None
+_volume_rank_rest_at_mono: float = 0.0
+_volume_rank_rest_cache: list[tuple[str, float]] = []
 
 
 def _invalidate_position_cache(symbol: str | None = None) -> None:
@@ -76,12 +80,46 @@ class RateLimitError(ExchangeClientError):
 
 
 # Cooldown window: while active, all REST calls fail fast without hitting Binance.
+# Persisted across restarts so redeploy does not re-hit a banned IP (extends bans).
 _rate_limit_lock = threading.Lock()
 _rate_limited_until_ms = 0.0
+_RATE_LIMIT_FILE = Path(DATABASE_PATH).expanduser().resolve().parent / "binance_rate_limit_until_ms"
 
 
 def _now_ms() -> float:
     return time.time() * 1000
+
+
+def _load_persisted_rate_limit() -> None:
+    global _rate_limited_until_ms
+    try:
+        if not _RATE_LIMIT_FILE.is_file():
+            return
+        until_ms = float(_RATE_LIMIT_FILE.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return
+    if until_ms > _now_ms():
+        with _rate_limit_lock:
+            if until_ms > _rate_limited_until_ms:
+                _rate_limited_until_ms = until_ms
+        # Do not logging.warning here — import-time logging freezes root at WARNING
+        # and hides all INFO (Bot started / market WS) until force=True basicConfig.
+
+
+def _persist_rate_limit(until_ms: float) -> None:
+    try:
+        _RATE_LIMIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _RATE_LIMIT_FILE.write_text(str(int(until_ms)), encoding="utf-8")
+    except OSError as exc:
+        logging.debug("Binance rate-limit persist failed: %s", exc)
+
+
+def _clear_persisted_rate_limit() -> None:
+    try:
+        if _RATE_LIMIT_FILE.is_file():
+            _RATE_LIMIT_FILE.unlink()
+    except OSError:
+        pass
 
 
 def _set_rate_limited_until(until_ms: float) -> None:
@@ -93,9 +131,11 @@ def _set_rate_limited_until(until_ms: float) -> None:
                 "Binance rate limited — pausing REST calls for %.0fs",
                 max(0.0, until_ms - _now_ms()) / 1000,
             )
+            _persist_rate_limit(until_ms)
 
 
 def _check_rate_limit_pause() -> None:
+    global _rate_limited_until_ms
     with _rate_limit_lock:
         until_ms = _rate_limited_until_ms
     if _now_ms() < until_ms:
@@ -103,6 +143,26 @@ def _check_rate_limit_pause() -> None:
         raise RateLimitError(
             f"Rate-limit cooldown active — {remaining:.0f}s remaining, request skipped"
         )
+    # Ban expired — drop stale file so next boot stays clean.
+    if until_ms > 0 and _now_ms() >= until_ms:
+        with _rate_limit_lock:
+            if _rate_limited_until_ms == until_ms:
+                _rate_limited_until_ms = 0.0
+        _clear_persisted_rate_limit()
+
+
+def rate_limit_remaining_sec() -> float:
+    """Seconds left in local 418/429 cooldown (0 if clear)."""
+    with _rate_limit_lock:
+        until_ms = _rate_limited_until_ms
+    return max(0.0, (until_ms - _now_ms()) / 1000)
+
+
+def is_rate_limited() -> bool:
+    return rate_limit_remaining_sec() > 0
+
+
+_load_persisted_rate_limit()
 
 
 def _handle_rate_limit_response(response: requests.Response) -> None:
@@ -165,6 +225,10 @@ def _private_request(
         try:
             if method == "GET":
                 response = requests.get(url, params=signed, headers=headers, timeout=10)
+            elif method == "PUT":
+                response = requests.put(url, params=signed, headers=headers, timeout=10)
+            elif method == "DELETE":
+                response = requests.delete(url, params=signed, headers=headers, timeout=10)
             else:
                 response = requests.post(url, params=signed, headers=headers, timeout=10)
             _handle_rate_limit_response(response)
@@ -323,7 +387,7 @@ def fetch_contract_spec(symbol: str) -> ContractSpec:
     return _SPEC_CACHE[symbol]
 
 
-def fetch_candles(
+def fetch_candles_rest(
     symbol: str = SYMBOL,
     *,
     granularity: str = GRANULARITY,
@@ -354,7 +418,44 @@ def fetch_candles(
     return candles
 
 
-def fetch_top_futures_by_volume(limit: int | None = None) -> list[tuple[str, float]]:
+def fetch_candles(
+    symbol: str = SYMBOL,
+    *,
+    granularity: str = GRANULARITY,
+    limit: int = CANDLE_LIMIT,
+    max_retries: int = 3,
+) -> list[Candle]:
+    try:
+        from src.exchange.binance_ws import get_candles_from_ws, watch_symbols
+
+        watch_symbols([symbol])
+        cached = get_candles_from_ws(symbol, granularity, limit)
+        if cached is not None and len(cached) >= min(limit, 20):
+            return cached
+    except Exception:  # noqa: BLE001 — fall through to REST
+        pass
+    if is_rate_limited():
+        raise RateLimitError(
+            f"Rate-limit cooldown active — {rate_limit_remaining_sec():.0f}s remaining, "
+            "no candle cache yet (wait for WS history or ban end)"
+        )
+    candles = fetch_candles_rest(
+        symbol, granularity=granularity, limit=limit, max_retries=max_retries
+    )
+    try:
+        from src.exchange.binance_ws.cache import CACHE
+        from src.exchange.binance_ws.manager import is_ws_enabled
+        from src.exchange.binance_ws.persist import save_candles_snapshot
+
+        if is_ws_enabled():
+            CACHE.set_candles(symbol.upper(), granularity, candles)
+            save_candles_snapshot()
+    except Exception:  # noqa: BLE001
+        pass
+    return candles
+
+
+def fetch_top_futures_by_volume_rest(limit: int | None = None) -> list[tuple[str, float]]:
     info = _load_exchange_info()
     trading_perps = {
         item["symbol"]
@@ -384,7 +485,78 @@ def fetch_top_futures_by_volume(limit: int | None = None) -> list[tuple[str, flo
     return ranked[:limit]
 
 
-def fetch_futures_balance(symbol: str = SYMBOL) -> FuturesAccountBalance:
+def fetch_top_futures_by_volume(limit: int | None = None) -> list[tuple[str, float]]:
+    """Prefer miniTicker WS rank; throttled REST fallback when WS rank is empty."""
+    global _volume_rank_rest_at_mono, _volume_rank_rest_cache
+
+    try:
+        from src.exchange.binance_ws.cache import CACHE
+        from src.exchange.binance_ws.manager import is_ws_enabled
+        from src.exchange.symbols import is_scan_symbol as _is_scan
+
+        if is_ws_enabled():
+            ranked_raw = CACHE.ranked_volumes()
+            if ranked_raw and (CACHE.mini_ticker_seeded or len(ranked_raw) >= 30):
+                ranked = [(s, v) for s, v in ranked_raw if _is_scan(s)]
+                if not is_rate_limited():
+                    try:
+                        info = _load_exchange_info()
+                        trading_perps = {
+                            item["symbol"]
+                            for item in info.get("symbols", [])
+                            if item.get("contractType") == "PERPETUAL"
+                            and item.get("status") == "TRADING"
+                            and item.get("quoteAsset") == "USDT"
+                            and item.get("marginAsset") == "USDT"
+                            and _is_scan(str(item.get("symbol", "")))
+                        }
+                        ranked = [(s, v) for s, v in ranked if s in trading_perps]
+                    except Exception:  # noqa: BLE001
+                        pass
+                if ranked:
+                    return ranked if limit is None else ranked[:limit]
+    except Exception:  # noqa: BLE001
+        pass
+
+    if is_rate_limited():
+        if _volume_rank_rest_cache:
+            return _volume_rank_rest_cache if limit is None else _volume_rank_rest_cache[:limit]
+        return []
+
+    from src.config import BINANCE_VOLUME_RANK_REST_SEC
+
+    now = time.monotonic()
+    if _volume_rank_rest_at_mono > 0 and (now - _volume_rank_rest_at_mono) < BINANCE_VOLUME_RANK_REST_SEC:
+        if _volume_rank_rest_cache:
+            return _volume_rank_rest_cache if limit is None else _volume_rank_rest_cache[:limit]
+        return []
+
+    _volume_rank_rest_at_mono = now
+    try:
+        from src.exchange.binance_ws.manager import is_ws_enabled
+
+        if is_ws_enabled():
+            logging.info("Volume rank REST fallback — WS miniTicker empty or not seeded")
+    except Exception:  # noqa: BLE001
+        pass
+
+    ranked = fetch_top_futures_by_volume_rest(limit=limit)
+    if ranked:
+        _volume_rank_rest_cache = ranked
+        try:
+            from src.exchange.binance_ws.cache import CACHE
+            from src.exchange.binance_ws.manager import is_ws_enabled
+
+            if is_ws_enabled():
+                CACHE.set_quote_volumes({s: v for s, v in ranked}, seeded=True)
+        except Exception:  # noqa: BLE001
+            pass
+    elif _volume_rank_rest_cache:
+        return _volume_rank_rest_cache if limit is None else _volume_rank_rest_cache[:limit]
+    return ranked
+
+
+def fetch_futures_balance_rest(symbol: str = SYMBOL) -> FuturesAccountBalance:
     global _account_cache
     _ = symbol
     now = _now_ms()
@@ -409,6 +581,19 @@ def fetch_futures_balance(symbol: str = SYMBOL) -> FuturesAccountBalance:
     with _rest_cache_lock:
         _account_cache = (now, balance)
     return balance
+
+
+def fetch_futures_balance(symbol: str = SYMBOL) -> FuturesAccountBalance:
+    try:
+        from src.exchange.binance_ws import flush_pending_reconcile, get_balance_from_ws
+
+        flush_pending_reconcile()
+        cached = get_balance_from_ws()
+        if cached is not None:
+            return cached
+    except Exception:  # noqa: BLE001
+        pass
+    return fetch_futures_balance_rest(symbol)
 
 
 def _empty_position(symbol: str) -> Position:
@@ -459,7 +644,7 @@ def _positions_dict_from_rows(symbol: str, rows: list) -> dict[str, Position]:
     return result
 
 
-def fetch_symbol_positions(symbol: str) -> dict[str, Position]:
+def fetch_symbol_positions_rest(symbol: str) -> dict[str, Position]:
     symbol = symbol.upper()
     now = _now_ms()
     with _rest_cache_lock:
@@ -479,7 +664,25 @@ def fetch_symbol_positions(symbol: str) -> dict[str, Position]:
     return result
 
 
-def fetch_all_open_positions() -> list[Position]:
+def fetch_symbol_positions(symbol: str) -> dict[str, Position]:
+    try:
+        from src.exchange.binance_ws import (
+            flush_pending_reconcile,
+            get_symbol_positions_from_ws,
+            watch_symbols,
+        )
+
+        watch_symbols([symbol])
+        flush_pending_reconcile()
+        cached = get_symbol_positions_from_ws(symbol)
+        if cached is not None:
+            return cached
+    except Exception:  # noqa: BLE001
+        pass
+    return fetch_symbol_positions_rest(symbol)
+
+
+def fetch_all_open_positions_rest() -> list[Position]:
     global _positions_all
     now = _now_ms()
     with _rest_cache_lock:
@@ -514,7 +717,27 @@ def fetch_all_open_positions() -> list[Position]:
     return list(positions)
 
 
+def fetch_all_open_positions() -> list[Position]:
+    try:
+        from src.exchange.binance_ws import get_all_positions_from_ws
+
+        cached = get_all_positions_from_ws()
+        if cached is not None:
+            return cached
+    except Exception:  # noqa: BLE001
+        pass
+    return fetch_all_open_positions_rest()
+
+
 def fetch_side_mark_price(symbol: str) -> float:
+    try:
+        from src.exchange.binance_ws import get_mark_from_ws
+
+        mark = get_mark_from_ws(symbol)
+        if mark is not None and mark > 0:
+            return mark
+    except Exception:  # noqa: BLE001
+        pass
     data = _public_get("/fapi/v1/premiumIndex", {"symbol": symbol.upper()})
     if isinstance(data, list):
         data = data[0] if data else {}
@@ -549,6 +772,16 @@ def fetch_total_unrealized_pnl(symbols: list[str]) -> tuple[float, int]:
 
 
 def fetch_order_detail(symbol: str, order_id: str) -> dict:
+    try:
+        from src.exchange.binance_ws import get_order_detail_from_ws
+
+        cached = get_order_detail_from_ws(order_id)
+        if cached is not None:
+            status = str(cached.get("status") or "").lower()
+            if status in {"filled", "canceled", "cancelled", "expired", "rejected", "new", "partially_filled"}:
+                return cached
+    except Exception:  # noqa: BLE001
+        pass
     data = _private_get(
         "/fapi/v1/order",
         {"symbol": symbol.upper(), "orderId": order_id},
@@ -565,6 +798,14 @@ def fetch_order_detail(symbol: str, order_id: str) -> dict:
 
 
 def fetch_pending_orders(symbol: str) -> list[PendingOrder]:
+    try:
+        from src.exchange.binance_ws import get_pending_from_ws
+
+        cached = get_pending_from_ws(symbol)
+        if cached is not None:
+            return cached
+    except Exception:  # noqa: BLE001
+        pass
     rows = _private_get("/fapi/v1/openOrders", {"symbol": symbol.upper()})
     if not isinstance(rows, list):
         return []
@@ -665,6 +906,12 @@ def place_market_order(
             params["reduceOnly"] = "true"
     result = _private_post("/fapi/v1/order", params)
     _invalidate_position_cache(symbol)
+    try:
+        from src.exchange.binance_ws import on_order_placed
+
+        on_order_placed(symbol)
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Binance WS post-order reconcile skipped: %s", exc)
     return {
         "orderId": str(result.get("orderId", "")),
         "clientOid": str(result.get("clientOrderId", client_oid)),

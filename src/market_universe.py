@@ -45,9 +45,13 @@ def refresh_volume_rank(
             return list(_volume_rank)
 
     with _lock:
-        _volume_rank = rows
-        _last_refreshed = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        _last_refreshed_mono = time.monotonic()
+        if rows:
+            _volume_rank = rows
+            _last_refreshed = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            _last_refreshed_mono = time.monotonic()
+        elif _volume_rank:
+            logging.debug("Volume rank refresh empty — keeping previous cache (%d symbols)", len(_volume_rank))
+            return list(_volume_rank)
     if rows:
         logging.info(
             "Volume rank loaded: %d USDT-M perpetuals (lead %s %.0f USDT 24h)",

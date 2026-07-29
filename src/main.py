@@ -49,8 +49,30 @@ from src.notify import notify_error
 from src.spot_transfer import process_daily_spot_transfer
 from src.trend import candle_color
 from src.web.app import app as web_app
-
 from src import database as db
+
+
+def _sync_binance_ws_symbols(managed: list[str], ranked: list[tuple[str, float]] | None = None) -> None:
+    try:
+        from src.config import EXCHANGE
+        from src.exchange.binance_ws import (
+            is_ws_enabled,
+            log_rest_stats_if_any,
+            reconcile_account_state,
+            watch_symbols,
+        )
+
+        if EXCHANGE != "binance" or not is_ws_enabled():
+            return
+        # Only managed symbols for kline streams — watching top-80 caused 80× REST
+        # kline bootstraps and IP bans. Scan candidates subscribe lazily on fetch_candles.
+        _ = ranked
+        watch_symbols(managed)
+        reconcile_account_state(force=False)
+        log_rest_stats_if_any()
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Binance WS cycle sync skipped: %s", exc)
+
 
 def setup_logging() -> None:
     LOG_DIR.mkdir(exist_ok=True)
@@ -63,6 +85,7 @@ def setup_logging() -> None:
             logging.StreamHandler(),
             logging.FileHandler(log_file, encoding="utf-8"),
         ],
+        force=True,
     )
 
 
@@ -218,9 +241,16 @@ def run_cycle() -> None:
     # Full book: reuse ticker rank up to 15m. Still scanning: refresh at least every 5m.
     rank_max_age = 900.0 if open_symbol_count >= MAX_OPEN_SYMBOLS else 300.0
     ranked = refresh_volume_rank(max_age_sec=rank_max_age)
+    managed_symbols = get_managed_symbols()
     if not ranked:
-        logging.warning("Volume rank empty — could not fetch tickers")
-        return
+        if not managed_symbols:
+            logging.warning("Volume rank empty — could not fetch tickers")
+            return
+        logging.warning(
+            "Volume rank empty — managing %d open symbol(s) only (skip new-entry scan)",
+            len(managed_symbols),
+        )
+        ranked = [(managed_symbols[0], 0.0)]
 
     close_all_blocked_symbols()
 
@@ -230,10 +260,10 @@ def run_cycle() -> None:
         logging.info("  Cycle skipped after margin critical liquidation")
         return
 
-    managed_symbols = get_managed_symbols()
     cycle_symbols = sorted(managed_symbols)
     clear_stale_signal_statuses(set(cycle_symbols))
     pnl_symbols = cycle_symbols or [ranked[0][0]]
+    _sync_binance_ws_symbols(cycle_symbols, ranked)
 
     if check_profit_target(pnl_symbols):
         _complete_cycle(pnl_symbols[0], managed_symbols=pnl_symbols)
@@ -313,7 +343,29 @@ def main() -> None:
     setup_logging()
     init_db()
     restore_tracked_positions()
+    try:
+        from src.config import EXCHANGE
+        from src.exchange.binance_ws import start_binance_ws
+
+        if EXCHANGE == "binance" and has_credentials():
+            start_binance_ws()
+            # Let miniTicker fill before first volume-rank refresh (avoid REST ticker/24hr).
+            for _ in range(20):
+                time.sleep(0.5)
+                try:
+                    from src.exchange.binance_ws.cache import CACHE
+
+                    if CACHE.mini_ticker_seeded or len(CACHE.ranked_volumes()) >= 30:
+                        break
+                except Exception:  # noqa: BLE001
+                    break
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Binance WS start skipped: %s", exc)
     ranked = refresh_volume_rank()
+    if not ranked:
+        logging.warning(
+            "Volume rank empty at startup — will retry each cycle (WS miniTicker / REST)"
+        )
     if is_trading_enabled() and has_credentials():
         try:
             close_all_blocked_symbols()

@@ -28,10 +28,23 @@ class TestBinancePositionCache(unittest.TestCase):
     def setUp(self) -> None:
         binance._rate_limited_until_ms = 0.0
         binance._invalidate_position_cache()
+        self._ws_patch = patch("src.exchange.binance_ws.manager.is_ws_enabled", return_value=False)
+        self._ws_patch.start()
+        # Also block WS read paths imported inside fetch_* 
+        self._ws_get_pos = patch("src.exchange.binance_ws.get_symbol_positions_from_ws", return_value=None)
+        self._ws_get_all = patch("src.exchange.binance_ws.get_all_positions_from_ws", return_value=None)
+        self._ws_get_bal = patch("src.exchange.binance_ws.get_balance_from_ws", return_value=None)
+        self._ws_get_pos.start()
+        self._ws_get_all.start()
+        self._ws_get_bal.start()
 
     def tearDown(self) -> None:
         binance._rate_limited_until_ms = 0.0
         binance._invalidate_position_cache()
+        self._ws_patch.stop()
+        self._ws_get_pos.stop()
+        self._ws_get_all.stop()
+        self._ws_get_bal.stop()
 
     def test_fetch_symbol_positions_cached(self) -> None:
         rows = [
@@ -79,6 +92,7 @@ class TestBinancePositionCache(unittest.TestCase):
             patch("src.exchange.binance._ensure_credentials"),
             patch("src.exchange.binance.BINANCE_API_KEY", "k"),
             patch("src.exchange.binance.BINANCE_SECRET_KEY", "s"),
+            patch("src.exchange.binance_ws.on_order_placed"),
         ):
             binance.place_market_order(
                 "SOLUSDT", "buy", "1", hold_side="long", trade_side="open",
