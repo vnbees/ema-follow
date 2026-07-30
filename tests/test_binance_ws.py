@@ -87,10 +87,64 @@ class TestMarketParsers(unittest.TestCase):
         CACHE.quote_volumes.clear()
         CACHE.mini_ticker_seeded = False
         CACHE.market_last_msg_at = 0.0
+        CACHE.candle_last_msg_at.clear()
         batch = [{"e": "24hrMiniTicker", "s": f"SYM{i}USDT", "q": str(1000 - i)} for i in range(90)]
         apply_market_payload(batch)
         self.assertTrue(CACHE.mini_ticker_seeded)
         self.assertGreaterEqual(len(CACHE.quote_volumes), 80)
+        # miniTicker must NOT count as kline health
+        self.assertEqual(CACHE.candle_last_msg_at, {})
+
+    def test_kline_raw_and_combined_bump_candle_health(self) -> None:
+        CACHE.candles.clear()
+        CACHE.candle_interval.clear()
+        CACHE.candle_last_msg_at.clear()
+        apply_market_payload(
+            {
+                "e": "kline",
+                "k": {
+                    "t": 1_000,
+                    "o": "1",
+                    "h": "2",
+                    "l": "1",
+                    "c": "1.5",
+                    "v": "3",
+                    "i": "5m",
+                    "x": True,
+                    "s": "BTCUSDT",
+                },
+            }
+        )
+        self.assertIn("BTCUSDT", CACHE.candle_last_msg_at)
+        age = CACHE.candle_age_sec("BTCUSDT")
+        self.assertIsNotNone(age)
+        assert age is not None
+        self.assertLess(age, 1.0)
+
+        apply_market_payload(
+            {
+                "stream": "ethusdt@kline_5m",
+                "data": {
+                    "e": "kline",
+                    "k": {
+                        "t": 2_000,
+                        "o": "1",
+                        "h": "2",
+                        "l": "1",
+                        "c": "1.6",
+                        "v": "4",
+                        "i": "5m",
+                        "x": False,
+                        "s": "ETHUSDT",
+                    },
+                },
+            }
+        )
+        self.assertIn("ETHUSDT", CACHE.candle_last_msg_at)
+        rows = CACHE.get_candles("ETHUSDT", "5m", 5)
+        self.assertIsNotNone(rows)
+        assert rows is not None
+        self.assertEqual(rows[-1].close, 1.6)
 
     def test_mark_price_array(self) -> None:
         rows = parse_mark_price_message(
@@ -588,6 +642,53 @@ class TestUserStreamRecvTimeout(unittest.TestCase):
     def test_timeout_error_str_is_empty(self) -> None:
         """Documents why empty 'user WS error:' appeared in Railway logs."""
         self.assertEqual(str(TimeoutError()), "")
+
+
+class TestWatchSetPrune(unittest.TestCase):
+    def test_set_watched_symbols_replaces(self) -> None:
+        from src.exchange.binance_ws import manager as mgr
+
+        mgr.watch_symbols(["AAAUSDT", "BBBUSDT"])
+        mgr.set_watched_symbols(["AAAUSDT", "CCCUSDT"])
+        self.assertEqual(mgr.watched_symbols(), {"AAAUSDT", "CCCUSDT"})
+
+
+class TestCandleRestCooldown(unittest.TestCase):
+    def setUp(self) -> None:
+        from src.exchange import binance
+
+        binance._candle_rest_at_mono.clear()
+        binance._last_candle_rest_mono = 0.0
+        CACHE.candles.clear()
+        CACHE.candle_interval.clear()
+        CACHE.candle_last_msg_at.clear()
+
+    def test_second_fetch_within_cooldown_skips_rest_when_fresh(self) -> None:
+        from src.exchange import binance
+        from src.candles import expected_last_closed_ts_ms
+
+        fake = [
+            Candle(timestamp=i * 300_000, open=1, high=1, low=1, close=1, volume=1)
+            for i in range(30)
+        ]
+        # Make last closed match expected so series is not stale after REST seed.
+        expected = expected_last_closed_ts_ms(5)
+        fake[-1] = Candle(
+            timestamp=expected, open=1, high=1, low=1, close=1.2, volume=1
+        )
+        with (
+            patch("src.exchange.binance_ws.manager.is_ws_enabled", return_value=True),
+            patch("src.exchange.binance_ws.get_candles_from_ws", return_value=None),
+            patch("src.exchange.binance_ws.manager.watch_symbols"),
+            patch("src.exchange.binance.fetch_candles_rest", return_value=fake) as mock_rest,
+            patch("src.exchange.binance.is_rate_limited", return_value=False),
+            patch("src.exchange.binance_ws.persist.save_candles_snapshot"),
+        ):
+            out1 = binance.fetch_candles("BTCUSDT", granularity="5m", limit=25)
+            out2 = binance.fetch_candles("BTCUSDT", granularity="5m", limit=25)
+            self.assertGreaterEqual(len(out1), 25)
+            self.assertGreaterEqual(len(out2), 25)
+            mock_rest.assert_called_once()
 
 
 if __name__ == "__main__":

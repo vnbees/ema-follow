@@ -11,7 +11,7 @@ from typing import Any, Callable
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from src.config import BINANCE_WS_STREAM_BASE, MARGIN_COIN
+from src.config import BINANCE_WS_USER_BASE, MARGIN_COIN
 from src.exchange.binance_ws.cache import CACHE
 from src.exchange.types import FuturesAccountBalance, PendingOrder, Position
 
@@ -208,9 +208,9 @@ class UserStream:
                     continue
 
                 listen_key = await asyncio.to_thread(self.create_listen_key)
-                base = "wss://fstream.binance.com"
-                if BINANCE_WS_STREAM_BASE:
-                    base = BINANCE_WS_STREAM_BASE.replace("/stream", "").rstrip("/")
+                base = (BINANCE_WS_USER_BASE or "wss://fstream.binance.com/private").rstrip(
+                    "/"
+                )
                 url = f"{base}/ws/{listen_key}"
                 async with websockets.connect(
                     url,

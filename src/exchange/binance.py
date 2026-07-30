@@ -44,6 +44,9 @@ _positions_all: tuple[float, list[Position]] | None = None
 _account_cache: tuple[float, FuturesAccountBalance] | None = None
 _volume_rank_rest_at_mono: float = 0.0
 _volume_rank_rest_cache: list[tuple[str, float]] = []
+_candle_rest_at_mono: dict[str, float] = {}
+_candle_rest_lock = threading.Lock()
+_last_candle_rest_mono: float = 0.0
 
 
 def _invalidate_position_cache(symbol: str | None = None) -> None:
@@ -425,30 +428,71 @@ def fetch_candles(
     limit: int = CANDLE_LIMIT,
     max_retries: int = 3,
 ) -> list[Candle]:
+    global _last_candle_rest_mono
+
+    symbol_u = symbol.upper()
     try:
         from src.exchange.binance_ws import get_candles_from_ws, watch_symbols
 
-        watch_symbols([symbol])
-        cached = get_candles_from_ws(symbol, granularity, limit)
+        watch_symbols([symbol_u])
+        cached = get_candles_from_ws(symbol_u, granularity, limit)
         if cached is not None and len(cached) >= min(limit, 20):
             return cached
     except Exception:  # noqa: BLE001 — fall through to REST
         pass
+
+    # Within cooldown: reuse last REST seed if it is still a valid closed series.
+    try:
+        from src.candles import is_candle_series_stale
+        from src.config import BINANCE_CANDLE_REST_SEC, INTERVAL_MINUTES
+        from src.exchange.binance_ws.cache import CACHE
+        from src.exchange.binance_ws.manager import is_ws_enabled
+
+        with _candle_rest_lock:
+            last_rest = _candle_rest_at_mono.get(symbol_u, 0.0)
+        if last_rest > 0 and (time.monotonic() - last_rest) < BINANCE_CANDLE_REST_SEC:
+            if is_ws_enabled():
+                rows = CACHE.get_candles(symbol_u, granularity, limit)
+                if (
+                    rows is not None
+                    and len(rows) >= min(limit, 20)
+                    and not is_candle_series_stale(rows, interval_minutes=INTERVAL_MINUTES)
+                ):
+                    return rows
+    except Exception:  # noqa: BLE001
+        pass
+
     if is_rate_limited():
         raise RateLimitError(
             f"Rate-limit cooldown active — {rate_limit_remaining_sec():.0f}s remaining, "
             "no candle cache yet (wait for WS history or ban end)"
         )
+
+    try:
+        from src.config import BINANCE_CANDLE_REST_STAGGER_SEC
+
+        with _candle_rest_lock:
+            gap = time.monotonic() - _last_candle_rest_mono
+            wait = BINANCE_CANDLE_REST_STAGGER_SEC - gap if _last_candle_rest_mono > 0 else 0.0
+        if wait > 0:
+            time.sleep(wait)
+    except Exception:  # noqa: BLE001
+        pass
+
     candles = fetch_candles_rest(
-        symbol, granularity=granularity, limit=limit, max_retries=max_retries
+        symbol_u, granularity=granularity, limit=limit, max_retries=max_retries
     )
+    now = time.monotonic()
+    with _candle_rest_lock:
+        _candle_rest_at_mono[symbol_u] = now
+        _last_candle_rest_mono = now
     try:
         from src.exchange.binance_ws.cache import CACHE
         from src.exchange.binance_ws.manager import is_ws_enabled
         from src.exchange.binance_ws.persist import save_candles_snapshot
 
         if is_ws_enabled():
-            CACHE.set_candles(symbol.upper(), granularity, candles)
+            CACHE.set_candles(symbol_u, granularity, candles)
             save_candles_snapshot()
     except Exception:  # noqa: BLE001
         pass

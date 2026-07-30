@@ -410,26 +410,36 @@ Mỗi lần `_open_pair` = **1 lot** (1 row):
 - `count_open_symbols()` — DISTINCT symbol có leg `open`
 - `count_open_legs()` — tổng leg `open`
 
-**Sync (`_sync_lots_with_exchange`):** so tổng size lot vs sàn; lệch → **log warning**, **không** tự sửa DB.
+**Sync (`_sync_lots_with_exchange`):** so tổng size lot vs sàn; DB > sàn → **tự đóng phantom lot sides** (FIFO); sàn > DB → log warning (không invent lot).
 
 **REST cache (Binance, chống IP ban):** `positionRisk` / `account` cache TTL ~2.5s trong process; tái sử dụng trong cùng lần evaluate 1 symbol. Invalidate ngay sau `place_market_order` / close. `fetch_total_unrealized_pnl` = **một** `positionRisk` (all). Cycle: nghỉ ~80ms giữa các symbol; `ticker/24hr` TTL **15 phút** khi đã đủ `MAX_OPEN_SYMBOLS`, **5 phút** khi còn slot scan.
 
 **WebSocket (Binance, mặc định bật `BINANCE_WS_ENABLED=true`):** giảm REST poll bằng push streams; facade `ExchangeClient` không đổi; Bitget không dùng path này.
 
+Hai connection market riêng (tránh miniTicker “nuôi” `market_fresh` trong khi kline chết):
+
+| Connection | Streams | Endpoint |
+|------------|---------|----------|
+| All-market | `!miniTicker@arr`, `!markPrice@arr@1s` | `wss://fstream.binance.com/market/ws` (raw array OK) |
+| Klines | `{symbol}@kline_5m` (managed + scan lazy) | `/market/ws` riêng + SUBSCRIBE (tách khỏi miniTicker; legacy `/ws` ACK nhưng không đẩy kline) |
+| User data | listenKey account/order/position | `wss://fstream.binance.com/private/ws/{listenKey}` |
+
 | REST | WS / hành vi |
 |------|----------------|
-| `klines` | `{symbol}@kline_5m` + REST lazy **từng** symbol (không bootstrap hàng loạt) |
-| `ticker/24hr` | `!miniTicker@arr` (REST seed **tắt** mặc định) |
+| `klines` | Kline WS + REST lazy **từng** symbol; cooldown `BINANCE_CANDLE_REST_SEC` + stagger chống burst 418 |
+| `ticker/24hr` | `!miniTicker@arr` (REST seed **tắt** mặc định; fallback throttle `BINANCE_VOLUME_RANK_REST_SEC`) |
 | `premiumIndex` | `!markPrice@arr@1s` |
-| `positionRisk` / `account` | UDS + REST reconcile **hoãn** sau khi market WS healthy; sau order: **debounce** (`on_order_placed` chỉ dirty) → `flush_pending_reconcile` đợi UDS hoặc reconcile **1 lần**/burst |
+| `positionRisk` / `account` | UDS + REST reconcile **hoãn** sau khi market WS healthy; sau order: **debounce** → `flush_pending_reconcile` |
 | `POST /order`, dual/margin/leverage, spot | **Vẫn REST** |
 | Lot-level TP nhiều lot cùng side | **1** `POST /order` (`sum` size), không N lệnh |
 
-**Chống ban lặp khi redeploy:** cooldown 418 ghi file cạnh DB (`binance_rate_limit_until_ms` trên volume). Process mới đọc file → **không** gọi REST khi IP còn ban (tránh Binance gia hạn ban). Boot WS **không** gọi `ticker/24hr` + force reconcile. Chỉ subscribe kline cho **managed** symbols.
+**Kline health:** `candle_last_msg_at` per-symbol; im lặng > `BINANCE_WS_KLINE_SILENCE_SEC` → resubscribe kline socket. Mỗi cycle `set_watched_symbols(managed)` prune streams thừa.
 
-**WS khi REST đang ban:** Market streams (kline / miniTicker / markPrice) vẫn chạy. User Data Stream tái dùng `listenKey` đã lưu disk (không POST create). Nến + positions snapshot trên volume để RSI/uPnL đọc được. **Không thể** đặt/đóng lệnh (order vẫn REST / cùng IP ban). Keepalive PUT bị skip khi ban — listenKey hết hạn ~60 phút nếu ban kéo dài.
+**Chống ban lặp khi redeploy:** cooldown 418 ghi file cạnh DB (`binance_rate_limit_until_ms` trên volume). Process mới đọc file → **không** gọi REST khi IP còn ban. Boot WS **không** gọi `ticker/24hr` + force reconcile.
 
-Module: [`src/exchange/binance_ws/`](src/exchange/binance_ws/). Stale > `BINANCE_WS_STALE_SEC` → fallback REST. Disconnect lâu → Discord `notify_error`.
+**WS khi REST đang ban:** All-market + kline + UDS (listenKey disk) vẫn chạy. Nến + positions snapshot trên volume. **Không thể** đặt/đóng lệnh. Keepalive PUT skip khi ban.
+
+Module: [`src/exchange/binance_ws/`](src/exchange/binance_ws/). Candle series stale → fallback REST (có throttle). Disconnect lâu → Discord `notify_error`.
 
 **Adopt:** vị thế sàn không có lot DB → tạo lot `adopted` (`LEGACY_MARGIN_USDT`).
 
@@ -553,6 +563,10 @@ BINANCE_WS_ENABLED=true
 BINANCE_WS_STALE_SEC=45
 BINANCE_WS_RECONCILE_SEC=300
 BINANCE_WS_DISCONNECT_NOTIFY_SEC=120
+BINANCE_WS_KLINE_SILENCE_SEC=90
+BINANCE_CANDLE_REST_SEC=45
+BINANCE_CANDLE_REST_STAGGER_SEC=0.15
+BINANCE_VOLUME_RANK_REST_SEC=300
 
 TRADING_ENABLED=true
 

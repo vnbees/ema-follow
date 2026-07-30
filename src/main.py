@@ -59,15 +59,14 @@ def _sync_binance_ws_symbols(managed: list[str], ranked: list[tuple[str, float]]
             is_ws_enabled,
             log_rest_stats_if_any,
             reconcile_account_state,
-            watch_symbols,
+            set_watched_symbols,
         )
 
         if EXCHANGE != "binance" or not is_ws_enabled():
             return
-        # Only managed symbols for kline streams — watching top-80 caused 80× REST
-        # kline bootstraps and IP bans. Scan candidates subscribe lazily on fetch_candles.
+        # Prune kline subscriptions to managed only — scan symbols join lazily via fetch_candles.
         _ = ranked
-        watch_symbols(managed)
+        set_watched_symbols(managed)
         reconcile_account_state(force=False)
         log_rest_stats_if_any()
     except Exception as exc:  # noqa: BLE001
@@ -275,7 +274,12 @@ def run_cycle() -> None:
 
     for idx, symbol in enumerate(cycle_symbols):
         if idx > 0:
-            time.sleep(0.08)
+            try:
+                from src.config import BINANCE_CANDLE_REST_STAGGER_SEC
+
+                time.sleep(max(0.08, BINANCE_CANDLE_REST_STAGGER_SEC))
+            except Exception:  # noqa: BLE001
+                time.sleep(0.08)
         try:
             run_analysis_for_symbol(symbol)
         except ExchangeClientError as exc:

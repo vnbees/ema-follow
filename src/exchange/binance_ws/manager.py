@@ -17,7 +17,7 @@ from src.config import (
     INTERVAL_MINUTES,
 )
 from src.exchange.binance_ws.cache import CACHE, _now
-from src.exchange.binance_ws.market_stream import MarketStream
+from src.exchange.binance_ws.market_stream import AllMarketStream, KlineStream
 from src.exchange.binance_ws.user_stream import UserStream
 from src.exchange.types import Candle, FuturesAccountBalance, PendingOrder, Position
 
@@ -43,6 +43,14 @@ def watch_symbols(symbols: list[str] | set[str]) -> None:
     """Ensure kline streams for these symbols (managed; scan candidates via fetch_candles)."""
     with _lock:
         _watch_symbols.update(s.upper() for s in symbols if s)
+
+
+def set_watched_symbols(symbols: list[str] | set[str]) -> None:
+    """Replace the watched kline set (prune streams no longer needed)."""
+    desired = {s.upper() for s in symbols if s}
+    with _lock:
+        _watch_symbols.clear()
+        _watch_symbols.update(desired)
 
 
 def watched_symbols() -> set[str]:
@@ -258,9 +266,12 @@ def maybe_notify_disconnect() -> None:
         return
     market_down = CACHE.market_disconnect_since
     user_down = CACHE.user_disconnect_since
+    kline_down = CACHE.kline_disconnect_since
     msgs: list[str] = []
     if market_down is not None and (_now() - market_down) >= BINANCE_WS_DISCONNECT_NOTIFY_SEC:
-        msgs.append(f"market WS down {(_now() - market_down):.0f}s")
+        msgs.append(f"all-market WS down {(_now() - market_down):.0f}s")
+    if kline_down is not None and (_now() - kline_down) >= BINANCE_WS_DISCONNECT_NOTIFY_SEC:
+        msgs.append(f"kline WS down {(_now() - kline_down):.0f}s")
     if user_down is not None and (_now() - user_down) >= BINANCE_WS_DISCONNECT_NOTIFY_SEC:
         msgs.append(f"user WS down {(_now() - user_down):.0f}s")
     if not msgs:
@@ -276,10 +287,10 @@ def maybe_notify_disconnect() -> None:
 
 async def _async_main() -> None:
     assert _stop_event is not None
-    market = MarketStream(
+    all_market = AllMarketStream(stop_event=_stop_event)
+    klines = KlineStream(
         interval=GRANULARITY,
         symbols_provider=watched_symbols,
-        bootstrap_candles=None,  # never mass-REST bootstrap on subscribe
         stop_event=_stop_event,
     )
     user = UserStream(
@@ -323,7 +334,8 @@ async def _async_main() -> None:
             await asyncio.sleep(60)
 
     await asyncio.gather(
-        market.run(),
+        all_market.run(),
+        klines.run(),
         user.run(),
         _health_watch(),
         _deferred_rest_after_market(),
@@ -365,7 +377,7 @@ def start_binance_ws() -> None:
 
         managed = get_managed_symbols()
         if managed:
-            watch_symbols(managed)
+            set_watched_symbols(managed)
             logging.info("Binance WS pre-subscribe klines for %d managed symbols", len(managed))
     except Exception as exc:  # noqa: BLE001
         logging.debug("Binance WS managed-symbol preload skipped: %s", exc)
@@ -395,7 +407,7 @@ def start_binance_ws() -> None:
 
     _thread = threading.Thread(target=_runner, name="binance-ws", daemon=True)
     _thread.start()
-    logging.info("Binance WS manager started (market + user data)")
+    logging.info("Binance WS manager started (all-market + kline + user data)")
 
 
 def stop_binance_ws() -> None:
@@ -426,6 +438,17 @@ def get_candles_from_ws(symbol: str, interval: str, limit: int) -> list[Candle] 
             symbol.upper(),
         )
     return None
+
+
+def kline_fresh(symbol: str, max_age: float | None = None) -> bool:
+    """True when this symbol recently received a kline WS update."""
+    from src.config import BINANCE_WS_KLINE_SILENCE_SEC
+
+    age = CACHE.candle_age_sec(symbol)
+    if age is None:
+        return False
+    limit = BINANCE_WS_KLINE_SILENCE_SEC if max_age is None else max_age
+    return CACHE.kline_connected and age <= limit
 
 
 def get_volume_rank_from_ws(limit: int | None = None) -> list[tuple[str, float]] | None:

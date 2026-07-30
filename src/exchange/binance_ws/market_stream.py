@@ -1,16 +1,25 @@
-"""Binance USD-M public market WebSocket (klines, miniTicker, markPrice)."""
+"""Binance USD-M public market WebSocket (klines, miniTicker, markPrice).
+
+All-market streams (miniTicker / markPrice) and per-symbol klines run on
+separate connections so all-market traffic cannot mask dead kline feeds.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import time
 from typing import Any, Callable
 
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from src.config import BINANCE_WS_MARKET_URL, GRANULARITY
+from src.config import (
+    BINANCE_WS_KLINE_SILENCE_SEC,
+    BINANCE_WS_MARKET_URL,
+    GRANULARITY,
+)
 from src.exchange.binance_ws.cache import CACHE
 from src.exchange.types import Candle
 
@@ -114,7 +123,6 @@ def apply_market_payload(payload: dict[str, Any] | list[Any]) -> None:
             CACHE.refresh_unrealized_from_marks()
         return
 
-    CACHE.touch_market()
     if payload.get("e") == "kline" or (
         isinstance(payload.get("data"), dict) and payload["data"].get("e") == "kline"
     ):
@@ -124,13 +132,13 @@ def apply_market_payload(payload: dict[str, Any] | list[Any]) -> None:
             CACHE.upsert_kline_update(symbol, interval, candle, is_closed=is_closed)
         return
 
+    CACHE.touch_market()
     stream = str(payload.get("stream") or "")
     if "miniTicker" in stream or payload.get("e") == "24hrMiniTicker":
         for symbol, quote in parse_mini_ticker_message(payload):
             CACHE.update_quote_volume(symbol, quote)
         return
     if isinstance(payload.get("data"), list):
-        # !miniTicker@arr or !markPrice@arr
         sample = payload["data"][0] if payload["data"] else {}
         if isinstance(sample, dict) and "q" in sample and "s" in sample and "p" not in sample:
             for symbol, quote in parse_mini_ticker_message(payload):
@@ -148,26 +156,27 @@ def apply_market_payload(payload: dict[str, Any] | list[Any]) -> None:
         CACHE.refresh_unrealized_from_marks()
 
 
-class MarketStream:
-    def __init__(
-        self,
-        *,
-        interval: str = GRANULARITY,
-        symbols_provider: SubscribeFn | None = None,
-        bootstrap_candles: BootstrapFn | None = None,
-        stop_event: asyncio.Event | None = None,
-    ) -> None:
-        self.interval = interval
-        self.symbols_provider = symbols_provider or (lambda: set())
-        self.bootstrap_candles = bootstrap_candles
+def _is_control_reply(payload: Any) -> bool:
+    return isinstance(payload, dict) and "id" in payload and ("result" in payload or "error" in payload)
+
+
+def _control_ok(payload: dict[str, Any]) -> bool:
+    if payload.get("error"):
+        return False
+    return True
+
+
+class AllMarketStream:
+    """miniTicker + markPrice on /market/ws (raw array payloads)."""
+
+    def __init__(self, *, stop_event: asyncio.Event | None = None) -> None:
         self._stop = stop_event or asyncio.Event()
         self._ws: Any = None
         self._subscribed: set[str] = set()
         self._msg_id = 1
-        self._last_sub_sync_at = 0.0
         self._base_streams = {"!miniTicker@arr", "!markPrice@arr@1s"}
-        # /ws + SUBSCRIBE: Binance pushes !miniTicker@arr as a top-level JSON array.
         self._ws_url = BINANCE_WS_MARKET_URL
+        self._pending_sub: dict[int, set[str]] = {}
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -176,51 +185,36 @@ class MarketStream:
         self._msg_id += 1
         return self._msg_id
 
-    def desired_streams(self) -> set[str]:
-        streams = set(self._base_streams)
-        for symbol in self.symbols_provider():
-            streams.add(_kline_stream(symbol, self.interval))
-        return streams
-
     async def _send_sub(self, streams: set[str], *, subscribe: bool) -> None:
         if not streams or self._ws is None:
             return
         method = "SUBSCRIBE" if subscribe else "UNSUBSCRIBE"
+        msg_id = self._next_id()
+        if subscribe:
+            self._pending_sub[msg_id] = set(streams)
         await self._ws.send(
-            json.dumps({"method": method, "params": sorted(streams), "id": self._next_id()})
+            json.dumps({"method": method, "params": sorted(streams), "id": msg_id})
         )
+        if not subscribe:
+            self._subscribed -= streams
 
-    async def _maybe_sync_subscriptions(self, *, force: bool = False) -> None:
-        import time
-
-        now = time.monotonic()
-        if not force and now - self._last_sub_sync_at < 3.0:
-            return
-        self._last_sub_sync_at = now
-        await self._sync_subscriptions()
-
-    async def _sync_subscriptions(self) -> None:
-        desired = self.desired_streams()
+    async def _sync(self) -> None:
+        desired = set(self._base_streams)
         to_add = desired - self._subscribed
-        to_drop = self._subscribed - desired
-        # Never drop base streams while connected
-        to_drop -= self._base_streams
         if to_add:
             await self._send_sub(to_add, subscribe=True)
-            for stream in to_add:
-                if stream.startswith("!") or "@kline_" not in stream:
-                    continue
-                symbol = stream.split("@", 1)[0].upper()
-                if self.bootstrap_candles is not None:
-                    try:
-                        self.bootstrap_candles(symbol, self.interval)
-                    except Exception as exc:  # noqa: BLE001
-                        logging.warning("Binance WS candle bootstrap failed %s: %s", symbol, exc)
-            self._subscribed |= to_add
-            logging.info("Binance market WS subscribed +%d streams", len(to_add))
-        if to_drop:
-            await self._send_sub(to_drop, subscribe=False)
-            self._subscribed -= to_drop
+            logging.info("Binance all-market WS subscribe requested +%d streams", len(to_add))
+
+    def _handle_control(self, payload: dict[str, Any]) -> None:
+        msg_id = payload.get("id")
+        pending = self._pending_sub.pop(msg_id, None) if msg_id is not None else None
+        if pending is None:
+            return
+        if _control_ok(payload):
+            self._subscribed |= pending
+            logging.info("Binance all-market WS subscribed %d streams", len(pending))
+        else:
+            logging.warning("Binance all-market WS subscribe failed: %s", payload.get("error"))
 
     async def run(self) -> None:
         while not self._stop.is_set():
@@ -234,14 +228,15 @@ class MarketStream:
                 ) as ws:
                     self._ws = ws
                     self._subscribed = set()
+                    self._pending_sub.clear()
                     CACHE.touch_market()
-                    logging.info("Binance market WS connected")
-                    await self._maybe_sync_subscriptions(force=True)
+                    logging.info("Binance all-market WS connected")
+                    await self._sync()
                     while not self._stop.is_set():
                         try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=15)
+                            raw = await asyncio.wait_for(ws.recv(), timeout=20)
                         except asyncio.TimeoutError:
-                            await self._maybe_sync_subscriptions(force=True)
+                            await self._sync()
                             continue
                         if isinstance(raw, bytes):
                             raw = raw.decode("utf-8", errors="ignore")
@@ -252,31 +247,227 @@ class MarketStream:
                             payload = json.loads(raw)
                         except json.JSONDecodeError:
                             continue
-                        if isinstance(payload, dict) and "result" in payload and "id" in payload:
+                        if _is_control_reply(payload):
+                            self._handle_control(payload)
                             continue
                         if isinstance(payload, (dict, list)):
                             apply_market_payload(payload)
-                            if isinstance(payload, dict):
-                                # Persist closed candles occasionally for REST-ban restarts.
-                                k = None
-                                if payload.get("e") == "kline":
-                                    k = payload.get("k") or {}
-                                elif isinstance(payload.get("data"), dict) and payload["data"].get("e") == "kline":
-                                    k = payload["data"].get("k") or {}
-                                if isinstance(k, dict) and k.get("x"):
-                                    try:
-                                        from src.exchange.binance_ws.persist import save_candles_snapshot
-
-                                        save_candles_snapshot()
-                                    except Exception:  # noqa: BLE001
-                                        pass
-                        await self._maybe_sync_subscriptions()
             except ConnectionClosed as exc:
-                logging.warning("Binance market WS disconnected: %s", exc)
+                logging.warning("Binance all-market WS disconnected: %s", exc)
             except Exception as exc:  # noqa: BLE001
-                logging.warning("Binance market WS error: %s", exc)
+                logging.warning("Binance all-market WS error: %s", exc)
             finally:
                 self._ws = None
                 CACHE.mark_market_down()
             if not self._stop.is_set():
                 await asyncio.sleep(3)
+
+
+class KlineStream:
+    """Per-symbol klines on a dedicated /market/ws connection (SUBSCRIBE only)."""
+
+    def __init__(
+        self,
+        *,
+        interval: str = GRANULARITY,
+        symbols_provider: SubscribeFn | None = None,
+        stop_event: asyncio.Event | None = None,
+        silence_sec: float | None = None,
+    ) -> None:
+        self.interval = interval
+        self.symbols_provider = symbols_provider or (lambda: set())
+        self._stop = stop_event or asyncio.Event()
+        self._ws: Any = None
+        self._subscribed: set[str] = set()
+        self._msg_id = 1
+        self._last_sub_sync_at = 0.0
+        self._pending_sub: dict[int, set[str]] = {}
+        self._subscribed_since: dict[str, float] = {}
+        self._silence_sec = (
+            BINANCE_WS_KLINE_SILENCE_SEC if silence_sec is None else float(silence_sec)
+        )
+        # Must be /market/ws — legacy /ws ACKs kline SUBSCRIBE but sends no frames.
+        self._ws_url = BINANCE_WS_MARKET_URL
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    def _next_id(self) -> int:
+        self._msg_id += 1
+        return self._msg_id
+
+    def desired_streams(self) -> set[str]:
+        return {_kline_stream(symbol, self.interval) for symbol in self.symbols_provider()}
+
+    async def _send_sub(self, streams: set[str], *, subscribe: bool) -> None:
+        if not streams or self._ws is None:
+            return
+        method = "SUBSCRIBE" if subscribe else "UNSUBSCRIBE"
+        msg_id = self._next_id()
+        if subscribe:
+            self._pending_sub[msg_id] = set(streams)
+        await self._ws.send(
+            json.dumps({"method": method, "params": sorted(streams), "id": msg_id})
+        )
+        if not subscribe:
+            self._subscribed -= streams
+            for stream in streams:
+                self._subscribed_since.pop(stream, None)
+
+    def _handle_control(self, payload: dict[str, Any]) -> None:
+        msg_id = payload.get("id")
+        pending = self._pending_sub.pop(msg_id, None) if msg_id is not None else None
+        if pending is None:
+            return
+        if _control_ok(payload):
+            now = time.monotonic()
+            self._subscribed |= pending
+            for stream in pending:
+                self._subscribed_since.setdefault(stream, now)
+            logging.info("Binance kline WS subscribed +%d streams", len(pending))
+        else:
+            logging.warning("Binance kline WS subscribe failed: %s", payload.get("error"))
+
+    async def _maybe_sync(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_sub_sync_at < 3.0:
+            return
+        self._last_sub_sync_at = now
+        await self._sync()
+
+    async def _force_resubscribe_silent(self) -> None:
+        now = time.monotonic()
+        silent: set[str] = set()
+        for stream in list(self._subscribed):
+            symbol = stream.split("@", 1)[0].upper()
+            age = CACHE.candle_age_sec(symbol)
+            if age is not None:
+                if age < self._silence_sec:
+                    continue
+            else:
+                since = self._subscribed_since.get(stream, now)
+                if (now - since) < self._silence_sec:
+                    continue
+            silent.add(stream)
+            logging.warning(
+                "Binance kline WS silent for %s (age=%s) — resubscribe",
+                symbol,
+                f"{age:.0f}s" if age is not None else "never",
+            )
+        if not silent:
+            return
+        await self._send_sub(silent, subscribe=False)
+        self._subscribed -= silent
+        for stream in silent:
+            self._subscribed_since.pop(stream, None)
+            with CACHE.lock:
+                CACHE.candle_last_msg_at.pop(stream.split("@", 1)[0].upper(), None)
+
+    async def _sync(self) -> None:
+        await self._force_resubscribe_silent()
+        desired = self.desired_streams()
+        pending: set[str] = set()
+        for streams in self._pending_sub.values():
+            pending |= streams
+        to_add = desired - self._subscribed - pending
+        to_drop = self._subscribed - desired
+        if to_add:
+            await self._send_sub(to_add, subscribe=True)
+            logging.info("Binance kline WS subscribe requested +%d streams", len(to_add))
+        if to_drop:
+            await self._send_sub(to_drop, subscribe=False)
+            logging.info("Binance kline WS unsubscribed -%d streams", len(to_drop))
+
+    async def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                async with websockets.connect(
+                    self._ws_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                    max_queue=1024,
+                ) as ws:
+                    self._ws = ws
+                    self._subscribed = set()
+                    self._subscribed_since.clear()
+                    self._pending_sub.clear()
+                    CACHE.touch_kline()
+                    logging.info("Binance kline WS connected (%s)", self._ws_url)
+                    await self._maybe_sync(force=True)
+                    data_msgs = 0
+                    last_stat = time.monotonic()
+                    logged_first = False
+                    while not self._stop.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=15)
+                        except asyncio.TimeoutError:
+                            await self._maybe_sync(force=True)
+                            continue
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8", errors="ignore")
+                        if raw == "ping":
+                            await ws.send("pong")
+                            continue
+                        try:
+                            payload = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        if _is_control_reply(payload):
+                            self._handle_control(payload)
+                            continue
+                        data_msgs += 1
+                        if not logged_first:
+                            logged_first = True
+                            kind = (
+                                "list"
+                                if isinstance(payload, list)
+                                else str(
+                                    (payload or {}).get("e")
+                                    or (payload or {}).get("stream")
+                                    or type(payload).__name__
+                                )
+                            )
+                            logging.info("Binance kline WS first data msg type=%s", kind)
+                        now = time.monotonic()
+                        if now - last_stat >= 60:
+                            logging.info(
+                                "Binance kline WS data msgs=%d in last 60s (watched=%d)",
+                                data_msgs,
+                                len(self._subscribed),
+                            )
+                            data_msgs = 0
+                            last_stat = now
+                        if isinstance(payload, (dict, list)):
+                            apply_market_payload(payload)
+                            if isinstance(payload, dict):
+                                k = None
+                                if payload.get("e") == "kline":
+                                    k = payload.get("k") or {}
+                                elif (
+                                    isinstance(payload.get("data"), dict)
+                                    and payload["data"].get("e") == "kline"
+                                ):
+                                    k = payload["data"].get("k") or {}
+                                if isinstance(k, dict) and k.get("x"):
+                                    try:
+                                        from src.exchange.binance_ws.persist import (
+                                            save_candles_snapshot,
+                                        )
+
+                                        save_candles_snapshot()
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                        await self._maybe_sync()
+            except ConnectionClosed as exc:
+                logging.warning("Binance kline WS disconnected: %s", exc)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Binance kline WS error: %s", exc)
+            finally:
+                self._ws = None
+                CACHE.mark_kline_down()
+            if not self._stop.is_set():
+                await asyncio.sleep(3)
+
+
+MarketStream = KlineStream

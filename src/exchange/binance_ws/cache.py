@@ -20,9 +20,12 @@ class BinanceWsCache:
     # Market
     candles: dict[str, list[Candle]] = field(default_factory=dict)
     candle_interval: dict[str, str] = field(default_factory=dict)
+    candle_last_msg_at: dict[str, float] = field(default_factory=dict)
     quote_volumes: dict[str, float] = field(default_factory=dict)
     marks: dict[str, float] = field(default_factory=dict)
     market_last_msg_at: float = 0.0
+    kline_connected: bool = False
+    kline_disconnect_since: float | None = None
     mini_ticker_seeded: bool = False
 
     # Account / positions / orders
@@ -70,6 +73,27 @@ class BinanceWsCache:
             self.market_connected = False
             if self.market_disconnect_since is None:
                 self.market_disconnect_since = _now()
+
+    def touch_kline(self, symbol: str | None = None) -> None:
+        with self.lock:
+            now = _now()
+            self.kline_connected = True
+            self.kline_disconnect_since = None
+            if symbol:
+                self.candle_last_msg_at[symbol.upper()] = now
+
+    def mark_kline_down(self) -> None:
+        with self.lock:
+            self.kline_connected = False
+            if self.kline_disconnect_since is None:
+                self.kline_disconnect_since = _now()
+
+    def candle_age_sec(self, symbol: str) -> float | None:
+        with self.lock:
+            ts = self.candle_last_msg_at.get(symbol.upper())
+            if not ts:
+                return None
+            return _now() - ts
 
     def mark_user_down(self) -> None:
         with self.lock:
@@ -134,6 +158,7 @@ class BinanceWsCache:
         *,
         is_closed: bool,
     ) -> None:
+        _ = is_closed
         symbol = symbol.upper()
         with self.lock:
             if self.candle_interval.get(symbol) not in (None, interval):
@@ -141,6 +166,10 @@ class BinanceWsCache:
             self.candle_interval[symbol] = interval
             rows = self.candles.setdefault(symbol, [])
             self._upsert_candle_row(rows, candle)
+            now = _now()
+            self.candle_last_msg_at[symbol] = now
+            self.kline_connected = True
+            self.kline_disconnect_since = None
 
     def set_quote_volumes(self, volumes: dict[str, float], *, seeded: bool = False) -> None:
         with self.lock:

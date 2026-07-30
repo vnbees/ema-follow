@@ -121,13 +121,20 @@ BINANCE_SPOT_API_BASE = os.getenv("BINANCE_SPOT_API_BASE", "https://api.binance.
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
 BINANCE_WS_ENABLED = os.getenv("BINANCE_WS_ENABLED", "true").lower() in ("1", "true", "yes")
+# Post April 2026: legacy wss://fstream.binance.com/ws ACKs SUBSCRIBE but
+# delivers no kline/miniTicker/markPrice data. Use /market for public market
+# streams and /private for user data (listenKey).
 BINANCE_WS_MARKET_URL = os.getenv(
     "BINANCE_WS_MARKET_URL",
-    "wss://fstream.binance.com/ws",
+    "wss://fstream.binance.com/market/ws",
 )
 BINANCE_WS_STREAM_BASE = os.getenv(
     "BINANCE_WS_STREAM_BASE",
-    "wss://fstream.binance.com/stream",
+    "wss://fstream.binance.com/market/stream",
+)
+BINANCE_WS_USER_BASE = os.getenv(
+    "BINANCE_WS_USER_BASE",
+    "wss://fstream.binance.com/private",
 )
 BINANCE_WS_STALE_SEC = float(os.getenv("BINANCE_WS_STALE_SEC", "45"))
 BINANCE_WS_RECONCILE_SEC = float(os.getenv("BINANCE_WS_RECONCILE_SEC", "300"))
@@ -140,6 +147,12 @@ BINANCE_WS_REST_TICKER_SEED = os.getenv("BINANCE_WS_REST_TICKER_SEED", "false").
 )
 # Min interval between ticker/24hr volume-rank fallbacks when WS miniTicker is empty.
 BINANCE_VOLUME_RANK_REST_SEC = float(os.getenv("BINANCE_VOLUME_RANK_REST_SEC", "300"))
+# Resubscribe kline socket when a watched symbol is silent this long.
+BINANCE_WS_KLINE_SILENCE_SEC = float(os.getenv("BINANCE_WS_KLINE_SILENCE_SEC", "90"))
+# Per-symbol cooldown between REST kline refreshes (anti-418; still correct within interval).
+BINANCE_CANDLE_REST_SEC = float(os.getenv("BINANCE_CANDLE_REST_SEC", "45"))
+# Stagger between REST kline calls in a cycle.
+BINANCE_CANDLE_REST_STAGGER_SEC = float(os.getenv("BINANCE_CANDLE_REST_STAGGER_SEC", "0.15"))
 
 SPOT_TRANSFER_ENABLED = os.getenv("SPOT_TRANSFER_ENABLED", "true").lower() in ("1", "true", "yes")
 SPOT_TRANSFER_PCT = float(os.getenv("SPOT_TRANSFER_PCT", "1"))
