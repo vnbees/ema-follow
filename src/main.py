@@ -42,7 +42,12 @@ from src.market_universe import refresh_volume_rank, set_scan_progress
 from src.profit_target import check_profit_target, refresh_account_profit_info
 from src.rsi import get_rsi_snapshot
 from src.rsi_signals import detect_entry_signal
-from src.rsi_trading import can_open_new_symbol, close_all_blocked_symbols, evaluate_rsi_trade
+from src.rsi_trading import (
+    can_open_new_symbol,
+    close_all_blocked_symbols,
+    evaluate_rsi_trade,
+    reset_age_close_budget,
+)
 from src.exchange.symbols import is_tradeable_symbol
 from src.margin_guard import get_margin_guard_state, process_margin_guard_cycle, refresh_margin_dashboard_fields
 from src.rsi_positions import get_managed_symbols, get_open_position_count, restore_tracked_positions
@@ -237,6 +242,7 @@ def run_analysis_for_symbol(
 
 
 def run_cycle() -> None:
+    reset_age_close_budget()
     open_symbol_count = db.count_open_symbols()
     # Full book: reuse ticker rank up to 15m. Still scanning: refresh at least every 5m.
     rank_max_age = 900.0 if open_symbol_count >= MAX_OPEN_SYMBOLS else 300.0
@@ -366,6 +372,12 @@ def main() -> None:
                     break
     except Exception as exc:  # noqa: BLE001
         logging.warning("Binance WS start skipped: %s", exc)
+    try:
+        from src.realtime_tp import start_realtime_tp
+
+        start_realtime_tp()
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Realtime TP watcher start skipped: %s", exc)
     ranked = refresh_volume_rank()
     if not ranked:
         logging.warning(

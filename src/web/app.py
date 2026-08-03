@@ -638,6 +638,8 @@ def _build_recent_orders(limit: int = 10) -> list[dict]:
 
 
 def _simple_dashboard_context() -> dict:
+    from src.realtime_tp import get_realtime_tp_status
+
     account = get_account_balance()
     spot_status = today_transfer_status()
     return {
@@ -649,6 +651,7 @@ def _simple_dashboard_context() -> dict:
         "spot_transfer": spot_status,
         "spot_transfers": _build_spot_transfer_rows(15),
         "margin_coin": MARGIN_COIN,
+        "realtime_tp": get_realtime_tp_status(),
     }
 
 

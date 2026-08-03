@@ -331,6 +331,37 @@ def fetch_spot_balance(asset: str = "USDT") -> float:
     return 0.0
 
 
+def fetch_futures_transfers(
+    start_ms: int,
+    end_ms: int | None = None,
+    limit: int = 1000,
+) -> list[dict]:
+    """Income rows of type TRANSFER on USDT-M futures (deposits > 0, withdrawals < 0).
+
+    Used to auto-sync the spot-transfer high-water mark when the user moves
+    funds in/out of futures manually.
+    """
+    params: dict[str, str | int | float | bool] = {
+        "incomeType": "TRANSFER",
+        "startTime": int(start_ms),
+        "limit": int(limit),
+    }
+    if end_ms is not None:
+        params["endTime"] = int(end_ms)
+    rows = _private_get("/fapi/v1/income", params)
+    out: list[dict] = []
+    for row in rows or []:
+        out.append(
+            {
+                "tranId": str(row.get("tranId", "") or ""),
+                "asset": str(row.get("asset", "") or "").upper(),
+                "income": float(row.get("income") or 0),
+                "time": int(row.get("time") or 0),
+            }
+        )
+    return out
+
+
 def _decimals_from_step(step: str) -> int:
     if not step or "e" in step.lower():
         return 8
@@ -499,9 +530,24 @@ def fetch_candles(
     return candles
 
 
-def fetch_top_futures_by_volume_rest(limit: int | None = None) -> list[tuple[str, float]]:
-    info = _load_exchange_info()
-    trading_perps = {
+def _listing_age_ok(item: dict) -> bool:
+    """Skip freshly listed contracts (MIN_LISTING_AGE_DAYS, 0 = off)."""
+    from src.config import MIN_LISTING_AGE_DAYS
+
+    if MIN_LISTING_AGE_DAYS <= 0:
+        return True
+    try:
+        onboard_ms = float(item.get("onboardDate") or 0)
+    except (TypeError, ValueError):
+        return True
+    if onboard_ms <= 0:
+        return True
+    age_ms = _now_ms() - onboard_ms
+    return age_ms >= MIN_LISTING_AGE_DAYS * 86_400_000
+
+
+def _scan_universe_from_info(info: dict) -> set[str]:
+    return {
         item["symbol"]
         for item in info.get("symbols", [])
         if item.get("contractType") == "PERPETUAL"
@@ -509,7 +555,13 @@ def fetch_top_futures_by_volume_rest(limit: int | None = None) -> list[tuple[str
         and item.get("quoteAsset") == "USDT"
         and item.get("marginAsset") == "USDT"
         and is_scan_symbol(str(item.get("symbol", "")))
+        and _listing_age_ok(item)
     }
+
+
+def fetch_top_futures_by_volume_rest(limit: int | None = None) -> list[tuple[str, float]]:
+    info = _load_exchange_info()
+    trading_perps = _scan_universe_from_info(info)
     tickers = _public_get("/fapi/v1/ticker/24hr", {})
     ranked: list[tuple[str, float]] = []
     for item in tickers:
@@ -545,15 +597,7 @@ def fetch_top_futures_by_volume(limit: int | None = None) -> list[tuple[str, flo
                 if not is_rate_limited():
                     try:
                         info = _load_exchange_info()
-                        trading_perps = {
-                            item["symbol"]
-                            for item in info.get("symbols", [])
-                            if item.get("contractType") == "PERPETUAL"
-                            and item.get("status") == "TRADING"
-                            and item.get("quoteAsset") == "USDT"
-                            and item.get("marginAsset") == "USDT"
-                            and _is_scan(str(item.get("symbol", "")))
-                        }
+                        trading_perps = _scan_universe_from_info(info)
                         ranked = [(s, v) for s, v in ranked if s in trading_perps]
                     except Exception:  # noqa: BLE001
                         pass
@@ -993,3 +1037,4 @@ class BinanceExchange:
     close_position_side = staticmethod(close_position_side)
     transfer_futures_to_spot = staticmethod(transfer_futures_to_spot)
     fetch_spot_balance = staticmethod(fetch_spot_balance)
+    fetch_futures_transfers = staticmethod(fetch_futures_transfers)

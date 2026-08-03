@@ -1,5 +1,6 @@
 import logging
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timedelta, timezone
 
 from src import database as db
 from src.exchange import (
@@ -23,6 +24,8 @@ from src.config import (
     LEVERAGE,
     MARGIN_MODE,
     MARGIN_PREFLIGHT_ENABLED,
+    MAX_AGE_CLOSES_PER_CYCLE,
+    MAX_LOT_AGE_DAYS,
     MAX_OPEN_SYMBOLS,
     PAIR_PROFIT_TARGET_PCT,
     TRADING_ENABLED,
@@ -39,6 +42,22 @@ from src.trading import (
 )
 
 _CONFIG_TRADING_ENABLED = TRADING_ENABLED
+
+# Shared by the 5m cycle TP scan, the age-close scan and the realtime TP watcher
+# so two threads can never batch-close the same lots concurrently.
+TP_CLOSE_LOCK = threading.RLock()
+
+# Global per-cycle budget of age-close exchange orders (reset by run_cycle).
+_age_close_budget = 0
+
+
+def reset_age_close_budget() -> None:
+    global _age_close_budget
+    _age_close_budget = MAX_AGE_CLOSES_PER_CYCLE
+
+
+def age_close_budget_remaining() -> int:
+    return _age_close_budget
 
 
 def _trading_enabled() -> bool:
@@ -609,6 +628,127 @@ def _take_profit_lots_side_batched(
     return True
 
 
+def _parse_opened_at(raw) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _max_age_trigger() -> str:
+    return f"max_age_{MAX_LOT_AGE_DAYS:g}d"
+
+
+def _close_expired_lots_side_batched(
+    symbol: str,
+    mark: float,
+    side: str,
+    cutoff: datetime,
+) -> bool:
+    """Close all expired lot sides (opened before cutoff) with one exchange order."""
+    global _age_close_budget
+
+    positions = fetch_symbol_positions(symbol)
+    exchange_size = positions[side].size
+    if exchange_size <= 0:
+        return False
+
+    candidates: list[tuple[object, float, float]] = []
+    for lot in db.get_open_pair_lots(symbol):
+        fields = _lot_side_fields(lot, side)
+        if fields is None:
+            continue
+        opened = _parse_opened_at(lot["opened_at"])
+        if opened is None or opened > cutoff:
+            continue
+        entry, size = fields
+        candidates.append((lot, entry, size))
+
+    if not candidates:
+        return False
+
+    # Cap to live exchange size — never send reduceOnly larger than position.
+    selected: list[tuple[object, float, float]] = []
+    selected_size = 0.0
+    for lot, entry, size in candidates:
+        if selected_size + size > exchange_size + 1e-9:
+            continue
+        selected.append((lot, entry, size))
+        selected_size += size
+    if not selected:
+        logging.warning(
+            "  [%s] Skip age close %s — expired lots exceed exchange size %.4f (sync will trim)",
+            symbol,
+            side.upper(),
+            exchange_size,
+        )
+        return False
+
+    trigger = _max_age_trigger()
+    size_str = _format_close_size(symbol, selected_size)
+    lot_ids = [int(lot["id"]) for lot, _, _ in selected]  # type: ignore[index]
+    logging.info(
+        "  [%s] Batch age close %s | trigger=%s | lots=%s | size=%s | n=%d | budget=%d",
+        symbol,
+        side.upper(),
+        trigger,
+        lot_ids,
+        size_str,
+        len(selected),
+        _age_close_budget,
+    )
+    fill = _close_side_and_resolve_fill(symbol, side, selected_size, mark)
+    _age_close_budget -= 1
+    for lot, entry, size in selected:
+        pnl = _estimate_leg_pnl(side, entry, fill, size)
+        logging.info(
+            "  [%s] Lot #%d age-close %s fill=%.6f | pnl≈%+.2f | trigger=%s",
+            symbol,
+            int(lot["id"]),  # type: ignore[index]
+            side.upper(),
+            fill,
+            pnl,
+            trigger,
+        )
+        db.close_lot_side(
+            int(lot["id"]),  # type: ignore[index]
+            side,
+            realized_pnl_usdt=pnl,
+            close_price=fill,
+        )
+
+    from src.notify import notify_close
+
+    notify_close(symbol, f"{side.upper()}×{len(selected)} ({trigger})")
+    return True
+
+
+def _scan_max_age_closes(symbol: str, mark: float) -> bool:
+    """Close lot legs older than MAX_LOT_AGE_DAYS (no reopen, budget per cycle)."""
+    if MAX_LOT_AGE_DAYS <= 0 or mark <= 0:
+        return False
+    if _age_close_budget <= 0:
+        return False
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_LOT_AGE_DAYS)
+    took_action = False
+    with TP_CLOSE_LOCK:
+        for side in ("long", "short"):
+            if _age_close_budget <= 0:
+                break
+            try:
+                if _close_expired_lots_side_batched(symbol, mark, side, cutoff):
+                    took_action = True
+            except ExchangeClientError as exc:
+                logging.error("  [%s] Age close %s failed: %s", symbol, side.upper(), exc)
+    if took_action:
+        _flush_post_order_reconcile()
+    return took_action
+
+
 def _flush_post_order_reconcile() -> None:
     try:
         from src.exchange.binance_ws import flush_pending_reconcile
@@ -619,6 +759,22 @@ def _flush_post_order_reconcile() -> None:
 
 
 def _scan_take_profits(
+    symbol: str,
+    mark: float,
+    snap: RsiSnapshot,
+    trigger: str,
+    *,
+    reopen_pair: bool,
+    tp_target_pct: float | None = None,
+) -> bool:
+    with TP_CLOSE_LOCK:
+        return _scan_take_profits_locked(
+            symbol, mark, snap, trigger,
+            reopen_pair=reopen_pair, tp_target_pct=tp_target_pct,
+        )
+
+
+def _scan_take_profits_locked(
     symbol: str,
     mark: float,
     snap: RsiSnapshot,
@@ -879,6 +1035,9 @@ def evaluate_rsi_trade(
         reopen_pair=False, tp_target_pct=tp_pct,
     )
 
+    # Age rule runs after TP so legs at TP are always closed as profit first.
+    _scan_max_age_closes(symbol, mark)
+
     if pair_event is None:
         return
 
@@ -952,15 +1111,16 @@ def manual_close_side(symbol: str, side: str) -> dict:
     db_avg_row = db.compute_open_lot_side_avg(symbol, side)
     db_avg = db_avg_row[0] if db_avg_row else None
     snap = RsiSnapshot(ready=False, rsi=0.0, close=mark)
-    _take_profit_aggregate_side(
-        symbol,
-        side,
-        mark,
-        snap,
-        "dashboard_manual_side",
-        reopen_pair=False,
-        db_avg=db_avg,
-    )
+    with TP_CLOSE_LOCK:
+        _take_profit_aggregate_side(
+            symbol,
+            side,
+            mark,
+            snap,
+            "dashboard_manual_side",
+            reopen_pair=False,
+            db_avg=db_avg,
+        )
     _flush_post_order_reconcile()
     return {
         "ok": True,
@@ -1005,7 +1165,11 @@ def manual_close_leg(lot_id: int, side: str) -> dict:
     if mark <= 0:
         entry = float(lot["long_entry"] if side == "long" else lot["short_entry"])
         mark = entry
-    result = close_lot_leg(symbol, lot, side, mark, "dashboard_manual_leg")
+    with TP_CLOSE_LOCK:
+        lot = db.get_pair_lot_by_id(int(lot_id))
+        if lot is None or lot[status_key] != "open":
+            return {"ok": False, "message": f"lot #{lot_id} {side} already closed"}
+        result = close_lot_leg(symbol, lot, side, mark, "dashboard_manual_leg")
     if result is None:
         return {"ok": False, "message": f"could not close lot #{lot_id} {side}"}
     _flush_post_order_reconcile()

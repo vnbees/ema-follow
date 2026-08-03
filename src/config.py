@@ -46,6 +46,18 @@ AGGREGATE_TP_ENABLED = os.getenv("AGGREGATE_TP_ENABLED", "true").lower() in (
     "yes",
 )
 
+# Auto-close lot legs older than this many days (0 = disabled).
+MAX_LOT_AGE_DAYS = float(os.getenv("MAX_LOT_AGE_DAYS", "0"))
+# Global budget of age-close exchange orders per 5m cycle (stagger to avoid 418).
+MAX_AGE_CLOSES_PER_CYCLE = int(os.getenv("MAX_AGE_CLOSES_PER_CYCLE", "4"))
+
+# Realtime TP watcher: close legs from WS mark prices instead of waiting for the 5m cycle.
+REALTIME_TP_ENABLED = os.getenv("REALTIME_TP_ENABLED", "true").lower() in ("1", "true", "yes")
+REALTIME_TP_INTERVAL_SEC = float(os.getenv("REALTIME_TP_INTERVAL_SEC", "2"))
+
+# Skip symbols listed on futures less than this many days ago (0 = disabled).
+MIN_LISTING_AGE_DAYS = float(os.getenv("MIN_LISTING_AGE_DAYS", "30"))
+
 MARGIN_GUARD_ENABLED = os.getenv("MARGIN_GUARD_ENABLED", "true").lower() in ("1", "true", "yes")
 MARGIN_MAINT_OK_PCT = float(os.getenv("MARGIN_MAINT_OK_PCT", "15"))
 MARGIN_MAINT_WARN_PCT = float(os.getenv("MARGIN_MAINT_WARN_PCT", "20"))
@@ -165,5 +177,9 @@ BINANCE_CANDLE_REST_STAGGER_SEC = float(os.getenv("BINANCE_CANDLE_REST_STAGGER_S
 
 SPOT_TRANSFER_ENABLED = os.getenv("SPOT_TRANSFER_ENABLED", "true").lower() in ("1", "true", "yes")
 SPOT_TRANSFER_PCT = float(os.getenv("SPOT_TRANSFER_PCT", "1"))
+# pct: fixed % of equity daily | hwm: share of equity above high-water mark (Binance only).
+_SPOT_TRANSFER_MODE_RAW = os.getenv("SPOT_TRANSFER_MODE", "pct").strip().lower()
+SPOT_TRANSFER_MODE = _SPOT_TRANSFER_MODE_RAW if _SPOT_TRANSFER_MODE_RAW in ("pct", "hwm") else "pct"
+SPOT_TRANSFER_HWM_SHARE = float(os.getenv("SPOT_TRANSFER_HWM_SHARE", "50"))
 SPOT_TRANSFER_PREPARE_HHMM = os.getenv("SPOT_TRANSFER_PREPARE_HHMM", "0655").strip()
 SPOT_TRANSFER_EXECUTE_HHMM = os.getenv("SPOT_TRANSFER_EXECUTE_HHMM", "0700").strip()

@@ -139,6 +139,7 @@ sequenceDiagram
 |------|--------|
 | `is_scan_symbol` / `is_tradeable_symbol` | Chỉ `*USDT`, loại `*USDC`, `USDCUSDT`, mọi symbol chứa `USDC` |
 | Scan volume | Binance + Bitget đều áp dụng filter khi rank |
+| Tuổi niêm yết (Binance) | `MIN_LISTING_AGE_DAYS` (mặc định 30): loại khỏi **scan universe** symbol có `onboardDate` mới hơn N ngày (exchangeInfo, cache sẵn). Chỉ chặn entry mới qua scan — lot đang có không bị force-close |
 | `_open_pair` | Từ chối symbol blocked |
 | `evaluate_rsi_trade` | Gọi `_force_close_blocked_symbol` nếu symbol blocked còn lot/vị thế |
 | `close_all_blocked_symbols` | Startup + đầu mỗi cycle — đóng L+S + sync DB |
@@ -350,11 +351,32 @@ Nếu **không chốt**:
 | Sau chốt | Không mở cặp | `_open_pair` ×1 (+ preflight) |
 | Không chốt | — | Stack hoặc entry |
 
+### 9c. Quy tắc tuổi lot (`MAX_LOT_AGE_DAYS`)
+
+Chống tích tụ lỗ treo: leg nào mở quá `MAX_LOT_AGE_DAYS` ngày (mặc định **0 = tắt**; rollout khuyến nghị 7 → 5 → 3) bị **tự đóng theo giá thị trường**, kể cả đang lỗ.
+
+- `_scan_max_age_closes` chạy **sau** cycle TP trong `evaluate_rsi_trade` — leg đủ TP luôn được chốt lãi trước, quy tắc tuổi chỉ xử lý phần còn lại
+- Batch **1 order/side** (giống lot-level TP), cap theo size sàn, ghi `close_lot_side` với fill thực, trigger log `max_age_{N}d`, **không reopen**
+- Budget toàn cục `MAX_AGE_CLOSES_PER_CYCLE` (mặc định **4** order/cycle, reset trong `run_cycle`) — backlog lớn được trải ra nhiều cycle, tránh 418
+- Notify Discord như mọi lần đóng lệnh
+
+### 9d. Realtime TP watcher ([`realtime_tp.py`](src/realtime_tp.py))
+
+Chốt lãi ngay khi giá chạm ngưỡng thay vì chờ mốc 5 phút (tránh tuột TP khi giá spike rồi rơi lại):
+
+- Thread riêng, mỗi `REALTIME_TP_INTERVAL_SEC` (mặc định **2s**) đọc giá mark từ **WS cache sẵn có** (`!markPrice@arr@1s`) — không thêm REST call để phát hiện
+- Leg nào đạt `effective_tp_pct()` → đóng qua `_scan_take_profits_locked` (trigger `realtime`, không reopen)
+- **Chống double-close:** dùng chung `TP_CLOSE_LOCK` với cycle 5m + dashboard manual close; trong lock re-đọc status lot từ DB trước khi đặt lệnh
+- Tự tạm dừng khi: trading disabled, rate-limit 418, hoặc WS stale (`get_mark_from_ws` trả None) — cycle 5m vẫn là lưới an toàn
+- Điều kiện chạy: `REALTIME_TP_ENABLED=true` + `EXCHANGE=binance` + `BINANCE_WS_ENABLED`
+- Dashboard hiển thị trạng thái watcher (đang chạy / tạm dừng / số đợt chốt)
+
 ### Dashboard đóng tay
 
 - `POST /api/positions/close-side` — đóng cả side (không cần đạt 2%)
 - `POST /api/positions/close-leg` — đóng 1 lot/leg
 - Tôn trọng rate-limit 418; chỉ REST khi user bấm đóng
+- Dùng chung `TP_CLOSE_LOCK` với cycle + realtime watcher
 
 
 ---
@@ -398,6 +420,7 @@ Config: `MARGIN_GUARD_ENABLED`, `MARGIN_MAINT_*_PCT`, `MARGIN_HIGH_TP_PCT`, `MAR
 5. _sync_lots_with_exchange (warning nếu lệch size)
 6. _update_status (RSI, mark, positions → dashboard)
 7. _scan_take_profits(cycle, reopen=False, tp=effective_tp_pct)
+7b. _scan_max_age_closes — đóng leg quá MAX_LOT_AGE_DAYS (budget/cycle, không reopen)
 
 Nếu có RSI cross 25/75:
 8. margin guard block? — yes → return (không stack/entry)
@@ -551,8 +574,22 @@ Bot trading **không** phụ thuộc đăng nhập dashboard / Discord.
 | `06:55` | Nếu `available < amount` → đóng leg lãi / lỗ ít nhất (giống margin preflight) |
 | `≥ 07:00` | Free nếu thiếu → transfer **1 lần success / ngày** (catch-up nếu miss 7h) |
 
-- Số tiền = `SPOT_TRANSFER_PCT` % futures equity (mặc định **1%**), chỉnh qua dashboard (`settings.spot_transfer_pct`)
-- `amount = floor(equity × pct / 100, 2 dp)`; nếu `available < amount` → đóng leg lãi / lỗ ít nhất rồi cả cặp (giống margin preflight)
+**Hai chế độ tính tiền (`SPOT_TRANSFER_MODE`):**
+
+| Mode | Công thức | Ghi chú |
+|------|-----------|---------|
+| `pct` (mặc định) | `floor(equity × SPOT_TRANSFER_PCT / 100, 2dp)` | % chỉnh được qua dashboard (`settings.spot_transfer_pct`) |
+| `hwm` (Binance only) | `floor(max(0, equity − HWM) × SPOT_TRANSFER_HWM_SHARE / 100, 2dp)` | Chỉ rút khi equity **vượt đỉnh cũ**; drawdown → 0, ghi 1 row `skipped`/ngày, **không** đóng leg lấy tiền |
+
+**Mode `hwm` chi tiết:**
+
+- `equity_hwm` lưu trong bảng `settings`, khởi tạo = equity lần chạy đầu
+- Sau transfer thành công: `equity_hwm = equity − amount` (đỉnh mới sau khi trích lãi)
+- **Auto-sync nạp/rút tay:** trước khi tính amount (trong khung 06:55–07:00+), bot gọi `GET /fapi/v1/income?incomeType=TRANSFER` từ mốc `equity_hwm_synced_at_ms`, **loại tranId của chính bot** (đã lưu trong `spot_transfers`, kèm fallback khớp ngày+số tiền) rồi cộng/trừ phần nạp/rút tay vào HWM — tiền nạp không bị coi là "lãi" để rút
+- Income API lỗi → **hoãn rút hôm đó** (row `skipped`, 1 lần/ngày), thử lại hôm sau — không bao giờ rút với HWM chưa sync
+- Bitget không có path này → `SPOT_TRANSFER_MODE=hwm` tự fallback về `pct`
+
+- Nếu `available < amount` → đóng leg lãi / lỗ ít nhất rồi cả cặp (giống margin preflight)
 - Trong cùng cycle: **rút spot trước**, mở lệnh sau
 - Binance: `POST /sapi/v1/asset/transfer` type `UMFUTURE_MAIN` (cần quyền Universal Transfer + Spot trên API key)
 - Bitget: `POST /api/v2/spot/wallet/transfer` `usdt_futures` → `spot`
@@ -599,6 +636,17 @@ MARGIN_MODE=crossed
 MAX_OPEN_SYMBOLS=20
 PAIR_PROFIT_TARGET_PCT=2
 AGGREGATE_TP_ENABLED=true
+
+# Quy tắc tuổi lot (0 = tắt; rollout 7 -> 5 -> 3)
+MAX_LOT_AGE_DAYS=0
+MAX_AGE_CLOSES_PER_CYCLE=4
+
+# Realtime TP watcher (Binance + WS)
+REALTIME_TP_ENABLED=true
+REALTIME_TP_INTERVAL_SEC=2
+
+# Lọc coin mới niêm yết (0 = tắt)
+MIN_LISTING_AGE_DAYS=30
 GRANULARITY=5m
 INTERVAL_MINUTES=5
 RSI_PERIOD=14
@@ -637,7 +685,9 @@ DISCORD_WEBHOOK_URL=
 
 # Rút futures → spot (giờ VN)
 SPOT_TRANSFER_ENABLED=true
+SPOT_TRANSFER_MODE=pct        # pct | hwm (hwm chỉ Binance)
 SPOT_TRANSFER_PCT=1
+SPOT_TRANSFER_HWM_SHARE=50
 SPOT_TRANSFER_PREPARE_HHMM=0655
 SPOT_TRANSFER_EXECUTE_HHMM=0700
 
@@ -666,9 +716,12 @@ Bot **mỗi 5 phút**:
 1. Đóng symbol blocked (USDC)
 2. Kiểm tra **maintenance margin** — có thể chặn mở mới, hạ TP, deleverage, hoặc đóng hết (critical)
 3. Sync + **chốt lãi** mọi leg đủ ngưỡng (chỉ đóng, không mở thêm trên cycle TP)
-4. Khi **RSI cắt 25/75** (nếu không bị block): chốt + mở lại, hoặc stack
-5. Trước mỗi lần mở cặp: **preflight available** — nếu thiếu thì đóng leg lãi cao / lỗ ít, rồi mới vào lệnh
-6. Sizing: **0.5% equity/leg**, max **20 coin**, hedge **long+short**, lot **FIFO** trong DB
+4. **Đóng leg quá tuổi** (`MAX_LOT_AGE_DAYS`, budget 4 order/cycle) — sau TP, không reopen
+5. Khi **RSI cắt 25/75** (nếu không bị block): chốt + mở lại, hoặc stack
+6. Trước mỗi lần mở cặp: **preflight available** — nếu thiếu thì đóng leg lãi cao / lỗ ít, rồi mới vào lệnh
+7. Sizing: **0.5% equity/leg**, max **20 coin**, hedge **long+short**, lot **FIFO** trong DB
+
+Song song, **watcher realtime** (2s) chốt lãi ngay khi mark WS chạm ngưỡng TP; sáng 07:00 VN rút spot theo mode `pct` hoặc `hwm`.
 
 ---
 
@@ -677,7 +730,9 @@ Bot **mỗi 5 phút**:
 | File | Nội dung chính |
 |------|----------------|
 | `src/main.py` | Vòng lặp 5m, scan, margin guard, blocked symbols |
-| `src/rsi_trading.py` | TP, `_open_pair`, preflight hook, rollback, hedge close |
+| `src/rsi_trading.py` | TP, quy tắc tuổi lot, `_open_pair`, preflight hook, rollback, hedge close |
+| `src/realtime_tp.py` | Watcher chốt lãi realtime từ WS markPrice |
+| `src/spot_transfer.py` | Rút spot hàng ngày, mode pct/HWM + auto-sync income |
 | `src/rsi_signals.py` | `detect_pair_event`, `should_take_profit` |
 | `src/rsi_positions.py` | `sync_exchange_positions`, adopt |
 | `src/margin_guard.py` | Tier maint margin, deleverage, critical liquidate |

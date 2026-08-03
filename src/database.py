@@ -1689,6 +1689,52 @@ def set_spot_transfer_pct(pct: float) -> None:
     set_setting("spot_transfer_pct", str(pct))
 
 
+def get_equity_hwm() -> float | None:
+    raw = get_setting("equity_hwm", "")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def set_equity_hwm(value: float) -> None:
+    set_setting("equity_hwm", str(value))
+    set_setting("equity_hwm_updated_at", _utc_now())
+
+
+def get_equity_hwm_updated_at() -> str:
+    return get_setting("equity_hwm_updated_at", "")
+
+
+def get_equity_hwm_synced_at_ms() -> int | None:
+    raw = get_setting("equity_hwm_synced_at_ms", "")
+    if not raw:
+        return None
+    try:
+        return int(float(raw))
+    except ValueError:
+        return None
+
+
+def set_equity_hwm_synced_at_ms(ms: int) -> None:
+    set_setting("equity_hwm_synced_at_ms", str(int(ms)))
+
+
+def has_transfer_row_on_date(transfer_date: str, status: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM spot_transfers
+            WHERE transfer_date = ? AND status = ?
+            LIMIT 1
+            """,
+            (transfer_date, status),
+        ).fetchone()
+        return row is not None
+
+
 def is_spot_transfer_enabled(default: bool = True) -> bool:
     return get_setting_bool("spot_transfer_enabled", default)
 

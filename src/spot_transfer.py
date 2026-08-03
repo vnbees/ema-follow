@@ -4,21 +4,26 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from src import database as db
 from src.config import (
+    EXCHANGE,
     MARGIN_COIN,
     MARGIN_PREFLIGHT_MAX_CLOSES,
     SPOT_TRANSFER_ENABLED,
     SPOT_TRANSFER_EXECUTE_HHMM,
+    SPOT_TRANSFER_HWM_SHARE,
+    SPOT_TRANSFER_MODE,
     SPOT_TRANSFER_PCT,
     SPOT_TRANSFER_PREPARE_HHMM,
 )
 from src.exchange import (
     ExchangeClientError,
     fetch_futures_balance,
+    fetch_futures_transfers,
     fetch_side_mark_price,
     fetch_spot_balance,
     has_credentials,
@@ -83,6 +88,110 @@ def compute_transfer_amount(equity: float, pct: float | None = None) -> float:
     if equity <= 0 or rate <= 0:
         return 0.0
     return math.floor(equity * rate / 100.0 * 100) / 100.0
+
+
+def get_transfer_mode() -> str:
+    """Active mode: 'hwm' needs the Binance income API; Bitget stays on 'pct'."""
+    if SPOT_TRANSFER_MODE == "hwm" and EXCHANGE != "binance":
+        return "pct"
+    return SPOT_TRANSFER_MODE
+
+
+def get_hwm_share() -> float:
+    return SPOT_TRANSFER_HWM_SHARE
+
+
+def compute_hwm_transfer_amount(
+    equity: float,
+    hwm: float,
+    share: float | None = None,
+) -> float:
+    """Return floor(max(0, equity - hwm) * share / 100, 2 decimals)."""
+    rate = get_hwm_share() if share is None else share
+    if equity <= 0 or rate <= 0:
+        return 0.0
+    excess = equity - hwm
+    if excess <= 0:
+        return 0.0
+    return math.floor(excess * rate / 100.0 * 100) / 100.0
+
+
+def ensure_hwm_initialized(equity: float) -> float:
+    """Return current HWM, seeding it with equity on first run."""
+    hwm = db.get_equity_hwm()
+    if hwm is None:
+        db.set_equity_hwm(equity)
+        logging.info("  Spot transfer HWM initialized at equity %.2f", equity)
+        return equity
+    return hwm
+
+
+def _bot_transfer_filters() -> tuple[set[str], set[tuple[str, float]]]:
+    """(tranIds, (vn_date, amount)) of the bot's own successful transfers."""
+    tran_ids: set[str] = set()
+    date_amounts: set[tuple[str, float]] = set()
+    for row in db.get_spot_transfers(limit=200):
+        if str(row["status"]) != "success":
+            continue
+        tran_id = str(row["tran_id"] or "").strip()
+        if tran_id:
+            tran_ids.add(tran_id)
+        date_amounts.add((str(row["transfer_date"]), round(float(row["amount"]), 2)))
+    return tran_ids, date_amounts
+
+
+def sync_hwm_manual_transfers() -> bool:
+    """Fold manual futures deposits/withdrawals into equity_hwm.
+
+    Without this, a manual deposit would look like 'profit above HWM' and get
+    half-skimmed to spot the next morning. Returns False when the income API
+    failed — callers must NOT transfer with an unsynced HWM.
+    """
+    now_ms = int(time.time() * 1000)
+    synced_at = db.get_equity_hwm_synced_at_ms()
+    if synced_at is None:
+        # First run: don't replay history, just start tracking from now.
+        db.set_equity_hwm_synced_at_ms(now_ms)
+        return True
+    if now_ms - synced_at < 1000:
+        return True
+
+    try:
+        rows = fetch_futures_transfers(synced_at + 1, end_ms=now_ms)
+    except ExchangeClientError as exc:
+        logging.warning("  Spot transfer HWM sync failed — income API error: %s", exc)
+        return False
+
+    bot_tran_ids, bot_date_amounts = _bot_transfer_filters()
+    net_manual = 0.0
+    for row in rows:
+        if row.get("asset", "").upper() != MARGIN_COIN:
+            continue
+        tran_id = str(row.get("tranId", "") or "")
+        if tran_id and tran_id in bot_tran_ids:
+            continue
+        income = float(row.get("income") or 0)
+        # Fallback: bot's own withdrawal whose income tranId differs from the
+        # sapi tranId — match by (VN date, amount) to avoid double-counting.
+        row_date = datetime.fromtimestamp(
+            int(row.get("time") or 0) / 1000, tz=timezone.utc
+        ).astimezone(VN_TZ).strftime("%Y-%m-%d")
+        if income < 0 and (row_date, round(-income, 2)) in bot_date_amounts:
+            continue
+        net_manual += income
+
+    if abs(net_manual) >= 0.01:
+        hwm = db.get_equity_hwm()
+        if hwm is not None:
+            db.set_equity_hwm(hwm + net_manual)
+            logging.info(
+                "  Spot transfer HWM adjusted %+.2f for manual transfer(s): %.2f -> %.2f",
+                net_manual,
+                hwm,
+                hwm + net_manual,
+            )
+    db.set_equity_hwm_synced_at_ms(now_ms)
+    return True
 
 
 def is_enabled() -> bool:
@@ -184,10 +293,13 @@ def ensure_available_for_transfer(required: float, ref_symbol: str) -> tuple[boo
 
 
 def _resolve_amount(ref_symbol: str) -> tuple[float, float]:
-    """Return (amount_usdt, equity)."""
+    """Return (amount_usdt, equity) for the active mode (HWM not synced here)."""
     balance = fetch_futures_balance(ref_symbol)
-    amount = compute_transfer_amount(balance.account_equity)
-    return amount, balance.account_equity
+    equity = balance.account_equity
+    if get_transfer_mode() == "hwm":
+        hwm = ensure_hwm_initialized(equity)
+        return compute_hwm_transfer_amount(equity, hwm), equity
+    return compute_transfer_amount(equity), equity
 
 
 def _prepare_for_transfer(ref_symbol: str, amount: float, transfer_date: str) -> None:
@@ -211,22 +323,37 @@ def _prepare_for_transfer(ref_symbol: str, amount: float, transfer_date: str) ->
         )
 
 
-def _execute_transfer(ref_symbol: str, amount: float, transfer_date: str) -> None:
+def _execute_transfer(
+    ref_symbol: str,
+    amount: float,
+    transfer_date: str,
+    *,
+    equity: float | None = None,
+) -> None:
     if db.has_successful_transfer_on_date(transfer_date):
         return
 
+    mode = get_transfer_mode()
+
     if amount < _MIN_TRANSFER_USDT:
-        db.insert_spot_transfer(
-            transfer_date=transfer_date,
-            amount=amount,
-            status="skipped",
-            error=f"amount below minimum ({amount:.4f} < {_MIN_TRANSFER_USDT})",
-        )
-        logging.info(
-            "  Spot transfer skipped for %s — amount %.4f below minimum",
-            transfer_date,
-            amount,
-        )
+        # HWM mode sits at 0 during drawdown — record the skip once per day.
+        if not db.has_transfer_row_on_date(transfer_date, "skipped"):
+            reason = (
+                "equity below high-water mark — nothing to withdraw"
+                if mode == "hwm"
+                else f"amount below minimum ({amount:.4f} < {_MIN_TRANSFER_USDT})"
+            )
+            db.insert_spot_transfer(
+                transfer_date=transfer_date,
+                amount=amount,
+                status="skipped",
+                error=reason,
+            )
+            logging.info(
+                "  Spot transfer skipped for %s — %s",
+                transfer_date,
+                reason,
+            )
         return
 
     ok, closes = ensure_available_for_transfer(amount, ref_symbol)
@@ -261,14 +388,21 @@ def _execute_transfer(ref_symbol: str, amount: float, transfer_date: str) -> Non
             spot_after=spot_after,
             legs_closed=closes,
         )
+        if mode == "hwm" and equity is not None:
+            new_hwm = equity - amount
+            db.set_equity_hwm(new_hwm)
+            logging.info(
+                "  Spot transfer HWM updated to %.2f after withdrawal",
+                new_hwm,
+            )
         logging.info(
-            "  Spot transfer success: %.2f %s futures→spot (date=%s, tranId=%s, closes=%d, pct=%.2f%%)",
+            "  Spot transfer success: %.2f %s futures→spot (date=%s, tranId=%s, closes=%d, mode=%s)",
             amount,
             MARGIN_COIN,
             transfer_date,
             result.get("tranId"),
             closes,
-            get_transfer_pct(),
+            mode,
         )
         if spot_after is not None:
             try:
@@ -299,22 +433,51 @@ def process_daily_spot_transfer(ref_symbol: str) -> None:
     if db.has_successful_transfer_on_date(transfer_date):
         return
 
+    mode = get_transfer_mode()
+    now_mins = _minutes_of_day(now)
+    prepare_mins = _hhmm_to_minutes(SPOT_TRANSFER_PREPARE_HHMM, (6, 55))
+    execute_mins = _hhmm_to_minutes(SPOT_TRANSFER_EXECUTE_HHMM, (7, 0))
+    in_window = now_mins >= prepare_mins
+
+    # Never withdraw with an unsynced HWM: a manual deposit would be skimmed as "profit".
+    if mode == "hwm" and in_window:
+        if not sync_hwm_manual_transfers():
+            if now_mins >= execute_mins and not db.has_transfer_row_on_date(
+                transfer_date, "skipped"
+            ):
+                db.insert_spot_transfer(
+                    transfer_date=transfer_date,
+                    amount=0.0,
+                    status="skipped",
+                    error="hwm sync failed — deferred to next day",
+                )
+            logging.warning(
+                "  Spot transfer deferred for %s — HWM sync failed", transfer_date
+            )
+            return
+
     try:
         amount, equity = _resolve_amount(ref_symbol)
     except ExchangeClientError as exc:
         logging.warning("  Spot transfer skipped — balance fetch failed: %s", exc)
         return
 
-    logging.info(
-        "  Spot transfer target: %.2f USDT (%.2f%% of equity %.2f)",
-        amount,
-        get_transfer_pct(),
-        equity,
-    )
-
-    now_mins = _minutes_of_day(now)
-    prepare_mins = _hhmm_to_minutes(SPOT_TRANSFER_PREPARE_HHMM, (6, 55))
-    execute_mins = _hhmm_to_minutes(SPOT_TRANSFER_EXECUTE_HHMM, (7, 0))
+    if mode == "hwm":
+        hwm = db.get_equity_hwm()
+        logging.info(
+            "  Spot transfer target: %.2f USDT (%.0f%% of equity %.2f above HWM %.2f)",
+            amount,
+            get_hwm_share(),
+            equity,
+            hwm if hwm is not None else equity,
+        )
+    else:
+        logging.info(
+            "  Spot transfer target: %.2f USDT (%.2f%% of equity %.2f)",
+            amount,
+            get_transfer_pct(),
+            equity,
+        )
 
     if now_mins >= prepare_mins and now_mins < execute_mins:
         if amount >= _MIN_TRANSFER_USDT:
@@ -322,7 +485,7 @@ def process_daily_spot_transfer(ref_symbol: str) -> None:
         return
 
     if now_mins >= execute_mins:
-        _execute_transfer(ref_symbol, amount, transfer_date)
+        _execute_transfer(ref_symbol, amount, transfer_date, equity=equity)
 
 
 def today_transfer_status() -> dict:
@@ -335,19 +498,37 @@ def today_transfer_status() -> dict:
     success = next((row for row in rows if row["status"] == "success"), None)
     latest = rows[0] if rows else None
     pct = get_transfer_pct()
+    mode = get_transfer_mode()
+    hwm = db.get_equity_hwm()
     amount_preview = 0.0
     try:
         from src.bot_state import get_account_balance
 
         equity = get_account_balance().equity
         if equity > 0:
-            amount_preview = compute_transfer_amount(equity, pct)
+            if mode == "hwm":
+                amount_preview = compute_hwm_transfer_amount(
+                    equity, hwm if hwm is not None else equity
+                )
+            else:
+                amount_preview = compute_transfer_amount(equity, pct)
     except Exception:  # noqa: BLE001
         pass
+    synced_at_ms = db.get_equity_hwm_synced_at_ms()
     return {
         "date": transfer_date,
         "enabled": is_enabled(),
+        "mode": mode,
         "pct": pct,
+        "hwm": hwm,
+        "hwm_share": get_hwm_share(),
+        "hwm_synced_at": (
+            datetime.fromtimestamp(synced_at_ms / 1000, tz=timezone.utc)
+            .astimezone(VN_TZ)
+            .strftime("%Y-%m-%d %H:%M")
+            if synced_at_ms
+            else None
+        ),
         "amount_preview": amount_preview,
         "success": success is not None,
         "latest_status": str(latest["status"]) if latest else None,

@@ -139,21 +139,54 @@
       {% endif %}
       | prepare {{ spot_transfer.prepare_hhmm }} · execute {{ spot_transfer.execute_hhmm }} (giờ VN)
     </p>
+    <p class="meta">
+      Chế độ:
+      {% if spot_transfer.mode == 'hwm' %}
+        <strong>HWM</strong> — rút {{ "%.0f"|format(spot_transfer.hwm_share) }}% phần equity vượt đỉnh
+        {% if spot_transfer.hwm is not none %}
+          | đỉnh (HWM): {{ "%.2f"|format(spot_transfer.hwm) }} {{ margin_coin }}
+        {% endif %}
+        {% if spot_transfer.hwm_synced_at %}
+          | sync nạp/rút tay: {{ spot_transfer.hwm_synced_at }} VN
+        {% endif %}
+      {% else %}
+        <strong>PCT</strong> — {{ "%.2f"|format(spot_transfer.pct) }}% equity mỗi ngày
+      {% endif %}
+    </p>
     <form method="post" action="/settings/spot-transfer" class="controls">
       <label>
         <input type="checkbox" name="enabled" value="on" {% if spot_transfer.enabled %}checked{% endif %}>
         Bật rút spot
       </label>
+      {% if spot_transfer.mode != 'hwm' %}
       <label>
         % equity / ngày
         <input type="number" name="pct" step="0.01" min="0.01" value="{{ '%.2f'|format(spot_transfer.pct) }}">
       </label>
+      {% endif %}
       <button type="submit">Lưu</button>
     </form>
     <p class="meta">
       Preview hôm nay: ≈ {{ "%.2f"|format(spot_transfer.amount_preview) }} {{ margin_coin }}
-      ({{ "%.2f"|format(spot_transfer.pct) }}% equity hiện tại)
+      {% if spot_transfer.mode == 'hwm' %}
+        ({{ "%.0f"|format(spot_transfer.hwm_share) }}% phần vượt HWM; 0 khi đang drawdown)
+      {% else %}
+        ({{ "%.2f"|format(spot_transfer.pct) }}% equity hiện tại)
+      {% endif %}
     </p>
+    {% if realtime_tp %}
+    <p class="meta">
+      Realtime TP:
+      {% if realtime_tp.enabled and realtime_tp.running %}
+        <span class="green">đang chạy</span>
+        {% if realtime_tp.paused_reason %} (tạm dừng: {{ realtime_tp.paused_reason }}){% endif %}
+        | đã chốt {{ realtime_tp.closes }} đợt
+        {% if realtime_tp.last_close_at %} | lần cuối: {{ realtime_tp.last_close_at }}{% endif %}
+      {% else %}
+        tắt — chốt lãi theo cycle 5 phút
+      {% endif %}
+    </p>
+    {% endif %}
   </div>
 
   <div class="chart-panel">
