@@ -78,6 +78,25 @@ class TestBinanceRateLimit(unittest.TestCase):
                 binance._public_get("/fapi/v1/klines", {"symbol": "BTCUSDT"})
             self.assertEqual(mock_get.call_count, 3)
 
+    def test_listen_key_1125_no_retry(self) -> None:
+        resp = _response(400, {"code": -1125, "msg": "This listenKey does not exist."})
+        with (
+            patch("src.exchange.binance.requests.put", return_value=resp) as mock_put,
+            patch("src.exchange.binance.time.sleep") as mock_sleep,
+            patch("src.exchange.binance._ensure_credentials"),
+            patch("src.exchange.binance.signed_params", return_value={"listenKey": "dead"}),
+            patch("src.exchange.binance.auth_headers", return_value={}),
+        ):
+            with self.assertRaises(binance.NonRetriableApiError):
+                binance._private_request(
+                    "PUT",
+                    "/fapi/v1/listenKey",
+                    {"listenKey": "dead"},
+                    max_retries=3,
+                )
+            self.assertEqual(mock_put.call_count, 1)
+            mock_sleep.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -78,8 +78,50 @@ def _parse_api_error(response: requests.Response) -> str:
         return response.text[:200]
 
 
+def _binance_error_code(detail: str) -> int | None:
+    match = re.search(r"code=(-?\d+)", detail)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+# Client / auth errors that will not succeed on retry (burn REST weight if retried).
+_NON_RETRIABLE_BINANCE_CODES = frozenset(
+    {
+        -1002,  # unauthorized
+        -1003,  # too many requests (also via 418)
+        -1021,  # timestamp
+        -1022,  # signature
+        -1102,  # mandatory param
+        -1111,  # precision
+        -1121,  # invalid symbol
+        -1125,  # listenKey does not exist
+        -2010,  # new order rejected
+        -2011,  # cancel rejected
+        -2019,  # margin insufficient
+        -4164,  # invalid listenKey
+    }
+)
+
+
+def _is_non_retriable_client_error(status_code: int, detail: str) -> bool:
+    if status_code == 400 or status_code == 401 or status_code == 403 or status_code == 404:
+        code = _binance_error_code(detail)
+        if code is None or code in _NON_RETRIABLE_BINANCE_CODES or code < 0:
+            return True
+    code = _binance_error_code(detail)
+    return code in _NON_RETRIABLE_BINANCE_CODES
+
+
 class RateLimitError(ExchangeClientError):
     """HTTP 429/418 from Binance — must NOT be retried."""
+
+
+class NonRetriableApiError(ExchangeClientError):
+    """Binance client error that must not be retried (e.g. dead listenKey -1125)."""
 
 
 # Cooldown window: while active, all REST calls fail fast without hitting Binance.
@@ -200,9 +242,12 @@ def _public_get(path: str, params: dict[str, str], max_retries: int = 3) -> Any:
             response = requests.get(url, params=params, timeout=10)
             _handle_rate_limit_response(response)
             if not response.ok:
-                raise ExchangeClientError(f"HTTP {response.status_code}: {_parse_api_error(response)}")
+                detail = _parse_api_error(response)
+                if _is_non_retriable_client_error(response.status_code, detail):
+                    raise NonRetriableApiError(f"HTTP {response.status_code}: {detail}")
+                raise ExchangeClientError(f"HTTP {response.status_code}: {detail}")
             return response.json()
-        except RateLimitError:
+        except (RateLimitError, NonRetriableApiError):
             raise
         except (requests.RequestException, ExchangeClientError, ValueError) as exc:
             last_error = exc
@@ -236,11 +281,14 @@ def _private_request(
                 response = requests.post(url, params=signed, headers=headers, timeout=10)
             _handle_rate_limit_response(response)
             if not response.ok:
-                raise ExchangeClientError(f"HTTP {response.status_code}: {_parse_api_error(response)}")
+                detail = _parse_api_error(response)
+                if _is_non_retriable_client_error(response.status_code, detail):
+                    raise NonRetriableApiError(f"HTTP {response.status_code}: {detail}")
+                raise ExchangeClientError(f"HTTP {response.status_code}: {detail}")
             if not response.text:
                 return {}
             return response.json()
-        except RateLimitError:
+        except (RateLimitError, NonRetriableApiError):
             raise
         except (requests.RequestException, ExchangeClientError, ValueError) as exc:
             last_error = exc
@@ -277,11 +325,14 @@ def _spot_private_request(
                 response = requests.post(url, params=signed, headers=headers, timeout=10)
             _handle_rate_limit_response(response)
             if not response.ok:
-                raise ExchangeClientError(f"HTTP {response.status_code}: {_parse_api_error(response)}")
+                detail = _parse_api_error(response)
+                if _is_non_retriable_client_error(response.status_code, detail):
+                    raise NonRetriableApiError(f"HTTP {response.status_code}: {detail}")
+                raise ExchangeClientError(f"HTTP {response.status_code}: {detail}")
             if not response.text:
                 return {}
             return response.json()
-        except RateLimitError:
+        except (RateLimitError, NonRetriableApiError):
             raise
         except (requests.RequestException, ExchangeClientError, ValueError) as exc:
             last_error = exc

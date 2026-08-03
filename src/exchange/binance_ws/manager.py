@@ -30,9 +30,10 @@ _watch_symbols: set[str] = set()
 _last_disconnect_notify_at = 0.0
 _pending_reconcile = False
 _pending_reconcile_symbols: set[str] = set()
-_UDS_WAIT_SEC = 0.5
+_UDS_WAIT_SEC = 2.0
 _UDS_POLL_SEC = 0.05
 _uds_connect_count = 0
+_listen_key_validated = False
 
 
 def is_ws_enabled() -> bool:
@@ -109,14 +110,50 @@ def _bootstrap_candles_rest(symbol: str, interval: str) -> None:
 
 
 def _create_listen_key() -> str:
-    """Reuse persisted listenKey when possible (works over WS even during REST IP ban)."""
+    """Reuse persisted listenKey when valid; recreate after -1125 / expiry.
+
+    Disk reuse avoids REST create during IP bans, but a dead key must be cleared
+    or every reconnect burns weight retrying keepalive on the same invalid key.
+    """
+    global _listen_key_validated
     from src.exchange import binance as binance_mod
-    from src.exchange.binance_ws.persist import load_listen_key, save_listen_key
+    from src.exchange.binance_ws.persist import clear_listen_key, load_listen_key, save_listen_key
 
     existing = load_listen_key()
-    if existing:
-        logging.info("Binance listenKey reused from disk (skip REST create)")
+    if existing and _listen_key_validated:
         return existing
+
+    if existing and binance_mod.is_rate_limited():
+        # Cannot validate via REST; reuse and hope WS still accepts the key.
+        logging.info("Binance listenKey reused from disk during rate-limit (skip validate)")
+        return existing
+
+    if existing:
+        try:
+            CACHE.bump_rest("listenKey_validate")
+            # Single attempt — dead keys must not burn 3× PUT weight.
+            binance_mod._private_request(
+                "PUT",
+                "/fapi/v1/listenKey",
+                {"listenKey": existing},
+                max_retries=1,
+            )
+            _listen_key_validated = True
+            logging.info("Binance listenKey validated from disk")
+            return existing
+        except binance_mod.RateLimitError:
+            logging.info("Binance listenKey reused from disk (validate skipped — rate-limit)")
+            return existing
+        except Exception as exc:  # noqa: BLE001
+            detail = str(exc)
+            if "-1125" in detail or "listenKey" in detail.lower():
+                logging.warning("Binance listenKey on disk is dead (%s) — recreating", detail)
+                clear_listen_key()
+                _listen_key_validated = False
+            else:
+                logging.warning("Binance listenKey validate failed (%s) — recreating", detail)
+                clear_listen_key()
+                _listen_key_validated = False
 
     remaining = binance_mod.rate_limit_remaining_sec()
     if remaining > 0:
@@ -129,11 +166,15 @@ def _create_listen_key() -> str:
     if not key:
         raise RuntimeError("Empty listenKey from Binance")
     save_listen_key(key)
+    _listen_key_validated = True
+    logging.info("Binance listenKey created via REST")
     return key
 
 
 def _keepalive_listen_key(listen_key: str) -> None:
+    global _listen_key_validated
     from src.exchange import binance as binance_mod
+    from src.exchange.binance_ws.persist import clear_listen_key
 
     if binance_mod.is_rate_limited():
         # PUT is REST — skip during ban; key lasts ~60m without keepalive.
@@ -143,7 +184,21 @@ def _keepalive_listen_key(listen_key: str) -> None:
         )
         return
     CACHE.bump_rest("listenKey_keepalive")
-    binance_mod._private_request("PUT", "/fapi/v1/listenKey", {"listenKey": listen_key})
+    try:
+        binance_mod._private_request(
+            "PUT",
+            "/fapi/v1/listenKey",
+            {"listenKey": listen_key},
+            max_retries=1,
+        )
+        _listen_key_validated = True
+    except Exception as exc:  # noqa: BLE001
+        detail = str(exc)
+        if "-1125" in detail or isinstance(exc, binance_mod.NonRetriableApiError):
+            logging.warning("Binance listenKey keepalive dead key — clearing disk: %s", detail)
+            clear_listen_key()
+            _listen_key_validated = False
+        raise
 
 
 def reconcile_account_state(*, force: bool = False) -> None:
@@ -525,8 +580,9 @@ def on_order_placed(symbol: str) -> None:
         if symbol:
             _pending_reconcile_symbols.add(symbol.upper())
     with CACHE.lock:
+        # Only invalidate positions — zeroing account too forced a full REST
+        # reconcile whenever UDS was >0.5s late, which stacked into 418 bans.
         CACHE.positions_updated_at = 0.0
-        CACHE.account_updated_at = 0.0
     watch_symbols([symbol])
 
 
@@ -539,6 +595,12 @@ def flush_pending_reconcile(*, wait_uds_sec: float | None = None) -> bool:
         if not _pending_reconcile:
             return False
         symbols = set(_pending_reconcile_symbols)
+
+    from src.exchange import binance as binance_mod
+
+    if binance_mod.is_rate_limited():
+        # Do not sleep/retry REST while banned — keep pending for later UDS/soft cycle.
+        return False
 
     wait = _UDS_WAIT_SEC if wait_uds_sec is None else max(0.0, wait_uds_sec)
     deadline = time.monotonic() + wait

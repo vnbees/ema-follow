@@ -123,9 +123,11 @@ def _close_side_and_resolve_fill(
     size: float,
     fallback_price: float,
 ) -> float:
+    positions = fetch_symbol_positions(symbol)
+    size_before = float(positions[side].size)
     size_str = _format_close_size(symbol, size)
     result = close_position_side(symbol, side, size_str)
-    _verify_side_reduced(symbol, side, size)
+    _verify_side_reduced(symbol, side, size_before, closed_size=size)
     return resolve_order_fill(symbol, result, fallback_price=fallback_price)
 
 
@@ -377,8 +379,14 @@ def _open_pair(symbol: str, snap: RsiSnapshot, trigger: str) -> int | None:
             exc,
         )
         try:
+            long_before_rollback = fetch_symbol_positions(symbol)["long"].size
             close_position_side(symbol, "long", size_str)
-            _verify_side_reduced(symbol, "long", float(size_str))
+            _verify_side_reduced(
+                symbol,
+                "long",
+                long_before_rollback,
+                closed_size=float(size_str),
+            )
         except ExchangeClientError as rollback_exc:
             logging.error(
                 "  [%s] Long rollback failed after short error: %s",
@@ -424,22 +432,39 @@ def _open_pair(symbol: str, snap: RsiSnapshot, trigger: str) -> int | None:
     return lot_id
 
 
-def _verify_side_reduced(symbol: str, side: str, size_before: float) -> None:
+def _verify_side_reduced(
+    symbol: str,
+    side: str,
+    size_before: float,
+    *,
+    closed_size: float | None = None,
+) -> None:
+    """Warn when position size did not decrease after a close order.
+
+    ``size_before`` must be the exchange size *before* the close (not the
+    closed quantity). Comparing against closed qty caused false positives when
+    residual size remained above the closed amount.
+    """
     positions = fetch_symbol_positions(symbol)
     size_after = positions[side].size
-    if size_after >= size_before - 1e-6:
-        other = "short" if side == "long" else "long"
-        other_after = positions[other].size
-        logging.error(
-            "  [%s] Close %s may have failed — %s size %.4f -> %.4f | other %s=%.4f",
-            symbol,
-            side.upper(),
-            side,
-            size_before,
-            size_after,
-            other,
-            other_after,
-        )
+    if size_after < size_before - 1e-6:
+        return
+    other = "short" if side == "long" else "long"
+    other_after = positions[other].size
+    extra = ""
+    if closed_size is not None:
+        extra = f" | closed≈{closed_size:.4f}"
+    logging.error(
+        "  [%s] Close %s may have failed — %s size %.4f -> %.4f%s | other %s=%.4f",
+        symbol,
+        side.upper(),
+        side,
+        size_before,
+        size_after,
+        extra,
+        other,
+        other_after,
+    )
 
 
 def _take_profit_aggregate_side(

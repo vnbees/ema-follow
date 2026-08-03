@@ -106,9 +106,11 @@ def apply_user_payload(payload: dict[str, Any]) -> None:
     event = payload.get("e")
     if event == "listenKeyExpired":
         logging.warning("Binance listenKey expired — reconnecting user stream")
+        from src.exchange.binance_ws import manager as ws_manager
         from src.exchange.binance_ws.persist import clear_listen_key
 
         clear_listen_key()
+        ws_manager._listen_key_validated = False
         raise RuntimeError("listenKeyExpired")
 
     CACHE.touch_user()
