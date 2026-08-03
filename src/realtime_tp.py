@@ -29,6 +29,7 @@ from src.exchange import ExchangeClientError, has_credentials
 from src.rsi import RsiSnapshot
 from src.rsi_signals import should_take_profit
 
+
 _lock = threading.Lock()
 _thread: threading.Thread | None = None
 _status: dict = {
@@ -38,6 +39,7 @@ _status: dict = {
     "last_check_at": None,
     "last_close_at": None,
     "closes": 0,
+    "be_closes": 0,
 }
 
 
@@ -88,8 +90,11 @@ def _run_once() -> None:
     from src.margin_guard import effective_tp_pct
     from src.rsi_trading import (
         TP_CLOSE_LOCK,
+        _scan_breakeven_closes,
         _scan_take_profits_locked,
         _trading_enabled,
+        arm_breakeven_lots_for_symbol,
+        side_has_breakeven_candidate,
     )
 
     if not _trading_enabled() or not has_credentials():
@@ -111,34 +116,55 @@ def _run_once() -> None:
         if mark is None or mark <= 0:
             continue
         ws_ok = True
+
+        # Arm sticky BE for old underwater lots (DB-only, no exchange).
+        arm_breakeven_lots_for_symbol(symbol, mark)
+
         hit_sides = [
             side
             for side in ("long", "short")
             if side in sides and _side_has_tp_candidate(symbol, side, mark, tp_pct)
         ]
-        if not hit_sides:
+        be_sides = [
+            side
+            for side in ("long", "short")
+            if side in sides and side_has_breakeven_candidate(symbol, side, mark)
+        ]
+        if not hit_sides and not be_sides:
             continue
+
         snap = RsiSnapshot(ready=False, rsi=0.0, close=mark)
+        took = False
+        be_took = False
         with TP_CLOSE_LOCK:
             # Locked scan re-reads DB + exchange, so a concurrent 5m cycle
             # close is detected and nothing is closed twice.
             try:
-                took = _scan_take_profits_locked(
-                    symbol,
-                    mark,
-                    snap,
-                    trigger="realtime",
-                    reopen_pair=False,
-                    tp_target_pct=tp_pct,
-                )
+                if hit_sides:
+                    took = _scan_take_profits_locked(
+                        symbol,
+                        mark,
+                        snap,
+                        trigger="realtime",
+                        reopen_pair=False,
+                        tp_target_pct=tp_pct,
+                    )
+                if be_sides or hit_sides:
+                    # Re-check BE after TP (lot may still be open / newly at BE).
+                    be_took = _scan_breakeven_closes(symbol, mark)
             except ExchangeClientError as exc:
-                logging.warning("  [%s] Realtime TP failed: %s", symbol, exc)
+                logging.warning("  [%s] Realtime TP/BE failed: %s", symbol, exc)
                 continue
         if took:
             with _lock:
                 _status["closes"] += 1
                 _status["last_close_at"] = _now_str()
             logging.info("  [%s] Realtime TP closed side(s) %s", symbol, hit_sides)
+        if be_took:
+            with _lock:
+                _status["be_closes"] += 1
+                _status["last_close_at"] = _now_str()
+            logging.info("  [%s] Realtime BE closed side(s) %s", symbol, be_sides)
 
     _set_status(
         paused_reason=None if ws_ok else "ws stale — 5m cycle is the fallback",

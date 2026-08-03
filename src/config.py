@@ -51,6 +51,12 @@ MAX_LOT_AGE_DAYS = float(os.getenv("MAX_LOT_AGE_DAYS", "0"))
 # Global budget of age-close exchange orders per 5m cycle (stagger to avoid 418).
 MAX_AGE_CLOSES_PER_CYCLE = int(os.getenv("MAX_AGE_CLOSES_PER_CYCLE", "4"))
 
+# After N hours, underwater lots arm sticky BE (close at entry); still-green lots keep TP.
+BREAKEVEN_WHEN_LOSING_ENABLED = os.getenv(
+    "BREAKEVEN_WHEN_LOSING_ENABLED", "false"
+).lower() in ("1", "true", "yes")
+BREAKEVEN_AFTER_HOURS = float(os.getenv("BREAKEVEN_AFTER_HOURS", "24"))
+
 # Realtime TP watcher: close legs from WS mark prices instead of waiting for the 5m cycle.
 REALTIME_TP_ENABLED = os.getenv("REALTIME_TP_ENABLED", "true").lower() in ("1", "true", "yes")
 REALTIME_TP_INTERVAL_SEC = float(os.getenv("REALTIME_TP_INTERVAL_SEC", "2"))

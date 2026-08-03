@@ -21,6 +21,8 @@ from src.exchange import (
 from src.bot_state import is_trading_enabled, update_symbol_status
 from src.config import (
     AGGREGATE_TP_ENABLED,
+    BREAKEVEN_AFTER_HOURS,
+    BREAKEVEN_WHEN_LOSING_ENABLED,
     LEVERAGE,
     MARGIN_MODE,
     MARGIN_PREFLIGHT_ENABLED,
@@ -32,7 +34,13 @@ from src.config import (
 )
 from src.order_sizing import compute_entry_margin_usdt, margin_to_notional
 from src.rsi import RsiSnapshot
-from src.rsi_signals import RsiSignal, detect_pair_event, price_move_pct, should_take_profit
+from src.rsi_signals import (
+    RsiSignal,
+    detect_pair_event,
+    is_underwater,
+    price_move_pct,
+    should_take_profit,
+)
 from src.exchange.symbols import is_tradeable_symbol
 from src.trading import (
     _get_state,
@@ -43,12 +51,17 @@ from src.trading import (
 
 _CONFIG_TRADING_ENABLED = TRADING_ENABLED
 
-# Shared by the 5m cycle TP scan, the age-close scan and the realtime TP watcher
+# Shared by the 5m cycle TP scan, the age-close scan, BE scan and the realtime TP watcher
 # so two threads can never batch-close the same lots concurrently.
 TP_CLOSE_LOCK = threading.RLock()
 
 # Global per-cycle budget of age-close exchange orders (reset by run_cycle).
 _age_close_budget = 0
+
+# Sticky BE arms: once a lot side goes underwater after BREAKEVEN_AFTER_HOURS,
+# keep BE target until close (in-memory; re-arms after restart if still underwater).
+_breakeven_armed: set[tuple[int, str]] = set()
+_breakeven_arm_lock = threading.Lock()
 
 
 def reset_age_close_budget() -> None:
@@ -58,6 +71,44 @@ def reset_age_close_budget() -> None:
 
 def age_close_budget_remaining() -> int:
     return _age_close_budget
+
+
+def reset_breakeven_arms() -> None:
+    """Test helper — clear sticky BE arm set."""
+    with _breakeven_arm_lock:
+        _breakeven_armed.clear()
+
+
+def is_breakeven_armed(lot_id: int, side: str) -> bool:
+    with _breakeven_arm_lock:
+        return (int(lot_id), side) in _breakeven_armed
+
+
+def clear_breakeven_arm(lot_id: int, side: str) -> None:
+    with _breakeven_arm_lock:
+        _breakeven_armed.discard((int(lot_id), side))
+
+
+def arm_breakeven_if_needed(
+    lot_id: int,
+    side: str,
+    opened_at: datetime | None,
+    entry: float,
+    mark: float,
+) -> bool:
+    """Arm sticky BE when lot is old enough and currently underwater. Returns armed state."""
+    if not BREAKEVEN_WHEN_LOSING_ENABLED or BREAKEVEN_AFTER_HOURS <= 0:
+        return False
+    if opened_at is None or entry <= 0 or mark <= 0:
+        return is_breakeven_armed(lot_id, side)
+    age_h = (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600.0
+    if age_h + 1e-9 < BREAKEVEN_AFTER_HOURS:
+        return is_breakeven_armed(lot_id, side)
+    if is_underwater(side, entry, mark):
+        with _breakeven_arm_lock:
+            _breakeven_armed.add((int(lot_id), side))
+        return True
+    return is_breakeven_armed(lot_id, side)
 
 
 def _trading_enabled() -> bool:
@@ -749,6 +800,146 @@ def _scan_max_age_closes(symbol: str, mark: float) -> bool:
     return took_action
 
 
+def _breakeven_trigger() -> str:
+    return f"be_after_{BREAKEVEN_AFTER_HOURS:g}h"
+
+
+def _lot_side_eligible_for_breakeven(
+    lot,
+    side: str,
+    mark: float,
+) -> tuple[object, float, float] | None:
+    """Return (lot, entry, size) when sticky-armed and at/above BE (does not arm)."""
+    fields = _lot_side_fields(lot, side)
+    if fields is None:
+        return None
+    entry, size = fields
+    lot_id = int(lot["id"])
+    if not is_breakeven_armed(lot_id, side):
+        return None
+    if not should_take_profit(side, entry, mark, target_pct=0.0):
+        return None
+    return lot, entry, size
+
+
+def arm_breakeven_lots_for_symbol(symbol: str, mark: float) -> int:
+    """Arm sticky BE for old underwater open lots. Returns newly-checked armed count."""
+    if not BREAKEVEN_WHEN_LOSING_ENABLED or BREAKEVEN_AFTER_HOURS <= 0 or mark <= 0:
+        return 0
+    armed_n = 0
+    for lot in db.get_open_pair_lots(symbol):
+        for side in ("long", "short"):
+            fields = _lot_side_fields(lot, side)
+            if fields is None:
+                continue
+            entry, _size = fields
+            opened = _parse_opened_at(lot["opened_at"])
+            if arm_breakeven_if_needed(int(lot["id"]), side, opened, entry, mark):
+                armed_n += 1
+    return armed_n
+
+
+def side_has_breakeven_candidate(symbol: str, side: str, mark: float) -> bool:
+    """True when at least one open lot on side is sticky-armed and at/above BE."""
+    if not BREAKEVEN_WHEN_LOSING_ENABLED or BREAKEVEN_AFTER_HOURS <= 0 or mark <= 0:
+        return False
+    for lot in db.get_open_pair_lots(symbol):
+        if _lot_side_eligible_for_breakeven(lot, side, mark) is not None:
+            return True
+    return False
+
+
+def _close_breakeven_lots_side_batched(symbol: str, mark: float, side: str) -> bool:
+    """Close sticky-armed BE lot sides (at/above entry) with one exchange order."""
+    positions = fetch_symbol_positions(symbol)
+    exchange_size = positions[side].size
+    if exchange_size <= 0:
+        return False
+
+    candidates: list[tuple[object, float, float]] = []
+    for lot in db.get_open_pair_lots(symbol):
+        hit = _lot_side_eligible_for_breakeven(lot, side, mark)
+        if hit is not None:
+            candidates.append(hit)
+
+    if not candidates:
+        return False
+
+    selected: list[tuple[object, float, float]] = []
+    selected_size = 0.0
+    for lot, entry, size in candidates:
+        if selected_size + size > exchange_size + 1e-9:
+            continue
+        selected.append((lot, entry, size))
+        selected_size += size
+    if not selected:
+        logging.warning(
+            "  [%s] Skip BE close %s — BE lots exceed exchange size %.4f (sync will trim)",
+            symbol,
+            side.upper(),
+            exchange_size,
+        )
+        return False
+
+    trigger = _breakeven_trigger()
+    size_str = _format_close_size(symbol, selected_size)
+    lot_ids = [int(lot["id"]) for lot, _, _ in selected]  # type: ignore[index]
+    logging.info(
+        "  [%s] Batch be close %s | trigger=%s | lots=%s | size=%s | n=%d",
+        symbol,
+        side.upper(),
+        trigger,
+        lot_ids,
+        size_str,
+        len(selected),
+    )
+    fill = _close_side_and_resolve_fill(symbol, side, selected_size, mark)
+    for lot, entry, size in selected:
+        lot_id = int(lot["id"])  # type: ignore[index]
+        pnl = _estimate_leg_pnl(side, entry, fill, size)
+        logging.info(
+            "  [%s] Lot #%d be-close %s fill=%.6f | pnl≈%+.2f | trigger=%s",
+            symbol,
+            lot_id,
+            side.upper(),
+            fill,
+            pnl,
+            trigger,
+        )
+        db.close_lot_side(
+            lot_id,
+            side,
+            realized_pnl_usdt=pnl,
+            close_price=fill,
+        )
+        clear_breakeven_arm(lot_id, side)
+
+    from src.notify import notify_close
+
+    notify_close(symbol, f"{side.upper()}×{len(selected)} ({trigger})")
+    return True
+
+
+def _scan_breakeven_closes(symbol: str, mark: float) -> bool:
+    """Arm old underwater lots, then close sticky-armed BE legs at/above entry (no reopen)."""
+    if not BREAKEVEN_WHEN_LOSING_ENABLED or BREAKEVEN_AFTER_HOURS <= 0 or mark <= 0:
+        return False
+
+    arm_breakeven_lots_for_symbol(symbol, mark)
+
+    took_action = False
+    with TP_CLOSE_LOCK:
+        for side in ("long", "short"):
+            try:
+                if _close_breakeven_lots_side_batched(symbol, mark, side):
+                    took_action = True
+            except ExchangeClientError as exc:
+                logging.error("  [%s] BE close %s failed: %s", symbol, side.upper(), exc)
+    if took_action:
+        _flush_post_order_reconcile()
+    return took_action
+
+
 def _flush_post_order_reconcile() -> None:
     try:
         from src.exchange.binance_ws import flush_pending_reconcile
@@ -1035,7 +1226,9 @@ def evaluate_rsi_trade(
         reopen_pair=False, tp_target_pct=tp_pct,
     )
 
-    # Age rule runs after TP so legs at TP are always closed as profit first.
+    # BE-when-losing after TP; hard-age still last so TP/BE win when eligible.
+    _scan_breakeven_closes(symbol, mark)
+    # Age rule runs after TP/BE so legs at TP/BE are always closed first.
     _scan_max_age_closes(symbol, mark)
 
     if pair_event is None:

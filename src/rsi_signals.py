@@ -45,3 +45,8 @@ def should_take_profit(
 ) -> bool:
     target = PAIR_PROFIT_TARGET_PCT if target_pct is None else target_pct
     return price_move_pct(side, entry, mark) >= target - 1e-9
+
+
+def is_underwater(side: str, entry: float, mark: float) -> bool:
+    """True when mark is against the position (negative price move vs entry)."""
+    return price_move_pct(side, entry, mark) < -1e-9

@@ -355,10 +355,20 @@ Nếu **không chốt**:
 
 Chống tích tụ lỗ treo: leg nào mở quá `MAX_LOT_AGE_DAYS` ngày (mặc định **0 = tắt**; rollout khuyến nghị 7 → 5 → 3) bị **tự đóng theo giá thị trường**, kể cả đang lỗ.
 
-- `_scan_max_age_closes` chạy **sau** cycle TP trong `evaluate_rsi_trade` — leg đủ TP luôn được chốt lãi trước, quy tắc tuổi chỉ xử lý phần còn lại
+- `_scan_max_age_closes` chạy **sau** cycle TP **và** BE trong `evaluate_rsi_trade` — leg đủ TP/BE luôn được xử lý trước, quy tắc tuổi chỉ xử lý phần còn lại
 - Batch **1 order/side** (giống lot-level TP), cap theo size sàn, ghi `close_lot_side` với fill thực, trigger log `max_age_{N}d`, **không reopen**
 - Budget toàn cục `MAX_AGE_CLOSES_PER_CYCLE` (mặc định **4** order/cycle, reset trong `run_cycle`) — backlog lớn được trải ra nhiều cycle, tránh 418
 - Notify Discord như mọi lần đóng lệnh
+
+### 9c2. Break-even khi lỗ sau N giờ (`BREAKEVEN_WHEN_LOSING_ENABLED`)
+
+Sau `BREAKEVEN_AFTER_HOURS` (mặc định **24**), lot **đang lỗ** được **arm sticky** target = 0% (đóng khi giá về entry). Lot chưa lỗ vẫn giữ TP thường (`effective_tp_pct()`).
+
+- `_scan_breakeven_closes` chạy **sau** TP và **trước** age — thứ tự: TP → BE → age
+- Sticky in-memory `(lot_id, side)`: một lần đã lỗ sau ngưỡng giờ thì giữ BE đến khi đóng (tránh miss lúc giá vừa vượt entry). Restart mất arm → re-arm khi còn underwater
+- Batch 1 order/side, trigger `be_after_{N}h`, **không reopen**
+- Realtime watcher cũng arm + đóng BE (cùng `TP_CLOSE_LOCK`)
+- Tắt mặc định (`false`); bật bằng env
 
 ### 9d. Realtime TP watcher ([`realtime_tp.py`](src/realtime_tp.py))
 
@@ -366,6 +376,7 @@ Chốt lãi ngay khi giá chạm ngưỡng thay vì chờ mốc 5 phút (tránh 
 
 - Thread riêng, mỗi `REALTIME_TP_INTERVAL_SEC` (mặc định **2s**) đọc giá mark từ **WS cache sẵn có** (`!markPrice@arr@1s`) — không thêm REST call để phát hiện
 - Leg nào đạt `effective_tp_pct()` → đóng qua `_scan_take_profits_locked` (trigger `realtime`, không reopen)
+- Cùng vòng lặp: arm BE + đóng BE khi sticky-armed và mark ≥ entry
 - **Chống double-close:** dùng chung `TP_CLOSE_LOCK` với cycle 5m + dashboard manual close; trong lock re-đọc status lot từ DB trước khi đặt lệnh
 - Tự tạm dừng khi: trading disabled, rate-limit 418, hoặc WS stale (`get_mark_from_ws` trả None) — cycle 5m vẫn là lưới an toàn
 - Điều kiện chạy: `REALTIME_TP_ENABLED=true` + `EXCHANGE=binance` + `BINANCE_WS_ENABLED`
@@ -420,6 +431,7 @@ Config: `MARGIN_GUARD_ENABLED`, `MARGIN_MAINT_*_PCT`, `MARGIN_HIGH_TP_PCT`, `MAR
 5. _sync_lots_with_exchange (warning nếu lệch size)
 6. _update_status (RSI, mark, positions → dashboard)
 7. _scan_take_profits(cycle, reopen=False, tp=effective_tp_pct)
+7a. _scan_breakeven_closes — arm/đóng BE khi lot > BREAKEVEN_AFTER_HOURS và đã lỗ (không reopen)
 7b. _scan_max_age_closes — đóng leg quá MAX_LOT_AGE_DAYS (budget/cycle, không reopen)
 
 Nếu có RSI cross 25/75:
@@ -641,6 +653,10 @@ AGGREGATE_TP_ENABLED=true
 MAX_LOT_AGE_DAYS=0
 MAX_AGE_CLOSES_PER_CYCLE=4
 
+# BE khi lỗ sau N giờ (sticky; lot chưa lỗ giữ TP)
+BREAKEVEN_WHEN_LOSING_ENABLED=false
+BREAKEVEN_AFTER_HOURS=24
+
 # Realtime TP watcher (Binance + WS)
 REALTIME_TP_ENABLED=true
 REALTIME_TP_INTERVAL_SEC=2
@@ -730,8 +746,8 @@ Song song, **watcher realtime** (2s) chốt lãi ngay khi mark WS chạm ngưỡ
 | File | Nội dung chính |
 |------|----------------|
 | `src/main.py` | Vòng lặp 5m, scan, margin guard, blocked symbols |
-| `src/rsi_trading.py` | TP, quy tắc tuổi lot, `_open_pair`, preflight hook, rollback, hedge close |
-| `src/realtime_tp.py` | Watcher chốt lãi realtime từ WS markPrice |
+| `src/rsi_trading.py` | TP, BE khi lỗ, quy tắc tuổi lot, `_open_pair`, preflight hook, rollback, hedge close |
+| `src/realtime_tp.py` | Watcher chốt lãi/BE realtime từ WS markPrice |
 | `src/spot_transfer.py` | Rút spot hàng ngày, mode pct/HWM + auto-sync income |
 | `src/rsi_signals.py` | `detect_pair_event`, `should_take_profit` |
 | `src/rsi_positions.py` | `sync_exchange_positions`, adopt |
