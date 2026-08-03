@@ -117,6 +117,18 @@ def apply_user_payload(payload: dict[str, Any]) -> None:
     if event == "ACCOUNT_UPDATE":
         updates, closed, balances = parse_account_update(payload)
         CACHE.apply_position_updates(updates, closed)
+        touched: set[str] = set()
+        for pos in updates:
+            touched.add(pos.symbol.upper())
+        for symbol, _side in closed:
+            touched.add(str(symbol).upper())
+        if touched:
+            try:
+                from src.exchange.binance_ws.manager import note_uds_position_refresh
+
+                note_uds_position_refresh(touched)
+            except Exception:  # noqa: BLE001
+                pass
         if MARGIN_COIN in balances:
             prev = CACHE.get_balance()
             wallet = balances[MARGIN_COIN]

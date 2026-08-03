@@ -290,8 +290,9 @@ def _on_user_stream_connected() -> None:
             )
         return
 
-    # Mid-run reconnect: catch events missed while UDS was down.
-    reconcile_account_state(force=True)
+    # Mid-run reconnect: soft reconcile only if due — force=True after every flap
+    # re-triggered IP bans. Soft cycle (every BINANCE_WS_RECONCILE_SEC) is enough.
+    reconcile_account_state(force=False)
 
 
 def seed_volume_rank_from_rest() -> None:
@@ -552,6 +553,20 @@ def get_symbol_positions_from_ws(symbol: str) -> dict[str, Position] | None:
     return sides
 
 
+def get_symbol_positions_lenient(symbol: str) -> dict[str, Position] | None:
+    """Return last WS snapshot even when cache is marked dirty after an order.
+
+    Avoids per-read REST while UDS is catching up. Callers that need a hard
+    refresh must use flush_pending_reconcile / symbol-scoped REST explicitly.
+    """
+    if not is_ws_enabled():
+        return None
+    sides = CACHE.get_symbol_positions(symbol)
+    if sides is None:
+        return None
+    return sides
+
+
 def get_all_positions_from_ws() -> list[Position] | None:
     if not is_ws_enabled() or not positions_fresh():
         return None
@@ -586,8 +601,77 @@ def on_order_placed(symbol: str) -> None:
     watch_symbols([symbol])
 
 
+def note_uds_position_refresh(symbols: set[str] | None = None) -> None:
+    """Clear pending reconcile for symbols refreshed via UDS ACCOUNT_UPDATE."""
+    global _pending_reconcile
+    if not is_ws_enabled():
+        return
+    with _lock:
+        if not _pending_reconcile:
+            return
+        if symbols:
+            for sym in symbols:
+                _pending_reconcile_symbols.discard(sym.upper())
+        if not _pending_reconcile_symbols:
+            _pending_reconcile = False
+
+
+def _reconcile_symbols_rest(symbols: set[str]) -> bool:
+    """Refresh only the dirty symbols via positionRisk?symbol= (+ one account)."""
+    if not symbols:
+        return True
+    from src.exchange import binance as binance_mod
+
+    if binance_mod.is_rate_limited():
+        return False
+    try:
+        CACHE.bump_rest("reconcile_account")
+        balance = binance_mod.fetch_futures_balance_rest()
+        CACHE.set_balance(balance)
+
+        with CACHE.lock:
+            by_symbol = {
+                sym: {"long": sides["long"], "short": sides["short"]}
+                for sym, sides in CACHE.positions_by_symbol.items()
+            }
+        for sym in sorted(symbols):
+            CACHE.bump_rest("reconcile_symbol")
+            sides = binance_mod.fetch_symbol_positions_rest(sym)
+            by_symbol[sym.upper()] = sides
+        all_positions: list[Position] = []
+        for _sym, sides in by_symbol.items():
+            for side_name in ("long", "short"):
+                pos = sides[side_name]
+                if pos.size > 0:
+                    all_positions.append(pos)
+        CACHE.set_positions(all_positions, by_symbol)
+        CACHE.refresh_unrealized_from_marks()
+        CACHE.mark_reconciled()
+        try:
+            from src.exchange.binance_ws.persist import save_account_snapshot
+
+            save_account_snapshot()
+        except Exception:  # noqa: BLE001
+            pass
+        logging.debug(
+            "Binance WS symbol reconcile OK (%s)",
+            ",".join(sorted(symbols)),
+        )
+        return True
+    except binance_mod.RateLimitError as exc:
+        logging.warning("Binance WS symbol reconcile paused (rate limit): %s", exc)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Binance WS symbol reconcile failed: %s", exc)
+        return False
+
+
 def flush_pending_reconcile(*, wait_uds_sec: float | None = None) -> bool:
-    """Wait briefly for UDS; if still dirty, REST reconcile once. Returns True if reconciled via REST."""
+    """Wait briefly for UDS; if still dirty, REST-refresh only pending symbols.
+
+    Returns True when a REST symbol reconcile ran. Never clears pending on failure
+    (avoids falling into per-call positionRisk storms after a ban).
+    """
     global _pending_reconcile
     if not is_ws_enabled():
         return False
@@ -599,30 +683,35 @@ def flush_pending_reconcile(*, wait_uds_sec: float | None = None) -> bool:
     from src.exchange import binance as binance_mod
 
     if binance_mod.is_rate_limited():
-        # Do not sleep/retry REST while banned — keep pending for later UDS/soft cycle.
         return False
 
     wait = _UDS_WAIT_SEC if wait_uds_sec is None else max(0.0, wait_uds_sec)
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
-        if positions_fresh(max_age=max(BINANCE_WS_STALE_SEC, wait + 1.0)) and account_fresh(
-            max_age=max(BINANCE_WS_RECONCILE_SEC, wait + 1.0)
-        ):
+        with _lock:
+            # UDS may have cleared pending via note_uds_position_refresh.
+            if not _pending_reconcile:
+                return False
+            symbols = set(_pending_reconcile_symbols)
+        if positions_fresh(max_age=max(BINANCE_WS_STALE_SEC, wait + 1.0)):
             with _lock:
                 _pending_reconcile = False
                 _pending_reconcile_symbols.clear()
             logging.debug(
-                "Binance post-order cache refreshed via UDS (skip REST reconcile) symbols=%s",
+                "Binance post-order cache refreshed via UDS (skip REST) symbols=%s",
                 sorted(symbols) or "—",
             )
             return False
         time.sleep(_UDS_POLL_SEC)
 
-    reconcile_account_state(force=True)
     with _lock:
-        _pending_reconcile = False
-        _pending_reconcile_symbols.clear()
-    return True
+        symbols = set(_pending_reconcile_symbols)
+    ok = _reconcile_symbols_rest(symbols)
+    if ok:
+        with _lock:
+            _pending_reconcile = False
+            _pending_reconcile_symbols.clear()
+    return ok
 
 
 def pending_reconcile() -> bool:

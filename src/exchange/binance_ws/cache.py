@@ -241,7 +241,14 @@ class BinanceWsCache:
             self.positions_updated_at = _now()
 
     def apply_position_updates(self, updates: list[Position], closed_keys: list[tuple[str, str]]) -> None:
-        """Merge UDS position deltas (changed rows only). closed_keys: (symbol, side)."""
+        """Merge UDS position deltas (changed rows only). closed_keys: (symbol, side).
+
+        Empty ACCOUNT_UPDATE payloads must NOT bump positions_updated_at — that made
+        flush_pending_reconcile think the cache was fresh and skip real updates, then
+        later fall through to heavy REST.
+        """
+        if not updates and not closed_keys:
+            return
         with self.lock:
             by_symbol = {
                 sym: {

@@ -114,11 +114,16 @@ def _complete_cycle(symbol: str, managed_symbols: list[str] | None = None) -> No
     set_last_cycle_at(now_str)
 
 
+_last_spot_snapshot_at = 0.0
+_SPOT_SNAPSHOT_MIN_SEC = 3600.0
+
+
 def log_futures_balance_once(
     symbol: str,
     *,
     managed_symbols: list[str] | None = None,
 ) -> None:
+    global _last_spot_snapshot_at
     if not has_credentials():
         logging.info(
             "  Futures balance: skipped (set BITGET_API_KEY, SECRET, PASSPHRASE in .env)"
@@ -150,11 +155,14 @@ def log_futures_balance_once(
             balance.available,
             maint_margin_pct=balance.maint_margin_pct,
         )
-        try:
-            spot_bal = fetch_spot_balance(MARGIN_COIN)
-            db.insert_spot_snapshot(spot_bal)
-        except ExchangeClientError as exc:
-            logging.warning("  Spot balance snapshot skipped: %s", exc)
+        now_mono = time.monotonic()
+        if now_mono - _last_spot_snapshot_at >= _SPOT_SNAPSHOT_MIN_SEC:
+            try:
+                spot_bal = fetch_spot_balance(MARGIN_COIN)
+                db.insert_spot_snapshot(spot_bal)
+                _last_spot_snapshot_at = now_mono
+            except ExchangeClientError as exc:
+                logging.warning("  Spot balance snapshot skipped: %s", exc)
         refresh_margin_dashboard_fields(
             balance.available,
             balance.account_equity,

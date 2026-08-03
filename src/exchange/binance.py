@@ -724,9 +724,10 @@ def fetch_futures_balance_rest(symbol: str = SYMBOL) -> FuturesAccountBalance:
 
 def fetch_futures_balance(symbol: str = SYMBOL) -> FuturesAccountBalance:
     try:
-        from src.exchange.binance_ws import flush_pending_reconcile, get_balance_from_ws
+        from src.exchange.binance_ws import get_balance_from_ws
 
-        flush_pending_reconcile()
+        # Do NOT flush_pending_reconcile here — that turned every balance read after an
+        # order into a full-book REST reconcile and caused repeated IP 418 bans.
         cached = get_balance_from_ws()
         if cached is not None:
             return cached
@@ -806,16 +807,22 @@ def fetch_symbol_positions_rest(symbol: str) -> dict[str, Position]:
 def fetch_symbol_positions(symbol: str) -> dict[str, Position]:
     try:
         from src.exchange.binance_ws import (
-            flush_pending_reconcile,
             get_symbol_positions_from_ws,
+            get_symbol_positions_lenient,
             watch_symbols,
         )
 
         watch_symbols([symbol])
-        flush_pending_reconcile()
+        # Never auto-flush here (see fetch_futures_balance). Explicit post-order
+        # flush lives in rsi_trading._flush_post_order_reconcile only.
         cached = get_symbol_positions_from_ws(symbol)
         if cached is not None:
             return cached
+        # While waiting for UDS after an order, reuse last WS snapshot instead of
+        # hammering positionRisk / full reconcile.
+        lenient = get_symbol_positions_lenient(symbol)
+        if lenient is not None:
+            return lenient
     except Exception:  # noqa: BLE001
         pass
     return fetch_symbol_positions_rest(symbol)
