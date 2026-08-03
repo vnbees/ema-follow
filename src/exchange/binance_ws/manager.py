@@ -203,7 +203,12 @@ def reconcile_account_state(*, force: bool = False) -> None:
 
 
 def _on_user_stream_connected() -> None:
-    """UDS connected: skip REST only while IP is banned; otherwise verify with one reconcile."""
+    """UDS connected: never REST on first connect (disk/WS); soft cycle reconciles later.
+
+    Deploy/restart used to force one account/positionRisk REST here and re-trigger
+    HTTP 418 even when the bot had been running fine on WS-only. Mid-run UDS
+    reconnects still reconcile once IP is clear to catch missed events.
+    """
     global _uds_connect_count
     _uds_connect_count += 1
     from src.exchange import binance as binance_mod
@@ -219,16 +224,17 @@ def _on_user_stream_connected() -> None:
         )
         return
 
-    if _uds_connect_count == 1 and has_cache:
-        # Disk snapshot can be stale/test junk — one REST verify when IP is clear.
-        logging.info(
-            "Binance UDS first connect — REST reconcile to verify account (disk may be stale)"
-        )
-        reconcile_account_state(force=True)
-        return
     if _uds_connect_count == 1:
-        reconcile_account_state(force=True)
+        if has_cache:
+            logging.info(
+                "Binance UDS first connect — skip REST (disk/WS cache; soft reconcile later)"
+            )
+        else:
+            logging.info(
+                "Binance UDS first connect — skip REST (no disk account; deferred reconcile when IP clear)"
+            )
         return
+
     # Mid-run reconnect: catch events missed while UDS was down.
     reconcile_account_state(force=True)
 

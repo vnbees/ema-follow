@@ -566,7 +566,7 @@ class TestBootReconcileSkip(unittest.TestCase):
         self.assertIsNotNone(CACHE.balance)
         self.assertGreater(CACHE.positions_updated_at, 0.0)
 
-    def test_first_uds_connect_verifies_via_rest_when_not_banned(self) -> None:
+    def test_first_uds_connect_skips_rest_when_disk_cache(self) -> None:
         CACHE.set_balance(
             FuturesAccountBalance(
                 margin_coin="USDT",
@@ -584,7 +584,17 @@ class TestBootReconcileSkip(unittest.TestCase):
             patch.object(self.mgr, "reconcile_account_state") as mock_rec,
         ):
             self.mgr._on_user_stream_connected()
-            mock_rec.assert_called_once_with(force=True)
+            mock_rec.assert_not_called()
+            self.assertEqual(self.mgr._uds_connect_count, 1)
+
+    def test_first_uds_connect_skips_rest_even_without_cache(self) -> None:
+        """Cold start without disk: deferred path reconciles later, not UDS handshake."""
+        with (
+            patch("src.exchange.binance.is_rate_limited", return_value=False),
+            patch.object(self.mgr, "reconcile_account_state") as mock_rec,
+        ):
+            self.mgr._on_user_stream_connected()
+            mock_rec.assert_not_called()
             self.assertEqual(self.mgr._uds_connect_count, 1)
 
     def test_first_uds_connect_skips_rest_when_rate_limited(self) -> None:
@@ -623,9 +633,9 @@ class TestBootReconcileSkip(unittest.TestCase):
             patch("src.exchange.binance.is_rate_limited", return_value=False),
             patch.object(self.mgr, "reconcile_account_state") as mock_rec,
         ):
-            self.mgr._on_user_stream_connected()
-            self.mgr._on_user_stream_connected()
-            self.assertEqual(mock_rec.call_count, 2)
+            self.mgr._on_user_stream_connected()  # first: skip REST
+            self.mgr._on_user_stream_connected()  # reconnect: REST once
+            self.assertEqual(mock_rec.call_count, 1)
             mock_rec.assert_called_with(force=True)
 
     def test_positions_fresh_while_uds_alive(self) -> None:

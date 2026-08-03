@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import uvicorn
 
 from src.config import (
+    AGGREGATE_TP_ENABLED,
     CANDLE_LIMIT,
     EXCHANGE_DISPLAY_NAME,
     GRANULARITY,
@@ -378,15 +379,17 @@ def main() -> None:
     logging.info("%s RSI Bot started", EXCHANGE_DISPLAY_NAME)
     logging.info("Dashboard: http://localhost:%d", WEB_PORT)
     logging.info(
-        "Scan mode: TP %.1f%% mỗi cycle (đóng only) | cross 25/75: TP+reopen/stack | max %d symbols",
+        "Scan mode: TP %.1f%% mỗi cycle (đóng only%s) | cross 25/75: TP+reopen/stack | max %d symbols",
         PAIR_PROFIT_TARGET_PCT,
+        ", lot-only" if not AGGREGATE_TP_ENABLED else ", agg+lot",
         MAX_OPEN_SYMBOLS,
     )
     logging.info("Cycle: %dm | RSI period: %d", INTERVAL_MINUTES, RSI_PERIOD)
     if is_trading_enabled():
         logging.info(
-            "Trading: LIVE hedged RSI — cycle TP %.1f%% | cross 25/75 pair+stack | margin/leg max(%.0f USDT, %.1f%% equity) @ %dx",
+            "Trading: LIVE hedged RSI — cycle TP %.1f%% (%s) | cross 25/75 pair+stack | margin/leg max(%.0f USDT, %.1f%% equity) @ %dx",
             PAIR_PROFIT_TARGET_PCT,
+            "lot-level only; AGGREGATE_TP_ENABLED=false" if not AGGREGATE_TP_ENABLED else "aggregate+lot",
             ORDER_MARGIN_MIN_USDT,
             ORDER_MARGIN_PCT,
             LEVERAGE,

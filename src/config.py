@@ -36,6 +36,15 @@ MAX_OPEN_SYMBOLS = int(os.getenv("MAX_OPEN_SYMBOLS", os.getenv("MAX_OPEN_POSITIO
 MAX_OPEN_POSITIONS = MAX_OPEN_SYMBOLS
 MAX_OPEN_LEGS = MAX_OPEN_SYMBOLS * 2
 PAIR_PROFIT_TARGET_PCT = float(os.getenv("PAIR_PROFIT_TARGET_PCT", "2"))
+# Close whole LONG/SHORT side when DB-weighted avg of open lots vs mark ≥ TP,
+# then fall through to per-lot TP when side avg is below threshold.
+# Uses lot entries in DB (not exchange entryPrice) to avoid closing underwater
+# stacked lots when exchange avg alone looks green.
+AGGREGATE_TP_ENABLED = os.getenv("AGGREGATE_TP_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 MARGIN_GUARD_ENABLED = os.getenv("MARGIN_GUARD_ENABLED", "true").lower() in ("1", "true", "yes")
 MARGIN_MAINT_OK_PCT = float(os.getenv("MARGIN_MAINT_OK_PCT", "15"))

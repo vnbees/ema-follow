@@ -1007,6 +1007,41 @@ def get_all_open_pair_lots() -> list[sqlite3.Row]:
     return get_open_pair_lots(None)
 
 
+def compute_open_lot_side_avg(symbol: str, side: str) -> tuple[float, float] | None:
+    """Weighted avg entry + total size for open lot sides of one symbol.
+
+    Returns (avg_entry, total_size) or None when no open size on that side.
+    """
+    side = side.lower()
+    if side not in ("long", "short"):
+        return None
+    status_key = "long_status" if side == "long" else "short_status"
+    entry_key = "long_entry" if side == "long" else "short_entry"
+    size_key = "long_size" if side == "long" else "short_size"
+    total_value = 0.0
+    total_size = 0.0
+    for lot in get_open_pair_lots(symbol.upper()):
+        if lot[status_key] != "open":
+            continue
+        size = float(lot[size_key] or 0)
+        entry = float(lot[entry_key] or 0)
+        if size <= 0 or entry <= 0:
+            continue
+        total_value += entry * size
+        total_size += size
+    if total_size <= 0:
+        return None
+    return total_value / total_size, total_size
+
+
+def get_pair_lot_by_id(lot_id: int) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM rsi_pair_lots WHERE id = ?",
+            (lot_id,),
+        ).fetchone()
+
+
 def get_recent_pair_lots(limit: int = 100) -> list[sqlite3.Row]:
     with get_connection() as conn:
         return conn.execute(

@@ -39,6 +39,17 @@
     .chart-wrap { position: relative; height: 280px; }
     .chart-empty { color: #8b949e; font-size: 13px; padding: 48px 0; text-align: center; }
     .settings-panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    .pos-panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    .pos-summary { font-size: 13px; color: #8b949e; margin: 0 0 12px; }
+    .pos-nested { margin-left: 12px; border-left: 2px solid #30363d; }
+    .pos-nested td { font-size: 12px; color: #c9d1d9; }
+    .btn-close { background: #3d1214; border-color: #8b1e22; color: #f85149; }
+    .btn-close:hover { background: #5a1a1d; }
+    .tp-ready { color: #3fb950; font-weight: 600; }
+    select {
+      background: #0f1117; color: #e6edf3; border: 1px solid #30363d;
+      border-radius: 6px; padding: 7px 10px;
+    }
   </style>
 </head>
 <body>
@@ -55,9 +66,10 @@
   <p class="meta">Cycle gần nhất: {{ last_cycle_at | vn_time }}</p>
 
   <div class="controls">
-    <span class="status-pill {% if trading_enabled %}running{% else %}stopped{% endif %}">
+    <span id="tradingPill" class="status-pill {% if trading_enabled %}running{% else %}stopped{% endif %}">
       Trading: {% if trading_enabled %}ON{% else %}OFF{% endif %}
     </span>
+    <span id="rateLimitPill" class="status-pill" hidden>Rate-limit</span>
     <form method="post" action="/settings/trading/start">
       <button type="submit" {% if trading_enabled %}disabled{% endif %}>Start</button>
     </form>
@@ -67,6 +79,51 @@
     <form method="post" action="/logout">
       <button type="submit">Logout</button>
     </form>
+  </div>
+
+  <div class="pos-panel">
+    <div class="chart-header">
+      <h2 style="margin: 0;">Vị thế</h2>
+      <div class="controls" style="margin: 0;">
+        <label>
+          Group
+          <select id="posGroup">
+            <option value="position" selected>Position</option>
+            <option value="leg">Leg</option>
+          </select>
+        </label>
+        <label>
+          Sort
+          <select id="posSort">
+            <option value="pnl_desc" selected>PnL ↓</option>
+            <option value="pnl_asc">PnL ↑</option>
+            <option value="symbol">Symbol</option>
+            <option value="opened_at">Opened</option>
+          </select>
+        </label>
+        <label>
+          Page size
+          <select id="posPageSize">
+            <option value="10">10</option>
+            <option value="20" selected>20</option>
+            <option value="50">50</option>
+          </select>
+        </label>
+        <button type="button" id="posPrev">←</button>
+        <span id="posPageLabel" class="meta">1 / 1</span>
+        <button type="button" id="posNext">→</button>
+        <button type="button" id="posRefresh">Refresh</button>
+      </div>
+    </div>
+    <p id="posSummary" class="pos-summary">Đang tải…</p>
+    <div class="table-wrap">
+      <table>
+        <thead id="posHead"></thead>
+        <tbody id="posBody">
+          <tr><td colspan="10" class="empty">Đang tải vị thế…</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 
   <div class="settings-panel">
@@ -336,6 +393,274 @@
         loadEquity(equityRange);
         loadSpot(spotRange);
       }, 60000);
+    })();
+
+    (function () {
+      const state = {
+        group: "position",
+        sort: "pnl_desc",
+        page: 1,
+        pageSize: 20,
+        tradingEnabled: {{ "true" if trading_enabled else "false" }},
+        rateLimited: false,
+        openSides: [],
+        openLegs: [],
+        pnlSummary: null,
+      };
+
+      const el = {
+        group: document.getElementById("posGroup"),
+        sort: document.getElementById("posSort"),
+        pageSize: document.getElementById("posPageSize"),
+        prev: document.getElementById("posPrev"),
+        next: document.getElementById("posNext"),
+        pageLabel: document.getElementById("posPageLabel"),
+        refresh: document.getElementById("posRefresh"),
+        summary: document.getElementById("posSummary"),
+        head: document.getElementById("posHead"),
+        body: document.getElementById("posBody"),
+        tradingPill: document.getElementById("tradingPill"),
+        ratePill: document.getElementById("rateLimitPill"),
+      };
+
+      function fmt(n, digits) {
+        if (n == null || Number.isNaN(n)) return "—";
+        return Number(n).toFixed(digits);
+      }
+
+      function pnlClass(n) {
+        if (n == null) return "";
+        return n >= 0 ? "green" : "red";
+      }
+
+      function canClose() {
+        return state.tradingEnabled && !state.rateLimited;
+      }
+
+      function sortRows(rows) {
+        const key = state.sort;
+        const copy = rows.slice();
+        copy.sort((a, b) => {
+          if (key === "pnl_asc") return (a.pnl_usdt ?? -1e18) - (b.pnl_usdt ?? -1e18);
+          if (key === "pnl_desc") return (b.pnl_usdt ?? -1e18) - (a.pnl_usdt ?? -1e18);
+          if (key === "symbol") {
+            const s = String(a.symbol).localeCompare(String(b.symbol));
+            if (s !== 0) return s;
+            return String(a.side).localeCompare(String(b.side));
+          }
+          return String(a.opened_at || "").localeCompare(String(b.opened_at || ""));
+        });
+        return copy;
+      }
+
+      function pageSlice(rows) {
+        const totalPages = Math.max(1, Math.ceil(rows.length / state.pageSize) || 1);
+        if (state.page > totalPages) state.page = totalPages;
+        if (state.page < 1) state.page = 1;
+        const start = (state.page - 1) * state.pageSize;
+        return {
+          rows: rows.slice(start, start + state.pageSize),
+          totalPages,
+          total: rows.length,
+        };
+      }
+
+      async function closeSide(symbol, side, size) {
+        if (!canClose()) return;
+        const ok = window.confirm(
+          `Đóng toàn bộ ${side.toUpperCase()} ${symbol} (size≈${fmt(size, 4)})?`,
+        );
+        if (!ok) return;
+        const res = await fetch("/api/positions/close-side", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbol, side }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          window.alert(data.message || "Close failed");
+        }
+        await loadPositions();
+      }
+
+      async function closeLeg(lotId, side, symbol, size) {
+        if (!canClose()) return;
+        const ok = window.confirm(
+          `Đóng lot #${lotId} ${side.toUpperCase()} ${symbol} (size≈${fmt(size, 4)})?`,
+        );
+        if (!ok) return;
+        const res = await fetch("/api/positions/close-leg", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ lot_id: lotId, side }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          window.alert(data.message || "Close failed");
+        }
+        await loadPositions();
+      }
+
+      function closeBtn(label, onClick) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn-close";
+        btn.textContent = label;
+        btn.disabled = !canClose();
+        btn.addEventListener("click", onClick);
+        return btn;
+      }
+
+      function renderPositionView(pageRows) {
+        el.head.innerHTML = `<tr>
+          <th>Symbol</th><th>Side</th><th>Size</th><th>DB avg</th><th>Mark</th>
+          <th>Move %</th><th>PnL</th><th>TP</th><th></th>
+        </tr>`;
+        el.body.innerHTML = "";
+        if (!pageRows.length) {
+          el.body.innerHTML = `<tr><td colspan="9" class="empty">Không có vị thế mở.</td></tr>`;
+          return;
+        }
+        for (const sideRow of pageRows) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td><strong>${sideRow.symbol}</strong></td>
+            <td class="${sideRow.side === "long" ? "green" : "red"}">${sideRow.side.toUpperCase()}</td>
+            <td>${fmt(sideRow.size, 4)}</td>
+            <td>${fmt(sideRow.entry, 6)}</td>
+            <td>${fmt(sideRow.mark, 6)}</td>
+            <td class="${pnlClass(sideRow.move_pct)}">${sideRow.move_pct == null ? "—" : fmt(sideRow.move_pct, 2) + "%"}</td>
+            <td class="${pnlClass(sideRow.pnl_usdt)}">${sideRow.pnl_usdt == null ? "—" : fmt(sideRow.pnl_usdt, 2)}</td>
+            <td class="${sideRow.tp_ready ? "tp-ready" : "meta"}">${sideRow.tp_ready ? "ready" : "—"}</td>
+            <td></td>`;
+          tr.lastElementChild.appendChild(
+            closeBtn("Đóng side", () => closeSide(sideRow.symbol, sideRow.side, sideRow.size)),
+          );
+          el.body.appendChild(tr);
+
+          for (const lot of sideRow.lots || []) {
+            const leg = lot[sideRow.side];
+            if (!leg || !leg.is_open) continue;
+            const nest = document.createElement("tr");
+            nest.className = "pos-nested";
+            nest.innerHTML = `
+              <td class="meta">↳ lot #${lot.lot_id}</td>
+              <td class="meta">${lot.entry_trigger || "—"}</td>
+              <td>${fmt(leg.size, 4)}</td>
+              <td>${fmt(leg.entry, 6)}</td>
+              <td></td>
+              <td class="${pnlClass(leg.move_pct)}">${leg.move_pct == null ? "—" : fmt(leg.move_pct, 2) + "%"}</td>
+              <td class="${pnlClass(leg.pnl_usdt)}">${leg.pnl_usdt == null ? "—" : fmt(leg.pnl_usdt, 2)}</td>
+              <td class="${leg.tp_ready ? "tp-ready" : "meta"}">${leg.tp_ready ? "ready" : "—"}</td>
+              <td></td>`;
+            nest.lastElementChild.appendChild(
+              closeBtn("Đóng leg", () =>
+                closeLeg(lot.lot_id, sideRow.side, sideRow.symbol, leg.size),
+              ),
+            );
+            el.body.appendChild(nest);
+          }
+        }
+      }
+
+      function renderLegView(pageRows) {
+        el.head.innerHTML = `<tr>
+          <th>Symbol</th><th>Side</th><th>Lot</th><th>Size</th><th>Entry</th>
+          <th>Mark</th><th>Move %</th><th>PnL</th><th>TP</th><th>Trigger</th><th></th>
+        </tr>`;
+        el.body.innerHTML = "";
+        if (!pageRows.length) {
+          el.body.innerHTML = `<tr><td colspan="11" class="empty">Không có leg mở.</td></tr>`;
+          return;
+        }
+        for (const row of pageRows) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td><strong>${row.symbol}</strong></td>
+            <td class="${row.side === "long" ? "green" : "red"}">${row.side.toUpperCase()}</td>
+            <td>#${row.lot_id}</td>
+            <td>${fmt(row.size, 4)}</td>
+            <td>${fmt(row.entry, 6)}</td>
+            <td>${fmt(row.mark, 6)}</td>
+            <td class="${pnlClass(row.move_pct)}">${row.move_pct == null ? "—" : fmt(row.move_pct, 2) + "%"}</td>
+            <td class="${pnlClass(row.pnl_usdt)}">${row.pnl_usdt == null ? "—" : fmt(row.pnl_usdt, 2)}</td>
+            <td class="${row.tp_ready ? "tp-ready" : "meta"}">${row.tp_ready ? "ready" : "—"}</td>
+            <td class="meta">${row.entry_trigger || "—"}</td>
+            <td></td>`;
+          tr.lastElementChild.appendChild(
+            closeBtn("Đóng", () => closeLeg(row.lot_id, row.side, row.symbol, row.size)),
+          );
+          el.body.appendChild(tr);
+        }
+      }
+
+      function render() {
+        const source = state.group === "leg" ? state.openLegs : state.openSides;
+        const sorted = sortRows(source);
+        const page = pageSlice(sorted);
+        el.pageLabel.textContent = `${state.page} / ${page.totalPages} (${page.total})`;
+        el.prev.disabled = state.page <= 1;
+        el.next.disabled = state.page >= page.totalPages;
+        const s = state.pnlSummary || {};
+        el.summary.textContent =
+          `Open lots: ${s.open_count ?? 0} · symbols: ${s.open_symbols ?? 0} · ` +
+          `legs: ${s.open_legs ?? 0} · unrealized≈${fmt(s.open_unrealized, 2)} USDT` +
+          (state.rateLimited ? " · RATE-LIMITED" : "");
+        if (state.group === "leg") renderLegView(page.rows);
+        else renderPositionView(page.rows);
+      }
+
+      async function loadPositions() {
+        try {
+          const res = await fetch("/api/positions");
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          state.openSides = data.open_sides || [];
+          state.openLegs = data.open_legs || [];
+          state.pnlSummary = data.pnl_summary || null;
+          state.tradingEnabled = !!data.trading_enabled;
+          state.rateLimited = !!data.rate_limited;
+          el.tradingPill.textContent = `Trading: ${state.tradingEnabled ? "ON" : "OFF"}`;
+          el.tradingPill.className = `status-pill ${state.tradingEnabled ? "running" : "stopped"}`;
+          if (state.rateLimited) {
+            el.ratePill.hidden = false;
+            el.ratePill.textContent = `Rate-limit ${fmt(data.rate_limit_remaining_sec, 0)}s`;
+          } else {
+            el.ratePill.hidden = true;
+          }
+          render();
+        } catch (err) {
+          el.body.innerHTML = `<tr><td colspan="11" class="empty">Lỗi tải vị thế: ${err.message}</td></tr>`;
+        }
+      }
+
+      el.group.addEventListener("change", () => {
+        state.group = el.group.value;
+        state.page = 1;
+        render();
+      });
+      el.sort.addEventListener("change", () => {
+        state.sort = el.sort.value;
+        state.page = 1;
+        render();
+      });
+      el.pageSize.addEventListener("change", () => {
+        state.pageSize = Number(el.pageSize.value) || 20;
+        state.page = 1;
+        render();
+      });
+      el.prev.addEventListener("click", () => {
+        state.page -= 1;
+        render();
+      });
+      el.next.addEventListener("click", () => {
+        state.page += 1;
+        render();
+      });
+      el.refresh.addEventListener("click", () => loadPositions());
+
+      loadPositions();
+      setInterval(loadPositions, 60000);
     })();
   </script>
 </body>

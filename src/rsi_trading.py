@@ -19,6 +19,7 @@ from src.exchange import (
 )
 from src.bot_state import is_trading_enabled, update_symbol_status
 from src.config import (
+    AGGREGATE_TP_ENABLED,
     LEVERAGE,
     MARGIN_MODE,
     MARGIN_PREFLIGHT_ENABLED,
@@ -379,6 +380,7 @@ def _take_profit_aggregate_side(
     trigger: str,
     *,
     reopen_pair: bool,
+    db_avg: float | None = None,
 ) -> None:
     positions = fetch_symbol_positions(symbol)
     pos = positions[side]
@@ -386,15 +388,19 @@ def _take_profit_aggregate_side(
         return
     size_str = _format_close_size(symbol, pos.size)
     pnl = fetch_side_unrealized_pnl(symbol, side)
-    move = price_move_pct(side, pos.avg_price, mark)
+    entry_for_move = db_avg if db_avg and db_avg > 0 else pos.avg_price
+    move = price_move_pct(side, entry_for_move, mark)
     logging.info(
-        "  [%s] Aggregate take profit %s | trigger=%s | move=%+.2f%% | size=%s | pnl≈%+.2f",
+        "  [%s] Aggregate take profit %s | trigger=%s | move=%+.2f%% | size=%s | "
+        "pnl≈%+.2f | db_avg=%s | exchange_avg=%.6f",
         symbol,
         side.upper(),
         trigger,
         move,
         size_str,
         pnl,
+        f"{db_avg:.6f}" if db_avg and db_avg > 0 else "—",
+        pos.avg_price,
     )
     fill = _close_side_and_resolve_fill(symbol, side, pos.size, mark)
     db.close_all_lot_sides(symbol, side, close_price=fill)
@@ -417,19 +423,20 @@ def close_lot_leg(
     side: str,
     mark: float,
     trigger: str,
-) -> None:
+) -> dict | None:
+    """Close one open lot side. Returns {fill, pnl, size, entry} or None if skipped."""
     if side == "long":
         if lot["long_status"] != "open":
-            return
+            return None
         entry = float(lot["long_entry"])
         size = float(lot["long_size"])
     else:
         if lot["short_status"] != "open":
-            return
+            return None
         entry = float(lot["short_entry"])
         size = float(lot["short_size"])
     if size <= 0:
-        return
+        return None
 
     size_str = _format_close_size(symbol, size)
     move = price_move_pct(side, entry, mark)
@@ -461,6 +468,7 @@ def close_lot_leg(
     from src.notify import notify_close
 
     notify_close(symbol, side.upper())
+    return {"fill": fill, "pnl": pnl, "size": size, "entry": entry, "move_pct": move}
 
 
 def _take_profit_lot_side(
@@ -625,22 +633,46 @@ def _scan_take_profits(
 
     positions = fetch_symbol_positions(symbol)
     long_agg = positions["long"]
-    if long_agg.size > 0 and should_take_profit(
-        "long", long_agg.avg_price, mark, target_pct=tp_target_pct,
+    long_db = db.compute_open_lot_side_avg(symbol, "long") if AGGREGATE_TP_ENABLED else None
+    if (
+        AGGREGATE_TP_ENABLED
+        and long_db is not None
+        and long_agg.size > 0
+        and should_take_profit(
+            "long", long_db[0], mark, target_pct=tp_target_pct,
+        )
     ):
         _take_profit_aggregate_side(
-            symbol, "long", mark, snap, trigger, reopen_pair=reopen_pair,
+            symbol,
+            "long",
+            mark,
+            snap,
+            trigger,
+            reopen_pair=reopen_pair,
+            db_avg=long_db[0],
         )
         took_action = True
         long_agg_closed = True
         positions = fetch_symbol_positions(symbol)
 
     short_agg = positions["short"]
-    if short_agg.size > 0 and should_take_profit(
-        "short", short_agg.avg_price, mark, target_pct=tp_target_pct,
+    short_db = db.compute_open_lot_side_avg(symbol, "short") if AGGREGATE_TP_ENABLED else None
+    if (
+        AGGREGATE_TP_ENABLED
+        and short_db is not None
+        and short_agg.size > 0
+        and should_take_profit(
+            "short", short_db[0], mark, target_pct=tp_target_pct,
+        )
     ):
         _take_profit_aggregate_side(
-            symbol, "short", mark, snap, trigger, reopen_pair=reopen_pair,
+            symbol,
+            "short",
+            mark,
+            snap,
+            trigger,
+            reopen_pair=reopen_pair,
+            db_avg=short_db[0],
         )
         took_action = True
         short_agg_closed = True
@@ -886,3 +918,102 @@ def evaluate_rsi_trade(
         db.count_open_symbols(),
         MAX_OPEN_SYMBOLS,
     )
+
+
+def manual_close_side(symbol: str, side: str) -> dict:
+    """Dashboard: close entire LONG or SHORT side for a symbol (no reopen)."""
+    from src.exchange import binance as binance_mod
+
+    symbol = symbol.upper()
+    side = side.lower()
+    if side not in ("long", "short"):
+        return {"ok": False, "message": "side must be long or short"}
+    if not is_trading_enabled() or not TRADING_ENABLED:
+        return {"ok": False, "message": "trading disabled"}
+    if not has_credentials():
+        return {"ok": False, "message": "missing exchange credentials"}
+    if binance_mod.is_rate_limited():
+        return {
+            "ok": False,
+            "message": (
+                f"rate-limit cooldown {binance_mod.rate_limit_remaining_sec():.0f}s — try later"
+            ),
+            "rate_limited": True,
+        }
+
+    positions = fetch_symbol_positions(symbol)
+    pos = positions[side]
+    if pos.size <= 0:
+        return {"ok": False, "message": f"no open {side} on exchange for {symbol}"}
+
+    mark = fetch_side_mark_price(symbol)
+    if mark <= 0:
+        mark = pos.avg_price
+    db_avg_row = db.compute_open_lot_side_avg(symbol, side)
+    db_avg = db_avg_row[0] if db_avg_row else None
+    snap = RsiSnapshot(ready=False, rsi=0.0, close=mark)
+    _take_profit_aggregate_side(
+        symbol,
+        side,
+        mark,
+        snap,
+        "dashboard_manual_side",
+        reopen_pair=False,
+        db_avg=db_avg,
+    )
+    _flush_post_order_reconcile()
+    return {
+        "ok": True,
+        "message": f"closed {symbol} {side.upper()}",
+        "symbol": symbol,
+        "side": side,
+        "size": pos.size,
+        "db_avg": db_avg,
+        "mark": mark,
+    }
+
+
+def manual_close_leg(lot_id: int, side: str) -> dict:
+    """Dashboard: close one lot leg (long or short)."""
+    from src.exchange import binance as binance_mod
+
+    side = side.lower()
+    if side not in ("long", "short"):
+        return {"ok": False, "message": "side must be long or short"}
+    if not is_trading_enabled() or not TRADING_ENABLED:
+        return {"ok": False, "message": "trading disabled"}
+    if not has_credentials():
+        return {"ok": False, "message": "missing exchange credentials"}
+    if binance_mod.is_rate_limited():
+        return {
+            "ok": False,
+            "message": (
+                f"rate-limit cooldown {binance_mod.rate_limit_remaining_sec():.0f}s — try later"
+            ),
+            "rate_limited": True,
+        }
+
+    lot = db.get_pair_lot_by_id(int(lot_id))
+    if lot is None:
+        return {"ok": False, "message": f"lot #{lot_id} not found"}
+    status_key = "long_status" if side == "long" else "short_status"
+    if lot[status_key] != "open":
+        return {"ok": False, "message": f"lot #{lot_id} {side} already closed"}
+
+    symbol = str(lot["symbol"]).upper()
+    mark = fetch_side_mark_price(symbol)
+    if mark <= 0:
+        entry = float(lot["long_entry"] if side == "long" else lot["short_entry"])
+        mark = entry
+    result = close_lot_leg(symbol, lot, side, mark, "dashboard_manual_leg")
+    if result is None:
+        return {"ok": False, "message": f"could not close lot #{lot_id} {side}"}
+    _flush_post_order_reconcile()
+    return {
+        "ok": True,
+        "message": f"closed {symbol} lot #{lot_id} {side.upper()}",
+        "symbol": symbol,
+        "lot_id": int(lot_id),
+        "side": side,
+        **result,
+    }

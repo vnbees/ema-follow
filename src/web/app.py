@@ -9,13 +9,6 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
 from src import database as db
-from src.exchange import (
-    ExchangeClientError,
-    fetch_side_mark_price,
-    fetch_side_unrealized_pnl,
-    fetch_symbol_positions,
-    has_credentials,
-)
 from src.config import (
     DASHBOARD_COOKIE_SECURE,
     DASHBOARD_PASSWORD,
@@ -213,29 +206,53 @@ def _build_spot_transfer_rows(limit: int = 20) -> list[dict]:
 
 
 def _fetch_symbol_marks(symbols: list[str]) -> dict[str, float]:
+    """WS mark only — never REST premiumIndex on dashboard refresh."""
     result: dict[str, float] = {}
-    if not has_credentials():
-        return result
+    try:
+        from src.exchange.binance_ws import get_mark_from_ws
+    except Exception:  # noqa: BLE001
+        get_mark_from_ws = None  # type: ignore[assignment]
     for symbol in symbols:
-        try:
-            result[symbol] = fetch_side_mark_price(symbol)
-        except ExchangeClientError:
-            result[symbol] = 0.0
+        mark = 0.0
+        if get_mark_from_ws is not None:
+            try:
+                cached = get_mark_from_ws(symbol)
+                if cached is not None and cached > 0:
+                    mark = float(cached)
+            except Exception:  # noqa: BLE001
+                mark = 0.0
+        result[symbol] = mark
     return result
 
 
-def _fetch_open_unrealized_by_symbol(symbols: list[str]) -> dict[str, float]:
+def _unrealized_map_from_groups(symbol_groups: list[dict]) -> dict[str, float]:
+    """Estimate open unrealized from DB lots + mark (no positionRisk)."""
     result: dict[str, float] = {}
-    if not has_credentials():
-        return result
-    for symbol in symbols:
-        try:
-            long_pnl = fetch_side_unrealized_pnl(symbol, "long")
-            short_pnl = fetch_side_unrealized_pnl(symbol, "short")
-            result[symbol] = long_pnl + short_pnl
-        except ExchangeClientError:
-            result[symbol] = 0.0
+    for group in symbol_groups:
+        long_pnl = group.get("agg_long", {}).get("pnl_usdt") or 0.0
+        short_pnl = group.get("agg_short", {}).get("pnl_usdt") or 0.0
+        result[group["symbol"]] = float(long_pnl) + float(short_pnl)
     return result
+
+
+def _agg_side_from_open_lots(side: str, open_lots: list, mark: float) -> dict:
+    """DB-weighted avg entry + size for one side; PnL from mark."""
+    status_key = f"{side}_status"
+    entry_key = f"{side}_entry"
+    size_key = f"{side}_size"
+    total_value = 0.0
+    total_size = 0.0
+    for row in open_lots:
+        if row[status_key] != "open":
+            continue
+        size = float(row[size_key] or 0)
+        entry = float(row[entry_key] or 0)
+        if size <= 0 or entry <= 0:
+            continue
+        total_value += entry * size
+        total_size += size
+    avg_entry = (total_value / total_size) if total_size > 0 else 0.0
+    return _build_agg_side(side, total_size, avg_entry, mark)
 
 
 def _lot_is_open(lot) -> bool:
@@ -356,46 +373,15 @@ def _leg_fields(
     }
 
 
-def _exchange_leg_pnl_share(
-    side: str,
-    lot,
-    side_pnl: float,
-    side_open_size: float,
-) -> float | None:
-    status_col = f"{side}_status"
-    size_col = f"{side}_size"
-    if lot[status_col] != "open" or side_open_size <= 0:
-        return None
-    lot_size = float(lot[size_col])
-    if lot_size <= 0:
-        return None
-    return side_pnl * (lot_size / side_open_size)
-
-
 def _build_lot_detail(
     lot,
     mark: float,
     fifo_index: int | None,
     fifo_count: int,
-    *,
-    long_side_pnl: float = 0.0,
-    short_side_pnl: float = 0.0,
-    long_open_size: float = 0.0,
-    short_open_size: float = 0.0,
 ) -> dict:
     open_legs, total_legs = _lot_open_leg_count(lot)
-    long_leg = _leg_fields(
-        "long",
-        lot,
-        mark,
-        exchange_leg_pnl=_exchange_leg_pnl_share("long", lot, long_side_pnl, long_open_size),
-    )
-    short_leg = _leg_fields(
-        "short",
-        lot,
-        mark,
-        exchange_leg_pnl=_exchange_leg_pnl_share("short", lot, short_side_pnl, short_open_size),
-    )
+    long_leg = _leg_fields("long", lot, mark)
+    short_leg = _leg_fields("short", lot, mark)
     realized_total = 0.0
     has_realized = False
     for leg in (long_leg, short_leg):
@@ -419,40 +405,8 @@ def _build_lot_detail(
     }
 
 
-def _fetch_agg_for_symbol(symbol: str, mark: float) -> tuple[dict, dict]:
-    if not has_credentials():
-        return (
-            _build_agg_side("long", 0, 0, mark),
-            _build_agg_side("short", 0, 0, mark),
-        )
-    try:
-        positions = fetch_symbol_positions(symbol)
-        long_pnl = fetch_side_unrealized_pnl(symbol, "long")
-        short_pnl = fetch_side_unrealized_pnl(symbol, "short")
-        return (
-            _build_agg_side(
-                "long",
-                positions["long"].size,
-                positions["long"].avg_price,
-                mark,
-                exchange_pnl=long_pnl,
-            ),
-            _build_agg_side(
-                "short",
-                positions["short"].size,
-                positions["short"].avg_price,
-                mark,
-                exchange_pnl=short_pnl,
-            ),
-        )
-    except ExchangeClientError:
-        return (
-            _build_agg_side("long", 0, 0, mark),
-            _build_agg_side("short", 0, 0, mark),
-        )
-
-
 def build_symbol_groups(lots, statuses: dict, mark_map: dict[str, float]) -> list[dict]:
+    """Build dashboard groups from DB lots + WS mark — no REST positionRisk."""
     by_symbol: dict[str, list] = {}
     for lot in lots:
         by_symbol.setdefault(lot["symbol"], []).append(lot)
@@ -464,16 +418,8 @@ def build_symbol_groups(lots, statuses: dict, mark_map: dict[str, float]) -> lis
         st = statuses.get(symbol)
         open_lots = [row for row in symbol_lots if _lot_is_open(row)]
         fifo_count = len(open_lots)
-        agg_long, agg_short = _fetch_agg_for_symbol(symbol, mark)
-
-        long_open_size = sum(
-            float(row["long_size"]) for row in open_lots if row["long_status"] == "open"
-        )
-        short_open_size = sum(
-            float(row["short_size"]) for row in open_lots if row["short_status"] == "open"
-        )
-        long_side_pnl = agg_long.get("pnl_usdt") or 0.0
-        short_side_pnl = agg_short.get("pnl_usdt") or 0.0
+        agg_long = _agg_side_from_open_lots("long", open_lots, mark)
+        agg_short = _agg_side_from_open_lots("short", open_lots, mark)
 
         lot_details: list[dict] = []
         fifo_n = 0
@@ -482,17 +428,9 @@ def build_symbol_groups(lots, statuses: dict, mark_map: dict[str, float]) -> lis
             if _lot_is_open(lot):
                 fifo_n += 1
                 fifo_index = fifo_n
+            # Per-leg PnL from entry×mark (not exchange side share).
             lot_details.append(
-                _build_lot_detail(
-                    lot,
-                    mark,
-                    fifo_index,
-                    fifo_count,
-                    long_side_pnl=long_side_pnl,
-                    short_side_pnl=short_side_pnl,
-                    long_open_size=long_open_size,
-                    short_open_size=short_open_size,
-                ),
+                _build_lot_detail(lot, mark, fifo_index, fifo_count),
             )
 
         groups.append(
@@ -507,6 +445,75 @@ def build_symbol_groups(lots, statuses: dict, mark_map: dict[str, float]) -> lis
             }
         )
     return groups
+
+
+def flatten_open_legs(symbol_groups: list[dict]) -> list[dict]:
+    """Flat list of open LONG/SHORT legs for dashboard leg-group view."""
+    rows: list[dict] = []
+    for group in symbol_groups:
+        symbol = group["symbol"]
+        mark = group.get("mark_price") or 0.0
+        for lot in group.get("lots", []):
+            if not lot.get("is_open"):
+                continue
+            for side in ("long", "short"):
+                leg = lot.get(side) or {}
+                if not leg.get("is_open"):
+                    continue
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "side": side,
+                        "lot_id": lot["lot_id"],
+                        "size": leg.get("size") or 0.0,
+                        "entry": leg.get("entry") or 0.0,
+                        "mark": mark,
+                        "move_pct": leg.get("move_pct"),
+                        "pnl_usdt": leg.get("pnl_usdt"),
+                        "tp_ready": bool(leg.get("tp_ready")),
+                        "entry_trigger": lot.get("entry_trigger") or "—",
+                        "opened_at": lot.get("opened_at"),
+                    }
+                )
+    return rows
+
+
+def flatten_open_sides(symbol_groups: list[dict]) -> list[dict]:
+    """One row per open symbol-side (DB avg) for position-group headers / sort."""
+    rows: list[dict] = []
+    for group in symbol_groups:
+        symbol = group["symbol"]
+        mark = group.get("mark_price") or 0.0
+        for side, agg in (("long", group.get("agg_long") or {}), ("short", group.get("agg_short") or {})):
+            size = float(agg.get("size") or 0)
+            if size <= 0:
+                continue
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "side": side,
+                    "size": size,
+                    "entry": float(agg.get("avg_entry") or 0),
+                    "mark": mark,
+                    "move_pct": agg.get("move_pct"),
+                    "pnl_usdt": agg.get("pnl_usdt"),
+                    "tp_ready": bool(agg.get("tp_ready")),
+                    "lots": [
+                        lot
+                        for lot in group.get("lots", [])
+                        if lot.get("is_open") and (lot.get(side) or {}).get("is_open")
+                    ],
+                    "opened_at": min(
+                        (
+                            lot.get("opened_at") or ""
+                            for lot in group.get("lots", [])
+                            if lot.get("is_open") and (lot.get(side) or {}).get("is_open")
+                        ),
+                        default="",
+                    ),
+                }
+            )
+    return rows
 
 
 def _build_pnl_summary(symbol_groups: list[dict], unrealized_map: dict[str, float]) -> dict:
@@ -654,8 +661,8 @@ def _dashboard_context(
     statuses = get_all_statuses()
     symbols = sorted({lot["symbol"] for lot in lots})
     mark_map = _fetch_symbol_marks(symbols)
-    unrealized_map = _fetch_open_unrealized_by_symbol(symbols)
     symbol_groups = build_symbol_groups(lots, statuses, mark_map)
+    unrealized_map = _unrealized_map_from_groups(symbol_groups)
     pnl_summary = _build_pnl_summary(symbol_groups, unrealized_map)
     open_count = pnl_summary["open_count"]
     closed_count = len(lots) - open_count
@@ -747,6 +754,16 @@ def api_status() -> dict:
     account = get_account_balance()
     statuses = get_all_statuses()
     ctx = _dashboard_context(None, None, None)
+    symbol_groups = ctx["symbol_groups"]
+    rate_limited = False
+    rate_limit_remaining_sec = 0.0
+    try:
+        from src.exchange import binance as binance_mod
+
+        rate_limited = binance_mod.is_rate_limited()
+        rate_limit_remaining_sec = binance_mod.rate_limit_remaining_sec()
+    except Exception:  # noqa: BLE001
+        pass
 
     return {
         "account": {
@@ -761,8 +778,13 @@ def api_status() -> dict:
             "baseline_updated_at": format_vn_time(account.baseline_updated_at),
         },
         "pnl_summary": ctx["pnl_summary"],
-        "symbol_groups": ctx["symbol_groups"],
+        "symbol_groups": symbol_groups,
+        "open_sides": flatten_open_sides(symbol_groups),
+        "open_legs": flatten_open_legs(symbol_groups),
         "profit_target_pct": PAIR_PROFIT_TARGET_PCT,
+        "trading_enabled": is_trading_enabled(),
+        "rate_limited": rate_limited,
+        "rate_limit_remaining_sec": rate_limit_remaining_sec,
         "symbols": {
             sym: {
                 **status_to_dict(st),
@@ -771,6 +793,80 @@ def api_status() -> dict:
             for sym, st in statuses.items()
         },
     }
+
+
+@app.get("/api/positions")
+def api_positions() -> dict:
+    """Lightweight positions payload for dashboard (DB + WS mark, no REST)."""
+    lots = db.get_pair_lots_for_dashboard(limit=200)
+    statuses = get_all_statuses()
+    symbols = sorted({lot["symbol"] for lot in lots})
+    mark_map = _fetch_symbol_marks(symbols)
+    symbol_groups = build_symbol_groups(lots, statuses, mark_map)
+    rate_limited = False
+    rate_limit_remaining_sec = 0.0
+    try:
+        from src.exchange import binance as binance_mod
+
+        rate_limited = binance_mod.is_rate_limited()
+        rate_limit_remaining_sec = binance_mod.rate_limit_remaining_sec()
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        "symbol_groups": symbol_groups,
+        "open_sides": flatten_open_sides(symbol_groups),
+        "open_legs": flatten_open_legs(symbol_groups),
+        "pnl_summary": _build_pnl_summary(
+            symbol_groups, _unrealized_map_from_groups(symbol_groups),
+        ),
+        "profit_target_pct": PAIR_PROFIT_TARGET_PCT,
+        "trading_enabled": is_trading_enabled(),
+        "rate_limited": rate_limited,
+        "rate_limit_remaining_sec": rate_limit_remaining_sec,
+    }
+
+
+@app.post("/api/positions/close-side")
+async def api_close_side(request: Request) -> JSONResponse:
+    from src.rsi_trading import manual_close_side
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False, "message": "invalid JSON"}, status_code=400)
+    symbol = str(body.get("symbol") or "").strip()
+    side = str(body.get("side") or "").strip().lower()
+    if not symbol or side not in ("long", "short"):
+        return JSONResponse(
+            {"ok": False, "message": "symbol and side (long|short) required"},
+            status_code=400,
+        )
+    result = manual_close_side(symbol, side)
+    status = 200 if result.get("ok") else (429 if result.get("rate_limited") else 400)
+    return JSONResponse(result, status_code=status)
+
+
+@app.post("/api/positions/close-leg")
+async def api_close_leg(request: Request) -> JSONResponse:
+    from src.rsi_trading import manual_close_leg
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False, "message": "invalid JSON"}, status_code=400)
+    try:
+        lot_id = int(body.get("lot_id"))
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "message": "lot_id required"}, status_code=400)
+    side = str(body.get("side") or "").strip().lower()
+    if side not in ("long", "short"):
+        return JSONResponse(
+            {"ok": False, "message": "side must be long or short"},
+            status_code=400,
+        )
+    result = manual_close_leg(lot_id, side)
+    status = 200 if result.get("ok") else (429 if result.get("rate_limited") else 400)
+    return JSONResponse(result, status_code=status)
 
 
 @app.get("/api/equity-history")

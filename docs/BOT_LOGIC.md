@@ -254,7 +254,8 @@ Margin **tính lại mỗi lần** `_open_pair` theo **equity** (không phải a
 | Sự kiện | Nguồn giá ghi DB / hiển thị |
 |---------|------------------------------|
 | Mở lot mới — `long_entry` / `short_entry` | `avgPrice` từ order response → poll `fetch_order_detail` nếu cần |
-| Quyết định chốt aggregate | `positionRisk.entryPrice` + `markPrice` / `unRealizedProfit` |
+| Quyết định chốt lot | `long_entry`/`short_entry` DB + `markPrice` |
+| Quyết định chốt aggregate (nếu `AGGREGATE_TP_ENABLED`) | **wavg open lots DB** + `markPrice` (không dùng `entryPrice` sàn) |
 | Đóng leg / aggregate — `close_price` | `avgPrice` fill lệnh đóng (không dùng mark) |
 | Dashboard unrealized | `unRealizedProfit` sàn, chia theo tỷ lệ size lot |
 | Lot cũ (trước deploy) | Entry DB **không** sửa; chỉ `close_price` fill khi đóng sau deploy |
@@ -301,9 +302,18 @@ Preflight **chỉ** gọi từ `_open_pair`, **không** gọi từ reopen sau TP
 
 ---
 
-## 9. Chốt lãi — hai tầng, hai thời điểm
+## 9. Chốt lãi — DB-weighted side + lot-level
 
-Ngưỡng: `PAIR_PROFIT_TARGET_PCT` (2%) hoặc `MARGIN_HIGH_TP_PCT` (1%) khi margin guard tier **high**. Cả aggregate **và** lot-level đều nhận `tp_target_pct` từ `effective_tp_pct()` (tránh lot-level vô tình fallback 2% khi margin high).
+Ngưỡng: `PAIR_PROFIT_TARGET_PCT` (2%) hoặc `MARGIN_HIGH_TP_PCT` (1%) khi margin guard tier **high**. Cả hai tầng nhận `tp_target_pct` từ `effective_tp_pct()`.
+
+### Aggregate = avg từ open lots DB (không dùng entry sàn)
+
+`AGGREGATE_TP_ENABLED=true` (default):
+
+- Tính **wavg** `Σ(entry×size)/Σ(size)` từ các lot DB còn `open` trên side.
+- Nếu wavg vs **mark** ≥ ngưỡng → đóng **hết** side trên sàn + `close_all_lot_sides` (1 order).
+- Tránh case entry sàn ≥2% trong khi nhiều lot DB vẫn lỗ (BEAMX/VELO).
+- Tắt: `AGGREGATE_TP_ENABLED=false` → chỉ lot-level.
 
 ### 9a. Mỗi cycle 5 phút (`trigger=cycle`, `reopen_pair=False`)
 
@@ -311,16 +321,16 @@ Chạy cho **mọi** symbol managed — **không cần RSI cross**.
 
 Thứ tự `_scan_take_profits`:
 
-1. **Aggregate LONG** trên sàn ≥ ngưỡng → đóng **hết** long + `close_all_lot_sides(long)` (1 order)
-2. **Aggregate SHORT** — tương tự (nếu long chưa aggregate-close)
-3. **Lot-level LONG** — mọi lot đủ ngưỡng → **một** order `sum(size)`, cập nhật DB từng lot
+1. **DB-avg LONG** (nếu flag) — wavg lots ≥ ngưỡng → đóng hết long
+2. **DB-avg SHORT** — tương tự
+3. **Lot-level LONG** — mọi lot đủ ngưỡng → **một** order `sum(size)` *(nếu side chưa bị aggregate đóng)*
 4. **Lot-level SHORT** — tương tự
 
 - **Không** `_open_pair` sau chốt
 
 ### 9b. Khi RSI cross (`reopen_pair=True`)
 
-Cùng logic batch/aggregate, nhưng sau chốt → `_open_pair` **một lần** / side (có preflight; không nhân reopen theo số lot).
+Cùng thứ tự, nhưng sau chốt → `_open_pair` **một lần** / side (có preflight).
 
 Nếu **có chốt** trên cross → return, **không** stack.
 
@@ -334,10 +344,18 @@ Nếu **không chốt**:
 
 | | Mỗi cycle 5m | RSI cross |
 |---|--------------|-----------|
-| Chốt aggregate/lot | Có | Có |
+| Chốt lot (≥ ngưỡng theo entry lot) | Có | Có |
+| Chốt DB-avg side | Nếu `AGGREGATE_TP_ENABLED` | Nếu flag bật |
 | Ngưỡng TP | `effective_tp_pct()` | `effective_tp_pct()` |
 | Sau chốt | Không mở cặp | `_open_pair` ×1 (+ preflight) |
 | Không chốt | — | Stack hoặc entry |
+
+### Dashboard đóng tay
+
+- `POST /api/positions/close-side` — đóng cả side (không cần đạt 2%)
+- `POST /api/positions/close-leg` — đóng 1 lot/leg
+- Tôn trọng rate-limit 418; chỉ REST khi user bấm đóng
+
 
 ---
 
@@ -429,7 +447,7 @@ Hai connection market riêng (tránh miniTicker “nuôi” `market_fresh` trong
 | `klines` | Kline WS + REST lazy **từng** symbol; cooldown `BINANCE_CANDLE_REST_SEC` + stagger chống burst 418 |
 | `ticker/24hr` | `!miniTicker@arr` (REST seed **tắt** mặc định; fallback throttle `BINANCE_VOLUME_RANK_REST_SEC`) |
 | `premiumIndex` | `!markPrice@arr@1s` |
-| `positionRisk` / `account` | UDS + REST reconcile **hoãn** sau khi market WS healthy; sau order: **debounce** → `flush_pending_reconcile` |
+| `positionRisk` / `account` | UDS + disk snapshot lúc boot (**không** REST verify first connect); soft reconcile mỗi `BINANCE_WS_RECONCILE_SEC` khi IP sạch; sau order: debounce → `flush_pending_reconcile` |
 | `POST /order`, dual/margin/leverage, spot | **Vẫn REST** |
 | Lot-level TP nhiều lot cùng side | **1** `POST /order` (`sum` size), không N lệnh |
 
@@ -437,7 +455,7 @@ Hai connection market riêng (tránh miniTicker “nuôi” `market_fresh` trong
 
 **Chống ban lặp khi redeploy:** cooldown 418 ghi file cạnh DB (`binance_rate_limit_until_ms` trên volume). Process mới đọc file → **không** gọi REST khi IP còn ban. Boot WS **không** gọi `ticker/24hr` + force reconcile.
 
-**WS khi REST đang ban:** All-market + kline + UDS (listenKey disk) vẫn chạy. Nến + positions snapshot trên volume. **Không thể** đặt/đóng lệnh. Keepalive PUT skip khi ban.
+**WS khi REST đang ban:** All-market + kline + UDS (listenKey disk) vẫn chạy. Nến + positions snapshot trên volume. **Không thể** đặt/đóng lệnh. Keepalive PUT skip khi ban. **Deploy/restart** trong lúc ban: đọc file cooldown → UDS first connect **không** gọi REST reconcile (tránh 418 lặp).
 
 Module: [`src/exchange/binance_ws/`](src/exchange/binance_ws/). Candle series stale → fallback REST (có throttle). Disconnect lâu → Discord `notify_error`.
 
@@ -580,6 +598,7 @@ MARGIN_MODE=crossed
 # Chiến lược RSI
 MAX_OPEN_SYMBOLS=20
 PAIR_PROFIT_TARGET_PCT=2
+AGGREGATE_TP_ENABLED=true
 GRANULARITY=5m
 INTERVAL_MINUTES=5
 RSI_PERIOD=14
