@@ -1,7 +1,7 @@
 import logging
 
 from src import database as db
-from src.exchange import ExchangeClientError, fetch_all_open_positions, fetch_symbol_positions, has_credentials
+from src.exchange import ExchangeClientError, fetch_all_open_positions, has_credentials
 from src.config import LEGACY_MARGIN_USDT
 
 
@@ -29,24 +29,59 @@ def sync_exchange_positions() -> list[str]:
         return sorted(db_symbols)
 
     exchange_symbols = {pos.symbol for pos in all_positions if pos.size > 0}
+    live_exchange_symbols: set[str] = set()
 
     for symbol in exchange_symbols:
         if db.symbol_has_open_lots(symbol):
+            live_exchange_symbols.add(symbol)
             continue
-        positions = fetch_symbol_positions(symbol)
-        if positions["long"].size > 0 or positions["short"].size > 0:
-            db.insert_pair_lot(
-                symbol,
-                long_size=positions["long"].size,
-                long_entry=positions["long"].avg_price or 0.0,
-                short_size=positions["short"].size,
-                short_entry=positions["short"].avg_price or 0.0,
-                margin_usdt=LEGACY_MARGIN_USDT,
-                entry_trigger="adopted",
-            )
-            logging.info("  Adopted exchange pair %s (no lot record)", symbol)
+        # WS can retain ghost sides after a flat close; never invent lots from
+        # cache alone — confirm with REST before adopt.
+        try:
+            from src.exchange.binance import fetch_symbol_positions_rest
 
-    managed = sorted(exchange_symbols | {row["symbol"] for row in db.get_all_open_pair_lots()})
+            positions = fetch_symbol_positions_rest(symbol)
+        except ExchangeClientError as exc:
+            logging.warning(
+                "  Skip adopt %s — REST confirm failed: %s", symbol, exc,
+            )
+            continue
+        long_size = positions["long"].size
+        short_size = positions["short"].size
+        if long_size <= 0 and short_size <= 0:
+            logging.info(
+                "  Skip adopt %s — REST flat (stale WS ghost)", symbol,
+            )
+            try:
+                from src.exchange.binance_ws.cache import CACHE
+
+                CACHE.apply_position_updates(
+                    [],
+                    closed_keys=[(symbol, "long"), (symbol, "short")],
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            continue
+        lot_id = db.insert_pair_lot(
+            symbol,
+            long_size=long_size,
+            long_entry=positions["long"].avg_price or 0.0,
+            short_size=short_size,
+            short_entry=positions["short"].avg_price or 0.0,
+            margin_usdt=LEGACY_MARGIN_USDT,
+            entry_trigger="adopted",
+        )
+        # insert_pair_lot always marks both sides open — close empty legs.
+        if long_size <= 0:
+            db.close_lot_side(lot_id, "long", realized_pnl_usdt=0.0, close_price=None)
+        if short_size <= 0:
+            db.close_lot_side(lot_id, "short", realized_pnl_usdt=0.0, close_price=None)
+        logging.info("  Adopted exchange pair %s (no lot record)", symbol)
+        live_exchange_symbols.add(symbol)
+
+    managed = sorted(
+        live_exchange_symbols | {row["symbol"] for row in db.get_all_open_pair_lots()}
+    )
     if managed:
         logging.info("Tracking %d symbol(s): %s", len(managed), ", ".join(managed))
     return managed

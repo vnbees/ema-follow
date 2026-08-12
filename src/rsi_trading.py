@@ -117,6 +117,34 @@ def _trading_enabled() -> bool:
     return is_trading_enabled()
 
 
+def _is_already_flat_error(exc: BaseException) -> bool:
+    """True when Binance rejects reduceOnly because the side is already flat (-2022)."""
+    msg = str(exc)
+    return "-2022" in msg or "ReduceOnly" in msg
+
+
+class AlreadyFlatError(ExchangeClientError):
+    """Side is flat on exchange; phantom DB lots were (or should be) synced closed."""
+
+
+def _mark_exchange_side_flat(symbol: str, side: str) -> int:
+    """Invalidate stale position caches and close phantom DB lot sides for a flat exchange side."""
+    side = side.lower()
+    try:
+        from src.exchange import binance as binance_mod
+
+        binance_mod._invalidate_position_cache(symbol)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from src.exchange.binance_ws.cache import CACHE
+
+        CACHE.apply_position_updates([], closed_keys=[(symbol, side)])
+    except Exception:  # noqa: BLE001
+        pass
+    return _trim_lot_side_to_exchange(symbol, side, 0.0)
+
+
 def _close_side_and_resolve_fill(
     symbol: str,
     side: str,
@@ -125,8 +153,30 @@ def _close_side_and_resolve_fill(
 ) -> float:
     positions = fetch_symbol_positions(symbol)
     size_before = float(positions[side].size)
+    if size_before <= 0:
+        n = _mark_exchange_side_flat(symbol, side)
+        logging.warning(
+            "  [%s] Skip close %s — exchange already flat (trimmed %d phantom lot side(s))",
+            symbol,
+            side.upper(),
+            n,
+        )
+        raise AlreadyFlatError(f"{symbol} {side} already flat on exchange")
     size_str = _format_close_size(symbol, size)
-    result = close_position_side(symbol, side, size_str)
+    try:
+        result = close_position_side(symbol, side, size_str)
+    except ExchangeClientError as exc:
+        if _is_already_flat_error(exc):
+            n = _mark_exchange_side_flat(symbol, side)
+            logging.warning(
+                "  [%s] Close %s rejected (already flat) — trimmed %d phantom lot side(s): %s",
+                symbol,
+                side.upper(),
+                n,
+                exc,
+            )
+            raise AlreadyFlatError(str(exc)) from exc
+        raise
     _verify_side_reduced(symbol, side, size_before, closed_size=size)
     return resolve_order_fill(symbol, result, fallback_price=fallback_price)
 
@@ -544,7 +594,10 @@ def close_lot_leg(
         move,
         size_str,
     )
-    fill = _close_side_and_resolve_fill(symbol, side, size, mark)
+    try:
+        fill = _close_side_and_resolve_fill(symbol, side, size, mark)
+    except AlreadyFlatError:
+        return None
     pnl = _estimate_leg_pnl(side, entry, fill, size)
     logging.info(
         "  [%s] Lot #%d close %s fill=%.6f | pnl≈%+.2f",
@@ -678,7 +731,10 @@ def _take_profit_lots_side_batched(
         size_str,
         len(selected),
     )
-    fill = _close_side_and_resolve_fill(symbol, side, selected_size, mark)
+    try:
+        fill = _close_side_and_resolve_fill(symbol, side, selected_size, mark)
+    except AlreadyFlatError:
+        return False
     for lot, entry, size in selected:
         pnl = _estimate_leg_pnl(side, entry, fill, size)
         logging.info(
@@ -730,6 +786,14 @@ def _close_expired_lots_side_batched(
     positions = fetch_symbol_positions(symbol)
     exchange_size = positions[side].size
     if exchange_size <= 0:
+        n = _trim_lot_side_to_exchange(symbol, side, 0.0)
+        if n:
+            logging.info(
+                "  [%s] Skip age close %s — exchange flat, closed %d phantom lot side(s)",
+                symbol,
+                side.upper(),
+                n,
+            )
         return False
 
     candidates: list[tuple[object, float, float]] = []
@@ -776,7 +840,10 @@ def _close_expired_lots_side_batched(
         len(selected),
         _age_close_budget,
     )
-    fill = _close_side_and_resolve_fill(symbol, side, selected_size, mark)
+    try:
+        fill = _close_side_and_resolve_fill(symbol, side, selected_size, mark)
+    except AlreadyFlatError:
+        return False
     _age_close_budget -= 1
     for lot, entry, size in selected:
         pnl = _estimate_leg_pnl(side, entry, fill, size)
@@ -879,6 +946,14 @@ def _close_breakeven_lots_side_batched(symbol: str, mark: float, side: str) -> b
     positions = fetch_symbol_positions(symbol)
     exchange_size = positions[side].size
     if exchange_size <= 0:
+        n = _trim_lot_side_to_exchange(symbol, side, 0.0)
+        if n:
+            logging.info(
+                "  [%s] Skip BE close %s — exchange flat, closed %d phantom lot side(s)",
+                symbol,
+                side.upper(),
+                n,
+            )
         return False
 
     candidates: list[tuple[object, float, float]] = []
@@ -918,7 +993,10 @@ def _close_breakeven_lots_side_batched(symbol: str, mark: float, side: str) -> b
         size_str,
         len(selected),
     )
-    fill = _close_side_and_resolve_fill(symbol, side, selected_size, mark)
+    try:
+        fill = _close_side_and_resolve_fill(symbol, side, selected_size, mark)
+    except AlreadyFlatError:
+        return False
     for lot, entry, size in selected:
         lot_id = int(lot["id"])  # type: ignore[index]
         pnl = _estimate_leg_pnl(side, entry, fill, size)
@@ -1014,18 +1092,27 @@ def _scan_take_profits_locked(
             "long", long_db[0], mark, target_pct=tp_target_pct,
         )
     ):
-        _take_profit_aggregate_side(
-            symbol,
-            "long",
-            mark,
-            snap,
-            trigger,
-            reopen_pair=reopen_pair,
-            db_avg=long_db[0],
-        )
-        took_action = True
-        long_agg_closed = True
-        positions = fetch_symbol_positions(symbol)
+        try:
+            _take_profit_aggregate_side(
+                symbol,
+                "long",
+                mark,
+                snap,
+                trigger,
+                reopen_pair=reopen_pair,
+                db_avg=long_db[0],
+            )
+            took_action = True
+            long_agg_closed = True
+            positions = fetch_symbol_positions(symbol)
+        except ExchangeClientError as exc:
+            # Already-flat is handled inside _close_side_and_resolve_fill; other
+            # errors must not skip the batch path that can trim phantoms.
+            if isinstance(exc, AlreadyFlatError) or _is_already_flat_error(exc):
+                _mark_exchange_side_flat(symbol, "long")
+                long_agg_closed = True
+            else:
+                raise
 
     short_agg = positions["short"]
     short_db = db.compute_open_lot_side_avg(symbol, "short") if AGGREGATE_TP_ENABLED else None
@@ -1037,17 +1124,24 @@ def _scan_take_profits_locked(
             "short", short_db[0], mark, target_pct=tp_target_pct,
         )
     ):
-        _take_profit_aggregate_side(
-            symbol,
-            "short",
-            mark,
-            snap,
-            trigger,
-            reopen_pair=reopen_pair,
-            db_avg=short_db[0],
-        )
-        took_action = True
-        short_agg_closed = True
+        try:
+            _take_profit_aggregate_side(
+                symbol,
+                "short",
+                mark,
+                snap,
+                trigger,
+                reopen_pair=reopen_pair,
+                db_avg=short_db[0],
+            )
+            took_action = True
+            short_agg_closed = True
+        except ExchangeClientError as exc:
+            if isinstance(exc, AlreadyFlatError) or _is_already_flat_error(exc):
+                _mark_exchange_side_flat(symbol, "short")
+                short_agg_closed = True
+            else:
+                raise
 
     if not long_agg_closed:
         if _take_profit_lots_side_batched(
@@ -1075,6 +1169,22 @@ def _trim_lot_side_to_exchange(symbol: str, side: str, exchange_size: float) -> 
     size_key = "long_size" if side == "long" else "short_size"
     closed = 0
     closed_ids: set[int] = set()
+    # Close zero-size "open" legs left by one-sided adopt / partial sync.
+    for row in db.get_open_pair_lots(symbol):
+        if row[status_key] != "open":
+            continue
+        if float(row[size_key]) > 0:
+            continue
+        lot_id = int(row["id"])
+        logging.warning(
+            "  [%s] Sync-close zero-size open %s lot #%d",
+            symbol,
+            side.upper(),
+            lot_id,
+        )
+        db.close_lot_side(lot_id, side, realized_pnl_usdt=0.0, close_price=None)
+        closed_ids.add(lot_id)
+        closed += 1
     while True:
         open_lots = db.get_open_pair_lots(symbol)
         lot_total = sum(

@@ -7,6 +7,7 @@ import uvicorn
 
 from src.config import (
     AGGREGATE_TP_ENABLED,
+    BALANCE_MONITOR_REST_SEC,
     CANDLE_LIMIT,
     EXCHANGE_DISPLAY_NAME,
     GRANULARITY,
@@ -21,6 +22,7 @@ from src.config import (
     PROFIT_TARGET_PCT,
     RSI_MIN_CANDLES,
     RSI_PERIOD,
+    SPOT_SNAPSHOT_INTERVAL_SEC,
     WEB_PORT,
 )
 from src.database import init_db
@@ -114,8 +116,8 @@ def _complete_cycle(symbol: str, managed_symbols: list[str] | None = None) -> No
     set_last_cycle_at(now_str)
 
 
+_last_balance_monitor_rest_at = 0.0
 _last_spot_snapshot_at = 0.0
-_SPOT_SNAPSHOT_MIN_SEC = 3600.0
 
 
 def log_futures_balance_once(
@@ -123,7 +125,8 @@ def log_futures_balance_once(
     *,
     managed_symbols: list[str] | None = None,
 ) -> None:
-    global _last_spot_snapshot_at
+    global _last_balance_monitor_rest_at, _last_spot_snapshot_at
+
     if not has_credentials():
         logging.info(
             "  Futures balance: skipped (set BITGET_API_KEY, SECRET, PASSPHRASE in .env)"
@@ -131,7 +134,37 @@ def log_futures_balance_once(
         return
 
     try:
-        balance = fetch_futures_balance(symbol)
+        # Monitoring only — trading still uses fetch_futures_balance (WS-first).
+        # Do not REST /account every 5m cycle (stacked with reconcile → 418).
+        # Prefer WS; optional rare REST to correct dashboard drift.
+        balance = None
+        try:
+            from src.exchange import binance as binance_mod
+
+            now = time.time()
+            due_rest = (
+                BALANCE_MONITOR_REST_SEC > 0
+                and not binance_mod.is_rate_limited()
+                and (now - _last_balance_monitor_rest_at) >= BALANCE_MONITOR_REST_SEC
+            )
+            if due_rest:
+                try:
+                    balance = binance_mod.fetch_futures_balance_rest(symbol)
+                    _last_balance_monitor_rest_at = now
+                    try:
+                        from src.exchange.binance_ws.cache import CACHE
+
+                        CACHE.set_balance(balance)
+                    except Exception:  # noqa: BLE001
+                        pass
+                except binance_mod.RateLimitError as exc:
+                    logging.warning("  Futures balance REST skipped (rate limit): %s", exc)
+                except Exception as exc:  # noqa: BLE001
+                    logging.debug("  Futures balance REST failed: %s", exc)
+        except Exception:  # noqa: BLE001
+            pass
+        if balance is None:
+            balance = fetch_futures_balance(symbol)
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         logging.info(
             "  Futures balance: available=%.2f %s | equity=%.2f %s | maint=%.2f%% | initial=%.2f%%",
@@ -155,14 +188,21 @@ def log_futures_balance_once(
             balance.available,
             maint_margin_pct=balance.maint_margin_pct,
         )
-        now_mono = time.monotonic()
-        if now_mono - _last_spot_snapshot_at >= _SPOT_SNAPSHOT_MIN_SEC:
-            try:
+        try:
+            from src.exchange import binance as binance_mod
+
+            now = time.time()
+            spot_due = (
+                SPOT_SNAPSHOT_INTERVAL_SEC > 0
+                and not binance_mod.is_rate_limited()
+                and (now - _last_spot_snapshot_at) >= SPOT_SNAPSHOT_INTERVAL_SEC
+            )
+            if spot_due:
                 spot_bal = fetch_spot_balance(MARGIN_COIN)
                 db.insert_spot_snapshot(spot_bal)
-                _last_spot_snapshot_at = now_mono
-            except ExchangeClientError as exc:
-                logging.warning("  Spot balance snapshot skipped: %s", exc)
+                _last_spot_snapshot_at = now
+        except ExchangeClientError as exc:
+            logging.warning("  Spot balance snapshot skipped: %s", exc)
         refresh_margin_dashboard_fields(
             balance.available,
             balance.account_equity,

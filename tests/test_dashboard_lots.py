@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from src.web.app import (
     build_symbol_groups,
@@ -147,6 +147,29 @@ class TestBuildSymbolGroups(unittest.TestCase):
         legs = flatten_open_legs(groups)
         self.assertEqual(len(legs), 2)
         self.assertEqual({leg["symbol"] for leg in legs}, {"AAAUSDT", "ZZZUSDT"})
+
+    @patch("src.web.app.MAX_LOT_AGE_DAYS", 3.0)
+    def test_age_countdown_fields_on_lots_and_sides(self):
+        from datetime import datetime, timedelta, timezone
+
+        from src.web.app import _lot_age_fields
+
+        now = datetime(2026, 8, 7, 3, 0, tzinfo=timezone.utc)
+        opened = (now - timedelta(days=1)).isoformat()
+        age = _lot_age_fields(opened, now=now)
+        self.assertIsNotNone(age["age_deadline_at"])
+        self.assertAlmostEqual(age["age_remaining_sec"], 2 * 86400, delta=1)
+        self.assertTrue(str(age["age_countdown"]).startswith("2d"))
+
+        lots = [_lot_row(1, "BTCUSDT", opened, short_status="closed")]
+        groups = build_symbol_groups(lots, {}, {"BTCUSDT": 100.0})
+        lot = groups[0]["lots"][0]
+        self.assertIn("age_deadline_at", lot)
+        self.assertIn("age_countdown", lot)
+        sides = flatten_open_sides(groups)
+        self.assertIn("age_countdown", sides[0])
+        legs = flatten_open_legs(groups)
+        self.assertIn("age_countdown", legs[0])
 
 
 if __name__ == "__main__":

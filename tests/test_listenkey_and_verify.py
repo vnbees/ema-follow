@@ -14,37 +14,45 @@ class TestListenKeyLifecycle(unittest.TestCase):
         ws_manager._listen_key_validated = False
 
     @patch("src.exchange.binance_ws.persist.save_listen_key")
-    @patch("src.exchange.binance_ws.persist.clear_listen_key")
-    @patch("src.exchange.binance_ws.persist.load_listen_key", return_value="dead-key")
-    @patch("src.exchange.binance.is_rate_limited", return_value=False)
+    @patch("src.exchange.binance_ws.persist.load_listen_key", return_value="disk-key")
     @patch("src.exchange.binance.rate_limit_remaining_sec", return_value=0.0)
-    def test_dead_disk_key_recreates(
+    def test_disk_key_reused_without_rest_validate(
         self,
         _remaining,
-        _limited,
         _load,
-        clear_key,
         save_key,
     ):
         from src.exchange import binance as binance_mod
 
         with (
-            patch.object(
-                binance_mod,
-                "_private_request",
-                side_effect=binance_mod.NonRetriableApiError(
-                    "HTTP 400: code=-1125 msg=This listenKey does not exist."
-                ),
-            ),
-            patch.object(
-                binance_mod,
-                "_private_post",
-                return_value={"listenKey": "fresh-key"},
-            ) as post,
+            patch.object(binance_mod, "_private_request") as put,
+            patch.object(binance_mod, "_private_post") as post,
         ):
             key = ws_manager._create_listen_key()
+        self.assertEqual(key, "disk-key")
+        put.assert_not_called()
+        post.assert_not_called()
+        save_key.assert_not_called()
+        self.assertTrue(ws_manager._listen_key_validated)
+
+    @patch("src.exchange.binance_ws.persist.save_listen_key")
+    @patch("src.exchange.binance_ws.persist.load_listen_key", return_value=None)
+    @patch("src.exchange.binance.rate_limit_remaining_sec", return_value=0.0)
+    def test_missing_disk_key_creates_via_rest(
+        self,
+        _remaining,
+        _load,
+        save_key,
+    ):
+        from src.exchange import binance as binance_mod
+
+        with patch.object(
+            binance_mod,
+            "_private_post",
+            return_value={"listenKey": "fresh-key"},
+        ) as post:
+            key = ws_manager._create_listen_key()
         self.assertEqual(key, "fresh-key")
-        clear_key.assert_called()
         post.assert_called_once()
         save_key.assert_called_with("fresh-key")
         self.assertTrue(ws_manager._listen_key_validated)

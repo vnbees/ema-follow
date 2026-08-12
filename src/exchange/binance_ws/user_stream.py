@@ -11,9 +11,9 @@ from typing import Any, Callable
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from src.config import BINANCE_WS_USER_BASE, MARGIN_COIN
+from src.config import BINANCE_WS_USER_BASE
 from src.exchange.binance_ws.cache import CACHE
-from src.exchange.types import FuturesAccountBalance, PendingOrder, Position
+from src.exchange.types import PendingOrder, Position
 
 ListenKeyFactory = Callable[[], str]
 ListenKeyKeepalive = Callable[[str], None]
@@ -129,20 +129,10 @@ def apply_user_payload(payload: dict[str, Any]) -> None:
                 note_uds_position_refresh(touched)
             except Exception:  # noqa: BLE001
                 pass
-        if MARGIN_COIN in balances:
-            prev = CACHE.get_balance()
-            wallet = balances[MARGIN_COIN]
-            if prev is not None:
-                CACHE.set_balance(
-                    FuturesAccountBalance(
-                        margin_coin=prev.margin_coin,
-                        available=min(prev.available, wallet) if prev.available > 0 else wallet,
-                        account_equity=wallet if wallet > 0 else prev.account_equity,
-                        usdt_equity=wallet if wallet > 0 else prev.usdt_equity,
-                        total_maint_margin=prev.total_maint_margin,
-                        total_initial_margin=prev.total_initial_margin,
-                    )
-                )
+        # ACCOUNT_UPDATE "wb" is wallet balance, NOT margin equity / available.
+        # Overwriting those fields skewed dashboard + equity snapshots. Keep the
+        # last REST-reconciled balance; positions above are still applied.
+        _ = balances
         try:
             from src.exchange.binance_ws.persist import save_account_snapshot
 

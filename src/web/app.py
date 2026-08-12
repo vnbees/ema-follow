@@ -16,6 +16,7 @@ from src.config import (
     DASHBOARD_USERNAME,
     EXCHANGE_DISPLAY_NAME,
     MARGIN_COIN,
+    MAX_LOT_AGE_DAYS,
     MAX_OPEN_LEGS,
     MAX_OPEN_SYMBOLS,
     PAIR_PROFIT_TARGET_PCT,
@@ -373,6 +374,57 @@ def _leg_fields(
     }
 
 
+def _parse_opened_at_utc(raw) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        text = str(raw).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _format_age_countdown(remaining_sec: float | None) -> str | None:
+    if remaining_sec is None:
+        return None
+    if remaining_sec <= 0:
+        return "overdue"
+    total = int(remaining_sec)
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours}h {minutes:02d}m"
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m"
+
+
+def _lot_age_fields(opened_at_raw, *, now: datetime | None = None) -> dict:
+    """Display-only countdown until MAX_LOT_AGE_DAYS hard close (dashboard)."""
+    empty = {
+        "age_deadline_at": None,
+        "age_remaining_sec": None,
+        "age_countdown": None,
+    }
+    if MAX_LOT_AGE_DAYS <= 0:
+        return empty
+    opened = _parse_opened_at_utc(opened_at_raw)
+    if opened is None:
+        return empty
+    now_utc = now or datetime.now(timezone.utc)
+    deadline = opened + timedelta(days=MAX_LOT_AGE_DAYS)
+    remaining = (deadline - now_utc).total_seconds()
+    return {
+        "age_deadline_at": deadline.isoformat(),
+        "age_remaining_sec": remaining,
+        "age_countdown": _format_age_countdown(remaining),
+    }
+
+
 def _build_lot_detail(
     lot,
     mark: float,
@@ -388,6 +440,7 @@ def _build_lot_detail(
         if not leg["is_open"] and leg["pnl_usdt"] is not None:
             realized_total += leg["pnl_usdt"]
             has_realized = True
+    age = _lot_age_fields(lot["opened_at"])
     return {
         "lot_id": int(lot["id"]),
         "fifo_index": fifo_index,
@@ -402,6 +455,7 @@ def _build_lot_detail(
         "realized_total_usdt": realized_total if has_realized else None,
         "long": long_leg,
         "short": short_leg,
+        **age,
     }
 
 
@@ -473,6 +527,9 @@ def flatten_open_legs(symbol_groups: list[dict]) -> list[dict]:
                         "tp_ready": bool(leg.get("tp_ready")),
                         "entry_trigger": lot.get("entry_trigger") or "—",
                         "opened_at": lot.get("opened_at"),
+                        "age_deadline_at": lot.get("age_deadline_at"),
+                        "age_remaining_sec": lot.get("age_remaining_sec"),
+                        "age_countdown": lot.get("age_countdown"),
                     }
                 )
     return rows
@@ -488,6 +545,21 @@ def flatten_open_sides(symbol_groups: list[dict]) -> list[dict]:
             size = float(agg.get("size") or 0)
             if size <= 0:
                 continue
+            side_lots = [
+                lot
+                for lot in group.get("lots", [])
+                if lot.get("is_open") and (lot.get(side) or {}).get("is_open")
+            ]
+            opened_at = min(
+                (lot.get("opened_at") or "" for lot in side_lots),
+                default="",
+            )
+            # Soonest age deadline among open lots on this side (oldest lot).
+            age = _lot_age_fields(opened_at) if opened_at else {
+                "age_deadline_at": None,
+                "age_remaining_sec": None,
+                "age_countdown": None,
+            }
             rows.append(
                 {
                     "symbol": symbol,
@@ -498,19 +570,9 @@ def flatten_open_sides(symbol_groups: list[dict]) -> list[dict]:
                     "move_pct": agg.get("move_pct"),
                     "pnl_usdt": agg.get("pnl_usdt"),
                     "tp_ready": bool(agg.get("tp_ready")),
-                    "lots": [
-                        lot
-                        for lot in group.get("lots", [])
-                        if lot.get("is_open") and (lot.get(side) or {}).get("is_open")
-                    ],
-                    "opened_at": min(
-                        (
-                            lot.get("opened_at") or ""
-                            for lot in group.get("lots", [])
-                            if lot.get("is_open") and (lot.get(side) or {}).get("is_open")
-                        ),
-                        default="",
-                    ),
+                    "lots": side_lots,
+                    "opened_at": opened_at,
+                    **age,
                 }
             )
     return rows
@@ -823,6 +885,7 @@ def api_positions() -> dict:
             symbol_groups, _unrealized_map_from_groups(symbol_groups),
         ),
         "profit_target_pct": PAIR_PROFIT_TARGET_PCT,
+        "max_lot_age_days": MAX_LOT_AGE_DAYS,
         "trading_enabled": is_trading_enabled(),
         "rate_limited": rate_limited,
         "rate_limit_remaining_sec": rate_limit_remaining_sec,

@@ -3,7 +3,6 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="refresh" content="60">
   <title>{{ exchange_name }} RSI Bot</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
@@ -46,6 +45,8 @@
     .btn-close { background: #3d1214; border-color: #8b1e22; color: #f85149; }
     .btn-close:hover { background: #5a1a1d; }
     .tp-ready { color: #3fb950; font-weight: 600; }
+    .age-soon { color: #d29922; }
+    .age-overdue { color: #f85149; font-weight: 600; }
     select {
       background: #0f1117; color: #e6edf3; border: 1px solid #30363d;
       border-radius: 6px; padding: 7px 10px;
@@ -422,10 +423,7 @@
 
       loadEquity(equityRange);
       loadSpot(spotRange);
-      setInterval(() => {
-        loadEquity(equityRange);
-        loadSpot(spotRange);
-      }, 60000);
+      // No auto-refresh — use chart range buttons / page reload manually.
     })();
 
     (function () {
@@ -436,6 +434,7 @@
         pageSize: 20,
         tradingEnabled: {{ "true" if trading_enabled else "false" }},
         rateLimited: false,
+        maxLotAgeDays: 0,
         openSides: [],
         openLegs: [],
         pnlSummary: null,
@@ -464,6 +463,35 @@
       function pnlClass(n) {
         if (n == null) return "";
         return n >= 0 ? "green" : "red";
+      }
+
+      function formatAgeCountdown(deadlineAt) {
+        if (!deadlineAt || !(state.maxLotAgeDays > 0)) return "—";
+        const deadlineMs = Date.parse(deadlineAt);
+        if (Number.isNaN(deadlineMs)) return "—";
+        const remainingSec = (deadlineMs - Date.now()) / 1000;
+        if (remainingSec <= 0) return "overdue";
+        const total = Math.floor(remainingSec);
+        const days = Math.floor(total / 86400);
+        const hours = Math.floor((total % 86400) / 3600);
+        const minutes = Math.floor((total % 3600) / 60);
+        if (days > 0) return `${days}d ${hours}h ${String(minutes).padStart(2, "0")}m`;
+        if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+        return `${minutes}m`;
+      }
+
+      function ageClass(deadlineAt) {
+        if (!deadlineAt || !(state.maxLotAgeDays > 0)) return "meta";
+        const remainingSec = (Date.parse(deadlineAt) - Date.now()) / 1000;
+        if (Number.isNaN(remainingSec)) return "meta";
+        if (remainingSec <= 0) return "age-overdue";
+        if (remainingSec <= 6 * 3600) return "age-soon";
+        return "meta";
+      }
+
+      function ageCell(deadlineAt) {
+        const text = formatAgeCountdown(deadlineAt);
+        return `<td class="${ageClass(deadlineAt)}" data-age-deadline="${deadlineAt || ""}">${text}</td>`;
       }
 
       function canClose() {
@@ -547,11 +575,11 @@
       function renderPositionView(pageRows) {
         el.head.innerHTML = `<tr>
           <th>Symbol</th><th>Side</th><th>Size</th><th>DB avg</th><th>Mark</th>
-          <th>Move %</th><th>PnL</th><th>TP</th><th></th>
+          <th>Move %</th><th>PnL</th><th>TP</th><th>Đóng sau (3d)</th><th></th>
         </tr>`;
         el.body.innerHTML = "";
         if (!pageRows.length) {
-          el.body.innerHTML = `<tr><td colspan="9" class="empty">Không có vị thế mở.</td></tr>`;
+          el.body.innerHTML = `<tr><td colspan="10" class="empty">Không có vị thế mở.</td></tr>`;
           return;
         }
         for (const sideRow of pageRows) {
@@ -565,6 +593,7 @@
             <td class="${pnlClass(sideRow.move_pct)}">${sideRow.move_pct == null ? "—" : fmt(sideRow.move_pct, 2) + "%"}</td>
             <td class="${pnlClass(sideRow.pnl_usdt)}">${sideRow.pnl_usdt == null ? "—" : fmt(sideRow.pnl_usdt, 2)}</td>
             <td class="${sideRow.tp_ready ? "tp-ready" : "meta"}">${sideRow.tp_ready ? "ready" : "—"}</td>
+            ${ageCell(sideRow.age_deadline_at)}
             <td></td>`;
           tr.lastElementChild.appendChild(
             closeBtn("Đóng side", () => closeSide(sideRow.symbol, sideRow.side, sideRow.size)),
@@ -585,6 +614,7 @@
               <td class="${pnlClass(leg.move_pct)}">${leg.move_pct == null ? "—" : fmt(leg.move_pct, 2) + "%"}</td>
               <td class="${pnlClass(leg.pnl_usdt)}">${leg.pnl_usdt == null ? "—" : fmt(leg.pnl_usdt, 2)}</td>
               <td class="${leg.tp_ready ? "tp-ready" : "meta"}">${leg.tp_ready ? "ready" : "—"}</td>
+              ${ageCell(lot.age_deadline_at)}
               <td></td>`;
             nest.lastElementChild.appendChild(
               closeBtn("Đóng leg", () =>
@@ -599,11 +629,12 @@
       function renderLegView(pageRows) {
         el.head.innerHTML = `<tr>
           <th>Symbol</th><th>Side</th><th>Lot</th><th>Size</th><th>Entry</th>
-          <th>Mark</th><th>Move %</th><th>PnL</th><th>TP</th><th>Trigger</th><th></th>
+          <th>Mark</th><th>Move %</th><th>PnL</th><th>TP</th><th>Trigger</th>
+          <th>Đóng sau (3d)</th><th></th>
         </tr>`;
         el.body.innerHTML = "";
         if (!pageRows.length) {
-          el.body.innerHTML = `<tr><td colspan="11" class="empty">Không có leg mở.</td></tr>`;
+          el.body.innerHTML = `<tr><td colspan="12" class="empty">Không có leg mở.</td></tr>`;
           return;
         }
         for (const row of pageRows) {
@@ -619,6 +650,7 @@
             <td class="${pnlClass(row.pnl_usdt)}">${row.pnl_usdt == null ? "—" : fmt(row.pnl_usdt, 2)}</td>
             <td class="${row.tp_ready ? "tp-ready" : "meta"}">${row.tp_ready ? "ready" : "—"}</td>
             <td class="meta">${row.entry_trigger || "—"}</td>
+            ${ageCell(row.age_deadline_at)}
             <td></td>`;
           tr.lastElementChild.appendChild(
             closeBtn("Đóng", () => closeLeg(row.lot_id, row.side, row.symbol, row.size)),
@@ -638,9 +670,18 @@
         el.summary.textContent =
           `Open lots: ${s.open_count ?? 0} · symbols: ${s.open_symbols ?? 0} · ` +
           `legs: ${s.open_legs ?? 0} · unrealized≈${fmt(s.open_unrealized, 2)} USDT` +
-          (state.rateLimited ? " · RATE-LIMITED" : "");
+          (state.rateLimited ? " · RATE-LIMITED" : "") +
+          " · bấm Refresh để cập nhật";
         if (state.group === "leg") renderLegView(page.rows);
         else renderPositionView(page.rows);
+      }
+
+      function tickAgeCountdowns() {
+        el.body.querySelectorAll("[data-age-deadline]").forEach((td) => {
+          const deadline = td.getAttribute("data-age-deadline") || "";
+          td.textContent = formatAgeCountdown(deadline);
+          td.className = ageClass(deadline);
+        });
       }
 
       async function loadPositions() {
@@ -653,6 +694,7 @@
           state.pnlSummary = data.pnl_summary || null;
           state.tradingEnabled = !!data.trading_enabled;
           state.rateLimited = !!data.rate_limited;
+          state.maxLotAgeDays = Number(data.max_lot_age_days) || 0;
           el.tradingPill.textContent = `Trading: ${state.tradingEnabled ? "ON" : "OFF"}`;
           el.tradingPill.className = `status-pill ${state.tradingEnabled ? "running" : "stopped"}`;
           if (state.rateLimited) {
@@ -663,7 +705,7 @@
           }
           render();
         } catch (err) {
-          el.body.innerHTML = `<tr><td colspan="11" class="empty">Lỗi tải vị thế: ${err.message}</td></tr>`;
+          el.body.innerHTML = `<tr><td colspan="12" class="empty">Lỗi tải vị thế: ${err.message}</td></tr>`;
         }
       }
 
@@ -693,7 +735,8 @@
       el.refresh.addEventListener("click", () => loadPositions());
 
       loadPositions();
-      setInterval(loadPositions, 60000);
+      // Local clock only — does not re-fetch /api/positions.
+      setInterval(tickAgeCountdowns, 30000);
     })();
   </script>
 </body>

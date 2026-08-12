@@ -180,6 +180,10 @@ BINANCE_WS_KLINE_SILENCE_SEC = float(os.getenv("BINANCE_WS_KLINE_SILENCE_SEC", "
 BINANCE_CANDLE_REST_SEC = float(os.getenv("BINANCE_CANDLE_REST_SEC", "45"))
 # Stagger between REST kline calls in a cycle.
 BINANCE_CANDLE_REST_STAGGER_SEC = float(os.getenv("BINANCE_CANDLE_REST_STAGGER_SEC", "0.15"))
+# Monitoring-only: min seconds between forced /fapi/v2/account REST (0 = never force; WS-first).
+BALANCE_MONITOR_REST_SEC = float(os.getenv("BALANCE_MONITOR_REST_SEC", "900"))
+# Monitoring-only: min seconds between spot snapshot REST (spot has no UDS).
+SPOT_SNAPSHOT_INTERVAL_SEC = float(os.getenv("SPOT_SNAPSHOT_INTERVAL_SEC", "900"))
 
 SPOT_TRANSFER_ENABLED = os.getenv("SPOT_TRANSFER_ENABLED", "true").lower() in ("1", "true", "yes")
 SPOT_TRANSFER_PCT = float(os.getenv("SPOT_TRANSFER_PCT", "1"))

@@ -153,7 +153,10 @@ def _run_once() -> None:
                     # Re-check BE after TP (lot may still be open / newly at BE).
                     be_took = _scan_breakeven_closes(symbol, mark)
             except ExchangeClientError as exc:
-                logging.warning("  [%s] Realtime TP/BE failed: %s", symbol, exc)
+                if isinstance(exc, AlreadyFlatError) or _is_already_flat_error(exc):
+                    logging.info("  [%s] Realtime TP/BE already flat: %s", symbol, exc)
+                else:
+                    logging.warning("  [%s] Realtime TP/BE failed: %s", symbol, exc)
                 continue
         if took:
             with _lock:

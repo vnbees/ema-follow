@@ -110,50 +110,22 @@ def _bootstrap_candles_rest(symbol: str, interval: str) -> None:
 
 
 def _create_listen_key() -> str:
-    """Reuse persisted listenKey when valid; recreate after -1125 / expiry.
+    """Reuse persisted listenKey; create via REST only when disk has none.
 
-    Disk reuse avoids REST create during IP bans, but a dead key must be cleared
-    or every reconnect burns weight retrying keepalive on the same invalid key.
+    Never REST-validate on boot/deploy — PUT validate was hitting HTTP 418 and
+    writing a multi-hour IP cooldown after every railway up. Dead keys are
+    cleared by keepalive -1125 or listenKeyExpired on the user stream.
     """
     global _listen_key_validated
     from src.exchange import binance as binance_mod
-    from src.exchange.binance_ws.persist import clear_listen_key, load_listen_key, save_listen_key
+    from src.exchange.binance_ws.persist import load_listen_key, save_listen_key
 
     existing = load_listen_key()
-    if existing and _listen_key_validated:
-        return existing
-
-    if existing and binance_mod.is_rate_limited():
-        # Cannot validate via REST; reuse and hope WS still accepts the key.
-        logging.info("Binance listenKey reused from disk during rate-limit (skip validate)")
-        return existing
-
     if existing:
-        try:
-            CACHE.bump_rest("listenKey_validate")
-            # Single attempt — dead keys must not burn 3× PUT weight.
-            binance_mod._private_request(
-                "PUT",
-                "/fapi/v1/listenKey",
-                {"listenKey": existing},
-                max_retries=1,
-            )
+        if not _listen_key_validated:
             _listen_key_validated = True
-            logging.info("Binance listenKey validated from disk")
-            return existing
-        except binance_mod.RateLimitError:
-            logging.info("Binance listenKey reused from disk (validate skipped — rate-limit)")
-            return existing
-        except Exception as exc:  # noqa: BLE001
-            detail = str(exc)
-            if "-1125" in detail or "listenKey" in detail.lower():
-                logging.warning("Binance listenKey on disk is dead (%s) — recreating", detail)
-                clear_listen_key()
-                _listen_key_validated = False
-            else:
-                logging.warning("Binance listenKey validate failed (%s) — recreating", detail)
-                clear_listen_key()
-                _listen_key_validated = False
+            logging.info("Binance listenKey reused from disk (no REST validate)")
+        return existing
 
     remaining = binance_mod.rate_limit_remaining_sec()
     if remaining > 0:

@@ -359,7 +359,12 @@ class TestUserDataParsers(unittest.TestCase):
         bal = CACHE.get_balance()
         self.assertIsNotNone(bal)
         assert bal is not None
+        # UDS wb must not overwrite REST equity/available (wallet ≠ margin balance).
+        self.assertEqual(bal.available, 500)
+        self.assertEqual(bal.account_equity, 1000)
+        self.assertEqual(bal.usdt_equity, 1000)
         self.assertEqual(bal.total_maint_margin, 10)
+        self.assertEqual(bal.total_initial_margin, 20)
 
 
 class TestWsFetchFallback(unittest.TestCase):
