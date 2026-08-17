@@ -451,6 +451,8 @@ def ensure_protective_orders(trade) -> None:
     trade_id = int(trade["id"])
     sl_id = str(trade["sl_order_id"] or "")
     tp_id = str(trade["tp_order_id"] or "")
+    if sl_id and tp_id:
+        return
     sl_client = f"ersl{trade_id}"
     tp_client = f"ertp{trade_id}"
     on_exchange = _open_algo_ids_by_client(symbol)
@@ -505,12 +507,30 @@ def ensure_protective_orders(trade) -> None:
 
 def reconcile_protective_orders() -> None:
     """Ensure every open trade has SL/TP on exchange (DB ids may be missing)."""
+    try:
+        from src.config import EXCHANGE
+        from src.exchange import binance as binance_mod
+
+        if EXCHANGE == "binance" and binance_mod.is_optional_rest_blocked():
+            logging.debug("EMA-RSI protective reconcile skipped — REST cooldown")
+            return
+    except Exception:  # noqa: BLE001
+        pass
     for trade in store.get_open_trades():
         ensure_protective_orders(trade)
 
 
 def reconcile_orphan_positions() -> None:
     """Re-adopt exchange positions that were wrongly marked closed in DB."""
+    try:
+        from src.config import EXCHANGE
+        from src.exchange import binance as binance_mod
+
+        if EXCHANGE == "binance" and binance_mod.is_optional_rest_blocked():
+            logging.debug("EMA-RSI orphan reconcile skipped — REST cooldown")
+            return
+    except Exception:  # noqa: BLE001
+        pass
     try:
         positions = fetch_all_open_positions()
     except ExchangeClientError as exc:

@@ -170,13 +170,23 @@ def _maybe_clear_stale_rate_limit() -> None:
         logging.debug("Binance cooldown clear skipped: %s", exc)
 
 
+_first_cycle = True
+
+
 def run_cycle() -> None:
+    global _first_cycle
     ranked = refresh_volume_rank(max_age_sec=BINANCE_VOLUME_RANK_REST_SEC)
     open_rows = store.get_open_trades()
     open_symbols = [str(row["symbol"]) for row in open_rows]
     _sync_watched(open_symbols, ranked)
-    reconcile_orphan_positions()
-    reconcile_protective_orders()
+    if _first_cycle:
+        logging.info(
+            "First cycle — skip REST orphan/protective reconcile (WS-only boot)"
+        )
+        _first_cycle = False
+    else:
+        reconcile_orphan_positions()
+        reconcile_protective_orders()
     reconcile_open_trades()
 
     occupied = occupied_symbols()
