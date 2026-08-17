@@ -1,1 +1,1 @@
-web: python -m src.main
+web: sh start.sh

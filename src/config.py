@@ -7,7 +7,8 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 LOG_DIR = BASE_DIR / "logs"
-DATABASE_PATH = BASE_DIR / os.getenv("DATABASE_PATH", "data/bot.db")
+_db_env = os.getenv("DATABASE_PATH", "data/bot.db")
+DATABASE_PATH = Path(_db_env).expanduser() if os.path.isabs(_db_env) else BASE_DIR / _db_env
 
 DEFAULT_SYMBOL = os.getenv("SYMBOL", "SUIUSDT")
 SYMBOL = DEFAULT_SYMBOL
