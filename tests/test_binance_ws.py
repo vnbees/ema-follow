@@ -407,11 +407,13 @@ class TestRateLimitPersist(unittest.TestCase):
             try:
                 binance._RATE_LIMIT_FILE = path
                 binance._rate_limited_until_ms = 0.0
-                binance._set_rate_limited_until(until)
+                binance._set_rate_limited_until(until, kind="padded")
                 self.assertTrue(path.is_file())
                 binance._rate_limited_until_ms = 0.0
+                binance._rate_limit_kind = "ban"
                 binance._load_persisted_rate_limit()
                 self.assertGreater(binance.rate_limit_remaining_sec(), 60.0)
+                self.assertEqual(binance._rate_limit_kind, "padded")
             finally:
                 binance._RATE_LIMIT_FILE = old
                 binance._rate_limited_until_ms = old_until
@@ -447,13 +449,15 @@ class TestPostOrderReconcileDebounce(unittest.TestCase):
             self.mgr.on_order_placed("ETHUSDT")
             mock_rec.assert_not_called()
             self.assertTrue(self.mgr.pending_reconcile())
-            used_rest = self.mgr.flush_pending_reconcile(wait_uds_sec=0.0)
+            with patch.object(self.mgr, "_reconcile_symbols_rest", return_value=True) as mock_sym:
+                used_rest = self.mgr.flush_pending_reconcile(wait_uds_sec=0.0)
             self.assertTrue(used_rest)
-            mock_rec.assert_called_once_with(force=True)
+            mock_rec.assert_not_called()
+            mock_sym.assert_called_once()
             self.assertFalse(self.mgr.pending_reconcile())
             # Second flush is no-op
             self.mgr.flush_pending_reconcile(wait_uds_sec=0.0)
-            mock_rec.assert_called_once()
+            mock_sym.assert_called_once()
 
     def test_uds_fresh_skips_rest_reconcile(self) -> None:
         from src.exchange.binance_ws.cache import _now
@@ -615,8 +619,8 @@ class TestBootReconcileSkip(unittest.TestCase):
         )
         CACHE.mark_reconciled()
         with (
-            patch("src.exchange.binance.is_rate_limited", return_value=True),
-            patch("src.exchange.binance.rate_limit_remaining_sec", return_value=120.0),
+            patch("src.exchange.binance.is_optional_rest_blocked", return_value=True),
+            patch("src.exchange.binance.optional_rest_blocked_sec", return_value=120.0),
             patch.object(self.mgr, "reconcile_account_state") as mock_rec,
         ):
             self.mgr._on_user_stream_connected()
@@ -641,7 +645,7 @@ class TestBootReconcileSkip(unittest.TestCase):
             self.mgr._on_user_stream_connected()  # first: skip REST
             self.mgr._on_user_stream_connected()  # reconnect: REST once
             self.assertEqual(mock_rec.call_count, 1)
-            mock_rec.assert_called_with(force=True)
+            mock_rec.assert_called_with(force=False)
 
     def test_positions_fresh_while_uds_alive(self) -> None:
         from src.exchange.binance_ws.cache import _now

@@ -3,8 +3,9 @@ import re
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import requests
 
@@ -19,6 +20,10 @@ from src.config import (
     LEVERAGE,
     MARGIN_COIN,
     MARGIN_MODE,
+    REST_BAN_GRACE_SEC,
+    REST_BAN_RESUME_GAP_SEC,
+    REST_BAN_RESUME_SEC,
+    REST_SERIAL_GAP_SEC,
     SYMBOL,
 )
 from src.exchange.binance_auth import auth_headers, signed_params
@@ -47,6 +52,9 @@ _volume_rank_rest_cache: list[tuple[str, float]] = []
 _candle_rest_at_mono: dict[str, float] = {}
 _candle_rest_lock = threading.Lock()
 _last_candle_rest_mono: float = 0.0
+_pending_orders_rest_lock = threading.Lock()
+_pending_orders_rest_at_mono: dict[str, float] = {}
+_pending_orders_rest_cache: dict[str, list[PendingOrder]] = {}
 
 
 def _invalidate_position_cache(symbol: str | None = None) -> None:
@@ -128,33 +136,80 @@ class NonRetriableApiError(ExchangeClientError):
 # Persisted across restarts so redeploy does not re-hit a banned IP (extends bans).
 _rate_limit_lock = threading.Lock()
 _rate_limited_until_ms = 0.0
+# "ban" = Binance 418/429 (may be unpadded legacy file)
+# "padded" = already includes REST_BAN_GRACE_SEC
+# "grace" = local quiet window after a legacy ban expired
+# "resume" = optional REST blocked; critical REST single-flight + gap
+_rate_limit_kind = "ban"
+_RATE_LIMIT_KINDS = ("ban", "padded", "grace", "resume")
 _RATE_LIMIT_FILE = Path(DATABASE_PATH).expanduser().resolve().parent / "binance_rate_limit_until_ms"
+_rest_http_lock = threading.Lock()
+_last_rest_at = 0.0
 
 
 def _now_ms() -> float:
     return time.time() * 1000
 
 
+def _grace_ms() -> float:
+    return max(0.0, float(REST_BAN_GRACE_SEC)) * 1000.0
+
+
+def _resume_ms() -> float:
+    return max(0.0, float(REST_BAN_RESUME_SEC)) * 1000.0
+
+
+def _serial_gap_sec() -> float:
+    return max(0.0, float(REST_SERIAL_GAP_SEC))
+
+
+def _resume_gap_sec() -> float:
+    return max(_serial_gap_sec(), float(REST_BAN_RESUME_GAP_SEC))
+
+
+def _infer_rest_priority(method: str, path: str) -> str:
+    """POST orders + positionRisk are critical; GET order query is optional (fill poll).
+
+    Fill-poll GET /order after every market fill was re-triggering 418 on shared
+    Railway IPs during REST resume — keep place/cancel critical, query optional.
+    """
+    p = (path or "").split("?")[0].rstrip("/")
+    method_u = (method or "GET").upper()
+    if p.endswith("/order") or p.endswith("/batchOrders"):
+        if method_u == "GET":
+            return "optional"
+        return "critical"
+    if p.endswith("/positionRisk"):
+        return "critical"
+    return "optional"
+
+
 def _load_persisted_rate_limit() -> None:
-    global _rate_limited_until_ms
+    global _rate_limited_until_ms, _rate_limit_kind
     try:
         if not _RATE_LIMIT_FILE.is_file():
             return
-        until_ms = float(_RATE_LIMIT_FILE.read_text(encoding="utf-8").strip())
+        raw = _RATE_LIMIT_FILE.read_text(encoding="utf-8").strip()
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        until_ms = float(lines[0])
+        kind = lines[1] if len(lines) > 1 else "ban"
+        if kind not in _RATE_LIMIT_KINDS:
+            kind = "ban"
     except (OSError, ValueError):
         return
     if until_ms > _now_ms():
         with _rate_limit_lock:
             if until_ms > _rate_limited_until_ms:
                 _rate_limited_until_ms = until_ms
+                _rate_limit_kind = kind
         # Do not logging.warning here — import-time logging freezes root at WARNING
         # and hides all INFO (Bot started / market WS) until force=True basicConfig.
 
 
-def _persist_rate_limit(until_ms: float) -> None:
+def _persist_rate_limit(until_ms: float, kind: str = "padded") -> None:
     try:
         _RATE_LIMIT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _RATE_LIMIT_FILE.write_text(str(int(until_ms)), encoding="utf-8")
+        _RATE_LIMIT_FILE.write_text(f"{int(until_ms)}\n{kind}\n", encoding="utf-8")
     except OSError as exc:
         logging.debug("Binance rate-limit persist failed: %s", exc)
 
@@ -167,44 +222,147 @@ def _clear_persisted_rate_limit() -> None:
         pass
 
 
-def _set_rate_limited_until(until_ms: float) -> None:
-    global _rate_limited_until_ms
+def _set_rate_limited_until(until_ms: float, *, kind: str = "padded") -> None:
+    global _rate_limited_until_ms, _rate_limit_kind
     with _rate_limit_lock:
         if until_ms > _rate_limited_until_ms:
             _rate_limited_until_ms = until_ms
+            _rate_limit_kind = kind
             logging.warning(
-                "Binance rate limited — pausing REST calls for %.0fs",
+                "Binance rate limited — pausing REST calls for %.0fs (%s)",
                 max(0.0, until_ms - _now_ms()) / 1000,
+                kind,
             )
-            _persist_rate_limit(until_ms)
+            _persist_rate_limit(until_ms, kind)
 
 
-def _check_rate_limit_pause() -> None:
-    global _rate_limited_until_ms
+def _snapshot_rate_limit() -> tuple[float, str]:
     with _rate_limit_lock:
-        until_ms = _rate_limited_until_ms
-    if _now_ms() < until_ms:
-        remaining = (until_ms - _now_ms()) / 1000
-        raise RateLimitError(
-            f"Rate-limit cooldown active — {remaining:.0f}s remaining, request skipped"
-        )
-    # Ban expired — drop stale file so next boot stays clean.
-    if until_ms > 0 and _now_ms() >= until_ms:
+        return _rate_limited_until_ms, _rate_limit_kind
+
+
+def is_rest_resume() -> bool:
+    until_ms, kind = _snapshot_rate_limit()
+    return kind == "resume" and _now_ms() < until_ms
+
+
+def _check_rate_limit_pause(
+    method: str = "GET",
+    path: str = "",
+    *,
+    priority: str | None = None,
+) -> None:
+    """Fail-fast during ban/grace; during resume skip optional REST.
+
+    Expired windows transition under the lock and re-evaluate — never `return`
+    so a second thread cannot slip through and burst REST with the first.
+    """
+    global _rate_limited_until_ms, _rate_limit_kind
+    pri = priority or _infer_rest_priority(method, path)
+    grace = _grace_ms()
+    resume = _resume_ms()
+
+    while True:
+        until_ms, kind = _snapshot_rate_limit()
+        now = _now_ms()
+
+        if until_ms <= 0:
+            return
+
+        if now < until_ms:
+            if kind == "resume":
+                if pri != "critical":
+                    remaining = (until_ms - now) / 1000
+                    raise RateLimitError(
+                        f"REST resume — optional {method} {path or 'request'} skipped, "
+                        f"{remaining:.0f}s remaining"
+                    )
+                return
+            remaining = (until_ms - now) / 1000
+            raise RateLimitError(
+                f"Rate-limit cooldown active — {remaining:.0f}s remaining, request skipped"
+            )
+
         with _rate_limit_lock:
-            if _rate_limited_until_ms == until_ms:
-                _rate_limited_until_ms = 0.0
+            if _rate_limited_until_ms != until_ms:
+                continue
+            if kind == "ban" and grace > 0:
+                grace_until = _now_ms() + grace
+                _rate_limited_until_ms = grace_until
+                _rate_limit_kind = "grace"
+                _persist_rate_limit(grace_until, "grace")
+                logging.warning(
+                    "Binance REST post-ban grace — pausing extra %.0fs before REST",
+                    grace / 1000,
+                )
+                raise RateLimitError(
+                    f"Rate-limit cooldown active — {grace / 1000:.0f}s remaining, request skipped"
+                )
+            if kind in ("padded", "grace") and resume > 0:
+                resume_until = _now_ms() + resume
+                _rate_limited_until_ms = resume_until
+                _rate_limit_kind = "resume"
+                _persist_rate_limit(resume_until, "resume")
+                logging.warning(
+                    "Binance REST resume — optional REST blocked %.0fs; "
+                    "orders single-flight + %.0fs gap",
+                    resume / 1000,
+                    _resume_gap_sec(),
+                )
+                continue
+            _rate_limited_until_ms = 0.0
+            _rate_limit_kind = "ban"
         _clear_persisted_rate_limit()
 
 
 def rate_limit_remaining_sec() -> float:
-    """Seconds left in local 418/429 cooldown (0 if clear)."""
-    with _rate_limit_lock:
-        until_ms = _rate_limited_until_ms
+    """Hard 418/429 cooldown remaining (0 during resume — orders may proceed)."""
+    until_ms, kind = _snapshot_rate_limit()
+    if kind == "resume":
+        return 0.0
+    return max(0.0, (until_ms - _now_ms()) / 1000)
+
+
+def optional_rest_blocked_sec() -> float:
+    """Seconds until listenKey/income/account/klines REST is allowed (includes resume)."""
+    until_ms, _kind = _snapshot_rate_limit()
     return max(0.0, (until_ms - _now_ms()) / 1000)
 
 
 def is_rate_limited() -> bool:
     return rate_limit_remaining_sec() > 0
+
+
+def is_optional_rest_blocked() -> bool:
+    return optional_rest_blocked_sec() > 0
+
+
+def _sleep_rest_gap() -> None:
+    gap = _resume_gap_sec() if is_rest_resume() else _serial_gap_sec()
+    if gap <= 0 or _last_rest_at <= 0:
+        return
+    wait = _last_rest_at + gap - time.time()
+    if wait > 0:
+        time.sleep(wait)
+
+
+@contextmanager
+def _rest_slot(
+    method: str,
+    path: str,
+    *,
+    priority: str | None = None,
+) -> Iterator[None]:
+    """One in-flight Binance REST at a time; re-check cooldown after the lock."""
+    global _last_rest_at
+    _check_rate_limit_pause(method, path, priority=priority)
+    with _rest_http_lock:
+        _check_rate_limit_pause(method, path, priority=priority)
+        _sleep_rest_gap()
+        try:
+            yield
+        finally:
+            _last_rest_at = time.time()
 
 
 _load_persisted_rate_limit()
@@ -229,7 +387,9 @@ def _handle_rate_limit_response(response: requests.Response) -> None:
     if until_ms <= _now_ms():
         # No usable hint: back off for a full minute (weight window).
         until_ms = _now_ms() + 60_000
-    _set_rate_limited_until(until_ms)
+    # Pad past Binance's "banned until" — probing at the exact timestamp re-triggers 418.
+    until_ms += _grace_ms()
+    _set_rate_limited_until(until_ms, kind="padded")
     raise RateLimitError(f"HTTP {response.status_code}: {detail}")
 
 
@@ -237,10 +397,10 @@ def _public_get(path: str, params: dict[str, str], max_retries: int = 3) -> Any:
     url = f"{BINANCE_API_BASE}{path}"
     last_error: Exception | None = None
     for attempt in range(max_retries):
-        _check_rate_limit_pause()
         try:
-            response = requests.get(url, params=params, timeout=10)
-            _handle_rate_limit_response(response)
+            with _rest_slot("GET", path):
+                response = requests.get(url, params=params, timeout=10)
+                _handle_rate_limit_response(response)
             if not response.ok:
                 detail = _parse_api_error(response)
                 if _is_non_retriable_client_error(response.status_code, detail):
@@ -261,25 +421,27 @@ def _private_request(
     path: str,
     params: dict[str, str | int | float | bool],
     max_retries: int = 3,
+    *,
+    priority: str | None = None,
 ) -> Any:
     _ensure_credentials()
     url = f"{BINANCE_API_BASE}{path}"
     headers = auth_headers(BINANCE_API_KEY)
     last_error: Exception | None = None
     for attempt in range(max_retries):
-        _check_rate_limit_pause()
         # Re-sign each attempt so timestamp stays inside recvWindow after backoff sleeps.
         signed = signed_params(BINANCE_API_KEY, BINANCE_SECRET_KEY, params)
         try:
-            if method == "GET":
-                response = requests.get(url, params=signed, headers=headers, timeout=10)
-            elif method == "PUT":
-                response = requests.put(url, params=signed, headers=headers, timeout=10)
-            elif method == "DELETE":
-                response = requests.delete(url, params=signed, headers=headers, timeout=10)
-            else:
-                response = requests.post(url, params=signed, headers=headers, timeout=10)
-            _handle_rate_limit_response(response)
+            with _rest_slot(method, path, priority=priority):
+                if method == "GET":
+                    response = requests.get(url, params=signed, headers=headers, timeout=10)
+                elif method == "PUT":
+                    response = requests.put(url, params=signed, headers=headers, timeout=10)
+                elif method == "DELETE":
+                    response = requests.delete(url, params=signed, headers=headers, timeout=10)
+                else:
+                    response = requests.post(url, params=signed, headers=headers, timeout=10)
+                _handle_rate_limit_response(response)
             if not response.ok:
                 detail = _parse_api_error(response)
                 if _is_non_retriable_client_error(response.status_code, detail):
@@ -290,19 +452,31 @@ def _private_request(
             return response.json()
         except (RateLimitError, NonRetriableApiError):
             raise
-        except (requests.RequestException, ExchangeClientError, ValueError) as exc:
-            last_error = exc
+        except (requests.RequestException, ExchangeClientError, ValueError) as err:
+            last_error = err
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
     raise ExchangeClientError(f"{method} {path} failed after {max_retries} attempts: {last_error}")
 
 
-def _private_get(path: str, params: dict[str, str | int | float | bool], max_retries: int = 3) -> Any:
-    return _private_request("GET", path, params, max_retries=max_retries)
+def _private_get(
+    path: str,
+    params: dict[str, str | int | float | bool],
+    max_retries: int = 3,
+    *,
+    priority: str | None = None,
+) -> Any:
+    return _private_request("GET", path, params, max_retries=max_retries, priority=priority)
 
 
-def _private_post(path: str, params: dict[str, str | int | float | bool], max_retries: int = 3) -> Any:
-    return _private_request("POST", path, params, max_retries=max_retries)
+def _private_post(
+    path: str,
+    params: dict[str, str | int | float | bool],
+    max_retries: int = 3,
+    *,
+    priority: str | None = None,
+) -> Any:
+    return _private_request("POST", path, params, max_retries=max_retries, priority=priority)
 
 
 def _spot_private_request(
@@ -316,14 +490,14 @@ def _spot_private_request(
     headers = auth_headers(BINANCE_API_KEY)
     last_error: Exception | None = None
     for attempt in range(max_retries):
-        _check_rate_limit_pause()
         signed = signed_params(BINANCE_API_KEY, BINANCE_SECRET_KEY, params)
         try:
-            if method == "GET":
-                response = requests.get(url, params=signed, headers=headers, timeout=10)
-            else:
-                response = requests.post(url, params=signed, headers=headers, timeout=10)
-            _handle_rate_limit_response(response)
+            with _rest_slot(method, path, priority="optional"):
+                if method == "GET":
+                    response = requests.get(url, params=signed, headers=headers, timeout=10)
+                else:
+                    response = requests.post(url, params=signed, headers=headers, timeout=10)
+                _handle_rate_limit_response(response)
             if not response.ok:
                 detail = _parse_api_error(response)
                 if _is_non_retriable_client_error(response.status_code, detail):
@@ -334,8 +508,8 @@ def _spot_private_request(
             return response.json()
         except (RateLimitError, NonRetriableApiError):
             raise
-        except (requests.RequestException, ExchangeClientError, ValueError) as exc:
-            last_error = exc
+        except (requests.RequestException, ExchangeClientError, ValueError) as err:
+            last_error = err
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
     raise ExchangeClientError(f"{method} {path} failed after {max_retries} attempts: {last_error}")
@@ -835,7 +1009,7 @@ def fetch_all_open_positions_rest() -> list[Position]:
         if _positions_all is not None and now - _positions_all[0] < _REST_CACHE_TTL_MS:
             return list(_positions_all[1])
 
-    rows = _private_get("/fapi/v2/positionRisk", {})
+    rows = _private_get("/fapi/v2/positionRisk", {}, priority="optional")
     positions: list[Position] = []
     by_symbol: dict[str, dict[str, Position]] = {}
     if isinstance(rows, list):
@@ -928,9 +1102,16 @@ def fetch_order_detail(symbol: str, order_id: str) -> dict:
                 return cached
     except Exception:  # noqa: BLE001
         pass
+    # Never hit GET /order during ban/resume — that path re-banned the shared IP.
+    if is_optional_rest_blocked():
+        raise RateLimitError(
+            "REST resume/ban — optional GET /fapi/v1/order skipped "
+            f"({optional_rest_blocked_sec():.0f}s remaining)"
+        )
     data = _private_get(
         "/fapi/v1/order",
         {"symbol": symbol.upper(), "orderId": order_id},
+        priority="optional",
     )
     status = str(data.get("status", "")).lower()
     avg_price = data.get("avgPrice")
@@ -944,6 +1125,11 @@ def fetch_order_detail(symbol: str, order_id: str) -> dict:
 
 
 def fetch_pending_orders(symbol: str) -> list[PendingOrder]:
+    """LIMIT orders for dashboard/status. Not on the RSI market-order trade path.
+
+    Prefer UDS cache (empty list when none). REST openOrders is throttled and
+    skipped during ban/resume — never once-per-symbol every 5m cycle.
+    """
     try:
         from src.exchange.binance_ws import get_pending_from_ws
 
@@ -952,9 +1138,22 @@ def fetch_pending_orders(symbol: str) -> list[PendingOrder]:
             return cached
     except Exception:  # noqa: BLE001
         pass
-    rows = _private_get("/fapi/v1/openOrders", {"symbol": symbol.upper()})
-    if not isinstance(rows, list):
+
+    if is_optional_rest_blocked():
         return []
+
+    from src.config import PENDING_ORDERS_REST_SEC
+
+    symbol_u = symbol.upper()
+    now = time.monotonic()
+    with _pending_orders_rest_lock:
+        last = _pending_orders_rest_at_mono.get(symbol_u, 0.0)
+        if last > 0 and (now - last) < PENDING_ORDERS_REST_SEC:
+            return list(_pending_orders_rest_cache.get(symbol_u, []))
+
+    rows = _private_get("/fapi/v1/openOrders", {"symbol": symbol_u}, priority="optional")
+    if not isinstance(rows, list):
+        rows = []
     orders: list[PendingOrder] = []
     for item in rows:
         if str(item.get("type", "")).upper() != "LIMIT":
@@ -968,6 +1167,9 @@ def fetch_pending_orders(symbol: str) -> list[PendingOrder]:
                 size=float(item.get("origQty", 0)),
             )
         )
+    with _pending_orders_rest_lock:
+        _pending_orders_rest_at_mono[symbol_u] = time.monotonic()
+        _pending_orders_rest_cache[symbol_u] = list(orders)
     return orders
 
 

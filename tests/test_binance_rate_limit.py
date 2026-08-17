@@ -19,9 +19,13 @@ def _response(status_code: int, payload: dict, headers: dict | None = None) -> M
 class TestBinanceRateLimit(unittest.TestCase):
     def setUp(self) -> None:
         binance._rate_limited_until_ms = 0.0
+        binance._rate_limit_kind = "ban"
+        binance._last_rest_at = 0.0
 
     def tearDown(self) -> None:
         binance._rate_limited_until_ms = 0.0
+        binance._rate_limit_kind = "ban"
+        binance._last_rest_at = 0.0
 
     def test_418_ban_no_retry_and_cooldown(self) -> None:
         banned_until = int((time.time() + 300) * 1000)
@@ -34,10 +38,12 @@ class TestBinanceRateLimit(unittest.TestCase):
                 binance._public_get("/fapi/v1/klines", {"symbol": "BTCUSDT"})
             self.assertEqual(mock_get.call_count, 1)  # no retries
 
-        # Cooldown registered until the ban timestamp
+        # Cooldown registered until ban timestamp + REST_BAN_GRACE_SEC
+        expected = banned_until + binance._grace_ms()
         self.assertAlmostEqual(
-            binance._rate_limited_until_ms, banned_until, delta=1000
+            binance._rate_limited_until_ms, expected, delta=1000
         )
+        self.assertEqual(binance._rate_limit_kind, "padded")
 
         # Next call fails fast without any HTTP request
         with patch("src.exchange.binance.requests.get") as mock_get2:
@@ -52,7 +58,9 @@ class TestBinanceRateLimit(unittest.TestCase):
             with self.assertRaises(binance.RateLimitError):
                 binance._public_get("/fapi/v1/klines", {"symbol": "BTCUSDT"})
             self.assertEqual(mock_get.call_count, 1)
-        self.assertGreaterEqual(binance._rate_limited_until_ms, start_ms + 59_000)
+        self.assertGreaterEqual(
+            binance._rate_limited_until_ms, start_ms + 59_000 + binance._grace_ms() - 50
+        )
 
     def test_429_respects_retry_after_header(self) -> None:
         resp = _response(
@@ -62,7 +70,9 @@ class TestBinanceRateLimit(unittest.TestCase):
         with patch("src.exchange.binance.requests.get", return_value=resp):
             with self.assertRaises(binance.RateLimitError):
                 binance._public_get("/fapi/v1/klines", {"symbol": "BTCUSDT"})
-        self.assertGreaterEqual(binance._rate_limited_until_ms, start_ms + 119_000)
+        self.assertGreaterEqual(
+            binance._rate_limited_until_ms, start_ms + 119_000 + binance._grace_ms() - 50
+        )
 
     def test_rate_limit_error_is_exchange_error(self) -> None:
         # Trading loop catches ExchangeClientError — cooldown must not crash it.
@@ -77,6 +87,129 @@ class TestBinanceRateLimit(unittest.TestCase):
             with self.assertRaises(ExchangeClientError):
                 binance._public_get("/fapi/v1/klines", {"symbol": "BTCUSDT"})
             self.assertEqual(mock_get.call_count, 3)
+
+    def test_legacy_ban_expiry_arms_grace(self) -> None:
+        past = time.time() * 1000 - 1000
+        binance._rate_limited_until_ms = past
+        binance._rate_limit_kind = "ban"
+        with (
+            patch("src.exchange.binance._persist_rate_limit") as persist,
+            patch("src.exchange.binance._clear_persisted_rate_limit") as clear,
+            patch("src.exchange.binance.requests.get") as mock_get,
+        ):
+            with self.assertRaises(binance.RateLimitError):
+                binance._public_get("/fapi/v1/klines", {"symbol": "BTCUSDT"})
+            mock_get.assert_not_called()
+            clear.assert_not_called()
+            persist.assert_called_once()
+            self.assertEqual(binance._rate_limit_kind, "grace")
+            self.assertGreater(binance._rate_limited_until_ms, time.time() * 1000)
+
+    def test_padded_ban_expiry_arms_resume(self) -> None:
+        past = time.time() * 1000 - 1000
+        binance._rate_limited_until_ms = past
+        binance._rate_limit_kind = "padded"
+        with (
+            patch("src.exchange.binance._persist_rate_limit") as persist,
+            patch("src.exchange.binance._clear_persisted_rate_limit") as clear,
+            patch("src.exchange.binance.requests.get") as mock_get,
+        ):
+            with self.assertRaises(binance.RateLimitError):
+                binance._public_get("/fapi/v1/klines", {"symbol": "BTCUSDT"})
+            mock_get.assert_not_called()
+            clear.assert_not_called()
+            persist.assert_called_once()
+        self.assertEqual(binance._rate_limit_kind, "resume")
+        self.assertGreater(binance.optional_rest_blocked_sec(), 0.0)
+        self.assertEqual(binance.rate_limit_remaining_sec(), 0.0)
+        self.assertFalse(binance.is_rate_limited())
+        self.assertTrue(binance.is_rest_resume())
+
+    def test_resume_blocks_optional_allows_order(self) -> None:
+        binance._rate_limited_until_ms = time.time() * 1000 + 60_000
+        binance._rate_limit_kind = "resume"
+        with patch("src.exchange.binance.requests.get") as mock_get:
+            with self.assertRaises(binance.RateLimitError):
+                binance._public_get("/fapi/v1/klines", {"symbol": "BTCUSDT"})
+            mock_get.assert_not_called()
+        with (
+            patch("src.exchange.binance._ensure_credentials"),
+            patch("src.exchange.binance.signed_params", return_value={}),
+            patch("src.exchange.binance.auth_headers", return_value={}),
+            patch(
+                "src.exchange.binance.requests.post",
+                return_value=_response(200, {"orderId": 1}),
+            ) as mock_post,
+        ):
+            out = binance._private_post("/fapi/v1/order", {"symbol": "BTCUSDT"})
+        self.assertEqual(out["orderId"], 1)
+        mock_post.assert_called_once()
+
+    def test_get_order_is_optional_post_is_critical(self) -> None:
+        self.assertEqual(
+            binance._infer_rest_priority("GET", "/fapi/v1/order"), "optional"
+        )
+        self.assertEqual(
+            binance._infer_rest_priority("POST", "/fapi/v1/order"), "critical"
+        )
+
+    def test_resume_blocks_fill_poll_get_order(self) -> None:
+        binance._rate_limited_until_ms = time.time() * 1000 + 60_000
+        binance._rate_limit_kind = "resume"
+        with (
+            patch("src.exchange.binance._ensure_credentials"),
+            patch("src.exchange.binance.signed_params", return_value={}),
+            patch("src.exchange.binance.auth_headers", return_value={}),
+            patch("src.exchange.binance.requests.get") as mock_get,
+        ):
+            with self.assertRaises(binance.RateLimitError):
+                binance._private_get(
+                    "/fapi/v1/order",
+                    {"symbol": "TRXUSDT", "orderId": 1},
+                )
+            mock_get.assert_not_called()
+
+    def test_fetch_order_detail_skips_rest_when_optional_blocked(self) -> None:
+        binance._rate_limited_until_ms = time.time() * 1000 + 60_000
+        binance._rate_limit_kind = "resume"
+        with (
+            patch(
+                "src.exchange.binance_ws.get_order_detail_from_ws",
+                return_value=None,
+            ),
+            patch("src.exchange.binance._private_get") as private_get,
+        ):
+            with self.assertRaises(binance.RateLimitError):
+                binance.fetch_order_detail("TRXUSDT", "1")
+            private_get.assert_not_called()
+
+    def test_second_thread_skips_http_after_418(self) -> None:
+        import threading
+
+        banned_until = int((time.time() + 300) * 1000)
+        resp = _response(
+            418,
+            {"code": -1003, "msg": f"Way too many requests; IP banned until {banned_until}."},
+        )
+        barrier = threading.Barrier(2)
+        results: list[str] = []
+
+        def worker() -> None:
+            barrier.wait()
+            try:
+                binance._public_get("/fapi/v1/income", {})
+                results.append("ok")
+            except binance.RateLimitError:
+                results.append("limited")
+
+        with patch("src.exchange.binance.requests.get", return_value=resp) as mock_get:
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(mock_get.call_count, 1)
+        self.assertEqual(results, ["limited", "limited"])
 
     def test_listen_key_1125_no_retry(self) -> None:
         resp = _response(400, {"code": -1125, "msg": "This listenKey does not exist."})

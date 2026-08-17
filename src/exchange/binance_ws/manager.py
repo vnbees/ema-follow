@@ -127,7 +127,7 @@ def _create_listen_key() -> str:
             logging.info("Binance listenKey reused from disk (no REST validate)")
         return existing
 
-    remaining = binance_mod.rate_limit_remaining_sec()
+    remaining = binance_mod.optional_rest_blocked_sec()
     if remaining > 0:
         raise binance_mod.RateLimitError(
             f"Rate-limit cooldown active — {remaining:.0f}s remaining, request skipped"
@@ -148,11 +148,11 @@ def _keepalive_listen_key(listen_key: str) -> None:
     from src.exchange import binance as binance_mod
     from src.exchange.binance_ws.persist import clear_listen_key
 
-    if binance_mod.is_rate_limited():
-        # PUT is REST — skip during ban; key lasts ~60m without keepalive.
+    if binance_mod.is_optional_rest_blocked():
+        # PUT is REST — skip during ban/resume; key lasts ~60m without keepalive.
         logging.debug(
             "Binance listenKey keepalive skipped — rate-limit %.0fs left",
-            binance_mod.rate_limit_remaining_sec(),
+            binance_mod.optional_rest_blocked_sec(),
         )
         return
     CACHE.bump_rest("listenKey_keepalive")
@@ -179,10 +179,10 @@ def reconcile_account_state(*, force: bool = False) -> None:
         return
     from src.exchange import binance as binance_mod
 
-    if binance_mod.is_rate_limited():
+    if binance_mod.is_optional_rest_blocked():
         logging.debug(
             "Binance WS reconcile skipped — rate-limit %.0fs left",
-            binance_mod.rate_limit_remaining_sec(),
+            binance_mod.optional_rest_blocked_sec(),
         )
         return
 
@@ -200,20 +200,28 @@ def reconcile_account_state(*, force: bool = False) -> None:
         balance = binance_mod.fetch_futures_balance_rest()
         CACHE.set_balance(balance)
 
-        CACHE.bump_rest("reconcile_positions")
-        positions = binance_mod.fetch_all_open_positions_rest()
-        by_symbol: dict[str, dict[str, Position]] = {}
-        for pos in positions:
-            bucket = by_symbol.setdefault(
-                pos.symbol.upper(),
-                {
-                    "long": Position(symbol=pos.symbol, side=None, size=0.0, avg_price=0.0),
-                    "short": Position(symbol=pos.symbol, side=None, size=0.0, avg_price=0.0),
-                },
-            )
-            if pos.side in bucket:
-                bucket[pos.side] = pos
-        CACHE.set_positions(positions, by_symbol)
+        with CACHE.lock:
+            positions_empty = CACHE.positions_updated_at <= 0
+        # Periodic cycle: account only. Full positionRisk every 5m stacked into 418.
+        # Positions stay on UDS; full book only when forced or cache never filled.
+        if force or positions_empty:
+            CACHE.bump_rest("reconcile_positions")
+            positions = binance_mod.fetch_all_open_positions_rest()
+            by_symbol: dict[str, dict[str, Position]] = {}
+            for pos in positions:
+                bucket = by_symbol.setdefault(
+                    pos.symbol.upper(),
+                    {
+                        "long": Position(symbol=pos.symbol, side=None, size=0.0, avg_price=0.0),
+                        "short": Position(symbol=pos.symbol, side=None, size=0.0, avg_price=0.0),
+                    },
+                )
+                if pos.side in bucket:
+                    bucket[pos.side] = pos
+            CACHE.set_positions(positions, by_symbol)
+            logging.debug("Binance WS reconcile OK (%d positions)", len(positions))
+        else:
+            logging.debug("Binance WS reconcile account-only (skip full positionRisk)")
         CACHE.refresh_unrealized_from_marks()
         CACHE.mark_reconciled()
         try:
@@ -222,7 +230,6 @@ def reconcile_account_state(*, force: bool = False) -> None:
             save_account_snapshot()
         except Exception:  # noqa: BLE001
             pass
-        logging.debug("Binance WS reconcile OK (%d positions)", len(positions))
     except binance_mod.RateLimitError as exc:
         logging.warning("Binance WS reconcile paused (rate limit): %s", exc)
     except Exception as exc:  # noqa: BLE001
@@ -244,10 +251,10 @@ def _on_user_stream_connected() -> None:
         has_cache = CACHE.balance is not None or CACHE.positions_updated_at > 0
 
     # During 418 cooldown, disk/WS cache is the only safe source — do not REST.
-    if binance_mod.is_rate_limited():
+    if binance_mod.is_optional_rest_blocked():
         logging.info(
             "Binance UDS connect — skip REST reconcile (rate-limit %.0fs, using disk/WS cache)",
-            binance_mod.rate_limit_remaining_sec(),
+            binance_mod.optional_rest_blocked_sec(),
         )
         return
 
@@ -275,10 +282,10 @@ def seed_volume_rank_from_rest() -> None:
     if not BINANCE_WS_REST_TICKER_SEED:
         logging.debug("Binance WS ticker REST seed disabled (use miniTicker)")
         return
-    if binance_mod.is_rate_limited():
+    if binance_mod.is_optional_rest_blocked():
         logging.info(
             "Binance WS volume seed deferred — rate-limit %.0fs left",
-            binance_mod.rate_limit_remaining_sec(),
+            binance_mod.optional_rest_blocked_sec(),
         )
         return
     CACHE.bump_rest("ticker_seed")
@@ -292,8 +299,8 @@ def maybe_notify_disconnect() -> None:
         return
     from src.exchange import binance as binance_mod
 
-    # During IP ban, user WS cannot create listenKey — expected, don't spam Discord.
-    if binance_mod.is_rate_limited():
+    # During IP ban/resume, user WS cannot create listenKey — expected, don't spam Discord.
+    if binance_mod.is_optional_rest_blocked():
         return
     now = time.time()
     if now - _last_disconnect_notify_at < 180:
@@ -348,7 +355,7 @@ async def _async_main() -> None:
         from src.exchange import binance as binance_mod
 
         while not _stop_event.is_set():
-            wait = binance_mod.rate_limit_remaining_sec()
+            wait = binance_mod.optional_rest_blocked_sec()
             if wait > 0:
                 await asyncio.sleep(min(wait + 2.0, 60.0))
                 continue
@@ -546,9 +553,19 @@ def get_all_positions_from_ws() -> list[Position] | None:
 
 
 def get_pending_from_ws(symbol: str) -> list[PendingOrder] | None:
-    if not is_ws_enabled() or not positions_fresh():
+    """Pending LIMIT orders from UDS.
+
+    Returns [] when UDS is alive but this symbol has no cached entry — RSI hedge
+    path is market-only, so missing key must NOT fall through to openOrders REST
+    (that was ~20 REST calls every 5m cycle and stacked into HTTP 418).
+    Returns None only when WS/UDS is unavailable so callers may REST-fallback.
+    """
+    if not is_ws_enabled():
         return None
-    return CACHE.get_pending(symbol)
+    if not _user_stream_alive() and not positions_fresh():
+        return None
+    cached = CACHE.get_pending(symbol)
+    return [] if cached is None else cached
 
 
 def get_order_detail_from_ws(order_id: str) -> dict | None:

@@ -184,6 +184,17 @@ BINANCE_CANDLE_REST_STAGGER_SEC = float(os.getenv("BINANCE_CANDLE_REST_STAGGER_S
 BALANCE_MONITOR_REST_SEC = float(os.getenv("BALANCE_MONITOR_REST_SEC", "900"))
 # Monitoring-only: min seconds between spot snapshot REST (spot has no UDS).
 SPOT_SNAPSHOT_INTERVAL_SEC = float(os.getenv("SPOT_SNAPSHOT_INTERVAL_SEC", "900"))
+# Dashboard status only: min seconds between openOrders REST when UDS is down.
+# RSI bot is market-order only — pending limits are not on the trade path.
+PENDING_ORDERS_REST_SEC = float(os.getenv("PENDING_ORDERS_REST_SEC", "900"))
+# Extra REST pause after Binance "banned until" (IP still hot at the exact timestamp).
+REST_BAN_GRACE_SEC = float(os.getenv("REST_BAN_GRACE_SEC", "900"))
+# After pad/grace: optional REST (listenKey/income/account) stays blocked this long.
+# Critical REST (orders, per-symbol positionRisk) is allowed but single-flight + gap.
+REST_BAN_RESUME_SEC = float(os.getenv("REST_BAN_RESUME_SEC", "900"))
+REST_BAN_RESUME_GAP_SEC = float(os.getenv("REST_BAN_RESUME_GAP_SEC", "5"))
+# Always serialize REST so TP + listenKey + spot cannot hit Binance in the same instant.
+REST_SERIAL_GAP_SEC = float(os.getenv("REST_SERIAL_GAP_SEC", "0.25"))
 
 SPOT_TRANSFER_ENABLED = os.getenv("SPOT_TRANSFER_ENABLED", "true").lower() in ("1", "true", "yes")
 SPOT_TRANSFER_PCT = float(os.getenv("SPOT_TRANSFER_PCT", "1"))

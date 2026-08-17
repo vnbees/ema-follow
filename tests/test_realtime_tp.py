@@ -169,6 +169,39 @@ class TestRunOnce(unittest.TestCase):
         be_scan.assert_called_once()
         self.assertGreaterEqual(get_realtime_tp_status()["be_closes"], before + 1)
 
+    @patch("src.rsi_trading._scan_breakeven_closes")
+    @patch("src.rsi_trading.arm_breakeven_lots_for_symbol", return_value=0)
+    @patch("src.rsi_trading.side_has_breakeven_candidate", return_value=False)
+    @patch("src.rsi_trading._scan_take_profits_locked")
+    @patch("src.margin_guard.effective_tp_pct", return_value=1.0)
+    @patch("src.exchange.binance_ws.get_mark_from_ws", return_value=101.5)
+    @patch("src.exchange.binance.is_rate_limited", return_value=False)
+    @patch("src.realtime_tp.has_credentials", return_value=True)
+    @patch("src.rsi_trading._trading_enabled", return_value=True)
+    @patch("src.realtime_tp.db.get_open_pair_lots")
+    @patch("src.realtime_tp.db.get_all_open_pair_lots")
+    def test_already_flat_does_not_crash(
+        self,
+        all_lots,
+        sym_lots,
+        _trading,
+        _creds,
+        _rate,
+        _mark,
+        _tp,
+        scan_locked,
+        _be_cand,
+        _arm,
+        _be_scan,
+    ):
+        from src.rsi_trading import AlreadyFlatError
+
+        all_lots.return_value = [_lot()]
+        sym_lots.return_value = [_lot()]
+        scan_locked.side_effect = AlreadyFlatError("BTCUSDT long already flat on exchange")
+        _run_once()  # must not raise NameError
+        scan_locked.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -170,8 +170,10 @@ def liquidate_all_and_reset(symbols: list[str]) -> float:
     return balance.account_equity
 
 
-_FILL_POLL_ATTEMPTS = 3
-_FILL_POLL_DELAY_SEC = 0.15
+_FILL_WS_ATTEMPTS = 5
+_FILL_WS_DELAY_SEC = 0.1
+# At most one REST GET /order — repeated fill polls re-triggered 418 bans.
+_FILL_REST_ATTEMPTS = 1
 
 
 def _parse_fill_price(detail: dict) -> float | None:
@@ -190,13 +192,34 @@ def _parse_fill_price(detail: dict) -> float | None:
     return price if price > 0 else None
 
 
+def _fill_from_ws(order_id: str) -> float | None:
+    try:
+        from src.exchange.binance_ws import get_order_detail_from_ws
+
+        cached = get_order_detail_from_ws(order_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if not cached:
+        return None
+    return _parse_fill_price(cached)
+
+
+def _optional_rest_blocked() -> bool:
+    try:
+        from src.exchange.binance import is_optional_rest_blocked
+
+        return bool(is_optional_rest_blocked())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def resolve_order_fill(
     symbol: str,
     order_result: dict,
     *,
     fallback_price: float,
 ) -> float:
-    """Resolve average fill price from order response or order detail API."""
+    """Resolve average fill price from order response, UDS, or mark — REST last."""
     parsed = _parse_fill_price(order_result)
     if parsed is not None:
         return parsed
@@ -216,25 +239,39 @@ def resolve_order_fill(
             return fallback_price
         return 0.0
 
-    for attempt in range(_FILL_POLL_ATTEMPTS):
-        try:
-            detail = exchange_fetch_order_detail(symbol, order_id)
-            parsed = _parse_fill_price(detail)
-            if parsed is not None:
-                return parsed
-            state = (detail.get("state") or detail.get("status") or "").lower()
-            if state in {"filled", "partially_filled", "partial-fill"}:
-                break
-        except ExchangeClientError as exc:
-            logging.warning(
-                "  [%s] Fill poll %d failed for order %s: %s",
-                symbol,
-                attempt + 1,
-                order_id,
-                exc,
-            )
-        if attempt < _FILL_POLL_ATTEMPTS - 1:
-            time.sleep(_FILL_POLL_DELAY_SEC)
+    # Prefer user-stream ORDER_TRADE_UPDATE before any REST query.
+    for attempt in range(_FILL_WS_ATTEMPTS):
+        ws_fill = _fill_from_ws(order_id)
+        if ws_fill is not None:
+            return ws_fill
+        if attempt < _FILL_WS_ATTEMPTS - 1:
+            time.sleep(_FILL_WS_DELAY_SEC)
+
+    rest_blocked = _optional_rest_blocked()
+    if not rest_blocked:
+        for attempt in range(_FILL_REST_ATTEMPTS):
+            try:
+                detail = exchange_fetch_order_detail(symbol, order_id)
+                parsed = _parse_fill_price(detail)
+                if parsed is not None:
+                    return parsed
+                state = (detail.get("state") or detail.get("status") or "").lower()
+                if state in {"filled", "partially_filled", "partial-fill"}:
+                    break
+            except ExchangeClientError as exc:
+                logging.warning(
+                    "  [%s] Fill poll %d failed for order %s: %s",
+                    symbol,
+                    attempt + 1,
+                    order_id,
+                    exc,
+                )
+    else:
+        logging.info(
+            "  [%s] Skip REST fill poll for order %s — ban/resume cooldown",
+            symbol,
+            order_id,
+        )
 
     try:
         mark = fetch_side_mark_price(symbol)

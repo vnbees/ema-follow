@@ -89,7 +89,9 @@ def _run_once() -> None:
     from src.exchange.binance_ws import get_mark_from_ws
     from src.margin_guard import effective_tp_pct
     from src.rsi_trading import (
+        AlreadyFlatError,
         TP_CLOSE_LOCK,
+        _is_already_flat_error,
         _scan_breakeven_closes,
         _scan_take_profits_locked,
         _trading_enabled,

@@ -15,7 +15,7 @@ class TestListenKeyLifecycle(unittest.TestCase):
 
     @patch("src.exchange.binance_ws.persist.save_listen_key")
     @patch("src.exchange.binance_ws.persist.load_listen_key", return_value="disk-key")
-    @patch("src.exchange.binance.rate_limit_remaining_sec", return_value=0.0)
+    @patch("src.exchange.binance.optional_rest_blocked_sec", return_value=0.0)
     def test_disk_key_reused_without_rest_validate(
         self,
         _remaining,
@@ -37,7 +37,7 @@ class TestListenKeyLifecycle(unittest.TestCase):
 
     @patch("src.exchange.binance_ws.persist.save_listen_key")
     @patch("src.exchange.binance_ws.persist.load_listen_key", return_value=None)
-    @patch("src.exchange.binance.rate_limit_remaining_sec", return_value=0.0)
+    @patch("src.exchange.binance.optional_rest_blocked_sec", return_value=0.0)
     def test_missing_disk_key_creates_via_rest(
         self,
         _remaining,
@@ -57,8 +57,18 @@ class TestListenKeyLifecycle(unittest.TestCase):
         save_key.assert_called_with("fresh-key")
         self.assertTrue(ws_manager._listen_key_validated)
 
+    @patch("src.exchange.binance_ws.persist.load_listen_key", return_value=None)
+    @patch("src.exchange.binance.optional_rest_blocked_sec", return_value=120.0)
+    def test_missing_disk_key_blocked_during_resume(self, _remaining, _load):
+        from src.exchange import binance as binance_mod
+
+        with patch.object(binance_mod, "_private_post") as post:
+            with self.assertRaises(binance_mod.RateLimitError):
+                ws_manager._create_listen_key()
+            post.assert_not_called()
+
     @patch("src.exchange.binance_ws.persist.clear_listen_key")
-    @patch("src.exchange.binance.is_rate_limited", return_value=False)
+    @patch("src.exchange.binance.is_optional_rest_blocked", return_value=False)
     def test_keepalive_clears_dead_key(self, _limited, clear_key):
         from src.exchange import binance as binance_mod
 

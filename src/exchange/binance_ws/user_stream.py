@@ -196,12 +196,12 @@ class UserStream:
             try:
                 from src.exchange import binance as binance_mod
 
-                wait = binance_mod.rate_limit_remaining_sec()
-                from src.exchange.binance_ws.persist import clear_listen_key, load_listen_key
+                from src.exchange.binance_ws.persist import load_listen_key
 
                 # Persisted listenKey can reconnect over WS without REST create.
                 has_key = bool(load_listen_key())
-                if wait > 0 and not has_key:
+                wait = 0.0 if has_key else binance_mod.optional_rest_blocked_sec()
+                if wait > 0:
                     logging.warning(
                         "Binance user WS waiting %.0fs for rate-limit cooldown before listenKey",
                         wait,
@@ -284,10 +284,13 @@ class UserStream:
                 )
                 await asyncio.sleep(3)
             except Exception as exc:  # noqa: BLE001
+                from src.exchange import binance as binance_mod
                 from src.exchange.binance import RateLimitError
 
                 if isinstance(exc, RateLimitError) or "Rate-limit cooldown" in str(exc):
                     logging.warning("Binance user WS: %s", exc)
+                    wait = binance_mod.optional_rest_blocked_sec()
+                    await asyncio.sleep(min(60.0, wait + 2.0) if wait > 0 else 5.0)
                     continue
                 logging.warning(
                     "Binance user WS error: type=%s msg=%r",
