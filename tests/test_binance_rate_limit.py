@@ -21,8 +21,11 @@ class TestBinanceRateLimit(unittest.TestCase):
         binance._rate_limited_until_ms = 0.0
         binance._rate_limit_kind = "ban"
         binance._last_rest_at = 0.0
+        self._notify_patch = patch("src.notify.notify_error")
+        self._notify_mock = self._notify_patch.start()
 
     def tearDown(self) -> None:
+        self._notify_patch.stop()
         binance._rate_limited_until_ms = 0.0
         binance._rate_limit_kind = "ban"
         binance._last_rest_at = 0.0
@@ -50,6 +53,18 @@ class TestBinanceRateLimit(unittest.TestCase):
             with self.assertRaises(binance.RateLimitError):
                 binance._public_get("/fapi/v1/klines", {"symbol": "ETHUSDT"})
             mock_get2.assert_not_called()
+
+    def test_padded_ban_notifies_discord(self) -> None:
+        until = binance._now_ms() + 60_000
+        binance._set_rate_limited_until(until, kind="padded")
+        self._notify_mock.assert_called()
+        self.assertEqual(self._notify_mock.call_args[0][0], "Binance REST ban")
+
+    def test_grace_does_not_notify_discord(self) -> None:
+        self._notify_mock.reset_mock()
+        until = binance._now_ms() + 60_000
+        binance._set_rate_limited_until(until, kind="grace")
+        self._notify_mock.assert_not_called()
 
     def test_429_backs_off_one_minute_without_retry(self) -> None:
         resp = _response(429, {"code": -1003, "msg": "Too many requests"})

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{{ exchange_name }} RSI Bot</title>
+  <title>{{ exchange_name }} {{ bot_title }}</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
     * { box-sizing: border-box; }
@@ -23,41 +23,26 @@
     button:hover { background: #30363d; }
     button:disabled { opacity: 0.45; cursor: default; }
     .range-btn.active { background: #238636; border-color: #2ea043; color: #fff; }
-    input[type="number"] {
-      background: #0f1117; color: #e6edf3; border: 1px solid #30363d;
-      border-radius: 6px; padding: 7px 10px; width: 100px;
-    }
-    label { font-size: 13px; color: #8b949e; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
     th, td { padding: 8px 10px; border-bottom: 1px solid #30363d; text-align: left; white-space: nowrap; }
     th { color: #8b949e; font-size: 11px; text-transform: uppercase; }
     .table-wrap { overflow-x: auto; }
     .empty { color: #8b949e; font-size: 13px; }
-    .chart-panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    .panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 16px 0; }
     .chart-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
     .chart-wrap { position: relative; height: 280px; }
     .chart-empty { color: #8b949e; font-size: 13px; padding: 48px 0; text-align: center; }
-    .settings-panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 16px 0; }
-    .pos-panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 16px 0; }
-    .pos-summary { font-size: 13px; color: #8b949e; margin: 0 0 12px; }
-    .pos-nested { margin-left: 12px; border-left: 2px solid #30363d; }
-    .pos-nested td { font-size: 12px; color: #c9d1d9; }
-    .btn-close { background: #3d1214; border-color: #8b1e22; color: #f85149; }
-    .btn-close:hover { background: #5a1a1d; }
-    .tp-ready { color: #3fb950; font-weight: 600; }
-    .age-soon { color: #d29922; }
-    .age-overdue { color: #f85149; font-weight: 600; }
-    select {
-      background: #0f1117; color: #e6edf3; border: 1px solid #30363d;
-      border-radius: 6px; padding: 7px 10px;
-    }
+    .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 12px 0; }
+    .summary-card { background: #0f1117; border: 1px solid #30363d; border-radius: 8px; padding: 12px; }
+    .summary-card .label { color: #8b949e; font-size: 12px; }
+    .summary-card .value { font-size: 18px; margin-top: 4px; }
   </style>
 </head>
 <body>
-  <h1>{{ exchange_name }} RSI Bot</h1>
+  <h1>{{ exchange_name }} {{ bot_title }}</h1>
 
   <p class="balance-line">
-    Futures balance:
+    Futures:
     available={{ "%.2f"|format(account.available) }} {{ account.margin_coin }}
     | equity={{ "%.2f"|format(account.equity) }} {{ account.margin_coin }}
     | maint={% if account.maint_margin_pct is not none %}{{ "%.2f"|format(account.maint_margin_pct) }}{% else %}—{% endif %}%
@@ -82,714 +67,229 @@
     </form>
   </div>
 
-  <div class="pos-panel">
-    <div class="chart-header">
-      <h2 style="margin: 0;">Vị thế</h2>
-      <div class="controls" style="margin: 0;">
-        <label>
-          Group
-          <select id="posGroup">
-            <option value="position" selected>Position</option>
-            <option value="leg">Leg</option>
-          </select>
-        </label>
-        <label>
-          Sort
-          <select id="posSort">
-            <option value="pnl_desc" selected>PnL ↓</option>
-            <option value="pnl_asc">PnL ↑</option>
-            <option value="symbol">Symbol</option>
-            <option value="opened_at">Opened</option>
-          </select>
-        </label>
-        <label>
-          Page size
-          <select id="posPageSize">
-            <option value="10">10</option>
-            <option value="20" selected>20</option>
-            <option value="50">50</option>
-          </select>
-        </label>
-        <button type="button" id="posPrev">←</button>
-        <span id="posPageLabel" class="meta">1 / 1</span>
-        <button type="button" id="posNext">→</button>
-        <button type="button" id="posRefresh">Refresh</button>
+  <div class="summary-grid">
+    <div class="summary-card">
+      <div class="label">Lệnh mở</div>
+      <div class="value">{{ ema_rsi.open_count }}/{{ ema_rsi_max_open }}</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">Unrealized PnL</div>
+      <div class="value {% if ema_rsi.summary.open_unrealized >= 0 %}green{% else %}red{% endif %}">
+        {{ ema_rsi.summary.open_unrealized | dash_pnl }}
       </div>
     </div>
-    <p id="posSummary" class="pos-summary">Đang tải…</p>
-    <div class="table-wrap">
-      <table>
-        <thead id="posHead"></thead>
-        <tbody id="posBody">
-          <tr><td colspan="10" class="empty">Đang tải vị thế…</td></tr>
-        </tbody>
-      </table>
+    <div class="summary-card">
+      <div class="label">Realized PnL (lịch sử)</div>
+      <div class="value {% if ema_rsi.summary.closed_realized >= 0 %}green{% else %}red{% endif %}">
+        {{ ema_rsi.summary.closed_realized | dash_pnl }}
+      </div>
     </div>
+    <div class="summary-card">
+      <div class="label">Tổng PnL</div>
+      <div class="value {% if ema_rsi.summary.total_pnl >= 0 %}green{% else %}red{% endif %}">
+        {{ ema_rsi.summary.total_pnl | dash_pnl }}
+      </div>
     </div>
+  </div>
 
-  <div class="pos-panel">
-    <h2 style="margin-top: 0;">Báo cáo đóng lệnh theo ngày</h2>
-    <p class="pos-summary">
-      {{ close_report.from_date }} → {{ close_report.to_date }} (giờ VN).
-      Chỉ tính lệnh đã ghi lý do: {{ close_report.labels.tp }},
-      {{ close_report.labels.orphan_be }},
-      {{ close_report.labels.age }}.
-      Lệnh cũ chưa có lý do không được đếm.
-    </p>
+  <div class="panel">
+    <h2 style="margin-top: 0;">Lệnh EMA RSI</h2>
     <div class="table-wrap">
-      <table>
+      <table id="tradesTable">
         <thead>
           <tr>
-            <th>Ngày</th>
-            <th>{{ close_report.labels.tp }}</th>
-            <th>{{ close_report.labels.orphan_be }}</th>
-            <th>{{ close_report.labels.age }}</th>
-            <th>Tổng PnL</th>
+            <th>Symbol</th>
+            <th>Side</th>
+            <th>Status</th>
+            <th>Entry</th>
+            <th>SL</th>
+            <th>TP</th>
+            <th>R</th>
+            <th>Size</th>
+            <th>PnL</th>
+            <th>Lý do</th>
+            <th>Mở</th>
+            <th>Đóng</th>
           </tr>
         </thead>
         <tbody>
-          {% for row in close_report.rows if row.total_count %}
+          {% for t in ema_rsi.trades %}
           <tr>
-            <td class="meta">{{ row.date }}</td>
-            <td>{{ row.tp_count }} / <span class="{% if row.tp_pnl >= 0 %}green{% else %}red{% endif %}">{{ row.tp_pnl | dash_pnl }}</span></td>
-            <td>{{ row.orphan_be_count }} / <span class="{% if row.orphan_be_pnl >= 0 %}green{% else %}red{% endif %}">{{ row.orphan_be_pnl | dash_pnl }}</span></td>
-            <td>{{ row.age_count }} / <span class="{% if row.age_pnl >= 0 %}green{% else %}red{% endif %}">{{ row.age_pnl | dash_pnl }}</span></td>
-            <td class="{% if row.total_pnl >= 0 %}green{% else %}red{% endif %}">{{ row.total_count }} / {{ row.total_pnl | dash_pnl }}</td>
+            <td>{{ t.symbol }}</td>
+            <td class="{% if t.side == 'long' %}green{% else %}red{% endif %}">{{ t.side.upper() }}</td>
+            <td>{{ t.status }}</td>
+            <td>{{ t.entry | dash_price }}</td>
+            <td>{{ t.sl | dash_price }}</td>
+            <td>{{ t.tp | dash_price }}</td>
+            <td>{{ t.r | dash_price }}</td>
+            <td>{{ t.size | dash_price }}</td>
+            <td class="{% if (t.pnl_usdt if t.pnl_usdt is not none else t.unrealized_pnl or 0) >= 0 %}green{% else %}red{% endif %}">
+              {% if t.status == 'open' %}
+                {{ t.unrealized_pnl | dash_pnl }}
+              {% else %}
+                {{ t.pnl_usdt | dash_pnl }}
+              {% endif %}
+            </td>
+            <td>{{ t.close_reason or "—" }}</td>
+            <td class="meta">{{ t.opened_at }}</td>
+            <td class="meta">{{ t.closed_at or "—" }}</td>
           </tr>
           {% else %}
           <tr>
-            <td colspan="5" class="empty">Chưa có lệnh đóng có lý do trong {{ close_report.days }} ngày.</td>
+            <td colspan="12" class="empty">Chưa có lệnh.</td>
           </tr>
           {% endfor %}
         </tbody>
-        {% if close_report.totals.total_count %}
-        <tfoot>
-          <tr>
-            <td><strong>Tổng {{ close_report.days }} ngày</strong></td>
-            <td>{{ close_report.totals.tp_count }} / <span class="{% if close_report.totals.tp_pnl >= 0 %}green{% else %}red{% endif %}">{{ close_report.totals.tp_pnl | dash_pnl }}</span></td>
-            <td>{{ close_report.totals.orphan_be_count }} / <span class="{% if close_report.totals.orphan_be_pnl >= 0 %}green{% else %}red{% endif %}">{{ close_report.totals.orphan_be_pnl | dash_pnl }}</span></td>
-            <td>{{ close_report.totals.age_count }} / <span class="{% if close_report.totals.age_pnl >= 0 %}green{% else %}red{% endif %}">{{ close_report.totals.age_pnl | dash_pnl }}</span></td>
-            <td class="{% if close_report.totals.total_pnl >= 0 %}green{% else %}red{% endif %}"><strong>{{ close_report.totals.total_count }} / {{ close_report.totals.total_pnl | dash_pnl }}</strong></td>
-          </tr>
-        </tfoot>
-        {% endif %}
       </table>
     </div>
   </div>
 
-  <div class="settings-panel">
-    <h2>Rút spot hàng ngày</h2>
-    <p class="meta">
-      Hôm nay ({{ spot_transfer.date }}):
-      {% if spot_transfer.success %}
-        <span class="green">đã chuyển</span>
-      {% elif spot_transfer.latest_status %}
-        lần gần nhất: {{ spot_transfer.latest_status }}
-      {% else %}
-        chưa chuyển
-      {% endif %}
-      | prepare {{ spot_transfer.prepare_hhmm }} · execute {{ spot_transfer.execute_hhmm }} (giờ VN)
-    </p>
-    <p class="meta">
-      Chế độ:
-      {% if spot_transfer.mode == 'hwm' %}
-        <strong>HWM</strong> — rút {{ "%.0f"|format(spot_transfer.hwm_share) }}% phần equity vượt đỉnh
-        {% if spot_transfer.hwm is not none %}
-          | đỉnh (HWM): {{ "%.2f"|format(spot_transfer.hwm) }} {{ margin_coin }}
-        {% endif %}
-        {% if spot_transfer.hwm_synced_at %}
-          | sync nạp/rút tay: {{ spot_transfer.hwm_synced_at }} VN
-        {% endif %}
-      {% else %}
-        <strong>PCT</strong> — {{ "%.2f"|format(spot_transfer.pct) }}% equity mỗi ngày
-      {% endif %}
-    </p>
-    <form method="post" action="/settings/spot-transfer" class="controls">
-      <label>
-        <input type="checkbox" name="enabled" value="on" {% if spot_transfer.enabled %}checked{% endif %}>
-        Bật rút spot
-      </label>
-      {% if spot_transfer.mode != 'hwm' %}
-      <label>
-        % equity / ngày
-        <input type="number" name="pct" step="0.01" min="0.01" value="{{ '%.2f'|format(spot_transfer.pct) }}">
-      </label>
-      {% endif %}
-      <button type="submit">Lưu</button>
-    </form>
-    <p class="meta">
-      Preview hôm nay: ≈ {{ "%.2f"|format(spot_transfer.amount_preview) }} {{ margin_coin }}
-      {% if spot_transfer.mode == 'hwm' %}
-        ({{ "%.0f"|format(spot_transfer.hwm_share) }}% phần vượt HWM; 0 khi đang drawdown)
-      {% else %}
-        ({{ "%.2f"|format(spot_transfer.pct) }}% equity hiện tại)
-      {% endif %}
-    </p>
-    {% if realtime_tp %}
-    <p class="meta">
-      Realtime TP:
-      {% if realtime_tp.enabled and realtime_tp.running %}
-        <span class="green">đang chạy</span>
-        {% if realtime_tp.paused_reason %} (tạm dừng: {{ realtime_tp.paused_reason }}){% endif %}
-        | đã chốt {{ realtime_tp.closes }} đợt
-        {% if realtime_tp.last_close_at %} | lần cuối: {{ realtime_tp.last_close_at }}{% endif %}
-      {% else %}
-        tắt — chốt lãi theo cycle 5 phút
-      {% endif %}
-    </p>
-    {% endif %}
-  </div>
-
-  <div class="chart-panel">
+  <div class="panel">
     <div class="chart-header">
-      <h2>Biến động equity</h2>
+      <h2 style="margin: 0;">Equity</h2>
       <div class="controls" style="margin: 0;">
-        <button type="button" class="range-btn equity-range" data-range="24h">24h</button>
-        <button type="button" class="range-btn equity-range active" data-range="7d">7 ngày</button>
-        <button type="button" class="range-btn equity-range" data-range="30d">30 ngày</button>
+        <button type="button" class="range-btn" data-range="24h">24h</button>
+        <button type="button" class="range-btn active" data-range="7d">7 ngày</button>
+        <button type="button" class="range-btn" data-range="30d">30 ngày</button>
       </div>
     </div>
     <div class="chart-wrap">
       <canvas id="equityChart"></canvas>
-      <div id="equityChartEmpty" class="chart-empty" hidden>Chưa có dữ liệu equity — điểm đầu tiên sẽ ghi sau cycle 5 phút tiếp theo.</div>
+      <div id="equityEmpty" class="chart-empty" hidden>Chưa có dữ liệu equity.</div>
     </div>
-  </div>
-
-  <div class="chart-panel">
-    <div class="chart-header">
-      <h2>Biến động spot</h2>
-      <div class="controls" style="margin: 0;">
-        <button type="button" class="range-btn spot-range" data-range="24h">24h</button>
-        <button type="button" class="range-btn spot-range active" data-range="7d">7 ngày</button>
-        <button type="button" class="range-btn spot-range" data-range="30d">30 ngày</button>
-      </div>
-    </div>
-    <div class="chart-wrap">
-      <canvas id="spotChart"></canvas>
-      <div id="spotChartEmpty" class="chart-empty" hidden>Chưa có dữ liệu spot — điểm đầu tiên sẽ ghi sau cycle 5 phút tiếp theo.</div>
-    </div>
-  </div>
-
-  <h2>Lịch sử chuyển spot</h2>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Thời gian</th>
-          <th>Ngày</th>
-          <th>Amount</th>
-          <th>Status</th>
-          <th>Legs closed</th>
-          <th>Spot after</th>
-          <th>Error</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in spot_transfers %}
-        <tr>
-          <td class="meta">{{ row.time_vn }}</td>
-          <td>{{ row.transfer_date }}</td>
-          <td>{{ "%.2f"|format(row.amount) }}</td>
-          <td class="{% if row.status == 'success' %}green{% elif row.status == 'failed' %}red{% endif %}">{{ row.status }}</td>
-          <td>{{ row.legs_closed }}</td>
-          <td>{% if row.spot_after is not none %}{{ "%.4f"|format(row.spot_after) }}{% else %}—{% endif %}</td>
-          <td class="meta">{{ row.error }}</td>
-        </tr>
-        {% else %}
-        <tr>
-          <td colspan="7" class="empty">Chưa có lần chuyển nào.</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-
-  <h2>Lệnh gần đây</h2>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Thời gian</th>
-          <th>Mở/Đóng</th>
-          <th>Symbol</th>
-          <th>Phía</th>
-          <th>Size</th>
-          <th>Entry</th>
-          <th>PnL</th>
-          <th>Lý do đóng</th>
-          <th>Trigger</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in recent_orders %}
-        <tr>
-          <td class="meta">{{ row.time_vn }}</td>
-          <td>{{ row.action }}</td>
-          <td><strong>{{ row.symbol }}</strong></td>
-          <td class="{% if row.side == 'LONG' %}green{% else %}red{% endif %}">{{ row.side }}</td>
-          <td>{{ row.size | dash_size }}</td>
-          <td>{{ row.entry | dash_price }}</td>
-          <td class="{% if row.pnl is not none %}{% if row.pnl >= 0 %}green{% else %}red{% endif %}{% endif %}">
-            {% if row.pnl is not none %}{{ row.pnl | dash_pnl }}{% else %}—{% endif %}
-          </td>
-          <td class="meta">{{ row.close_reason_label }}</td>
-          <td class="meta">{{ row.trigger }}</td>
-        </tr>
-        {% else %}
-        <tr>
-          <td colspan="9" class="empty">Chưa có lệnh nào.</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
   </div>
 
   <script>
-    (function () {
-      function sparseLabels(labels) {
-        const maxTicks = 8;
-        if (labels.length <= maxTicks) return labels;
-        const step = Math.ceil(labels.length / maxTicks);
-        return labels.map((label, idx) => (idx % step === 0 ? label : ""));
+    let equityChart = null;
+    let equityRange = '7d';
+
+    function pnlClass(v) {
+      return (v || 0) >= 0 ? 'green' : 'red';
+    }
+
+    function fmtPnl(v) {
+      if (v === null || v === undefined) return '—';
+      const n = Number(v);
+      const sign = n >= 0 ? '+' : '';
+      return sign + n.toFixed(4);
+    }
+
+    function fmtPrice(v) {
+      if (v === null || v === undefined) return '—';
+      const n = Number(v);
+      if (n >= 1) return n.toFixed(4);
+      if (n >= 0.01) return n.toFixed(6);
+      return n.toFixed(8);
+    }
+
+    function renderTrades(trades) {
+      const tbody = document.querySelector('#tradesTable tbody');
+      if (!trades.length) {
+        tbody.innerHTML = '<tr><td colspan="12" class="empty">Chưa có lệnh.</td></tr>';
+        return;
       }
-
-      function makeLineChart({ canvas, emptyEl, valueKey, label, color, points, marginCoin, getTooltipLines }) {
-        let chart = null;
-        function render(data) {
-          const labels = data.points.map((p) => p.time_vn);
-          const hasPoints = data.points.length > 0;
-          canvas.hidden = !hasPoints;
-          emptyEl.hidden = hasPoints;
-          if (!hasPoints) {
-            if (chart) { chart.destroy(); chart = null; }
-            return;
-          }
-          const config = {
-            type: "line",
-            data: {
-              labels: sparseLabels(labels),
-              datasets: [{
-                label,
-                data: data.points.map((p) => p[valueKey]),
-                borderColor: color,
-                backgroundColor: color.replace(")", ", 0.12)").replace("rgb", "rgba"),
-                fill: true,
-                tension: 0.2,
-                pointRadius: data.points.length > 120 ? 0 : 2,
-                pointHoverRadius: 4,
-              }],
-            },
-            options: {
-              responsive: true,
-              maintainAspectRatio: false,
-              interaction: { mode: "index", intersect: false },
-              plugins: {
-                legend: { labels: { color: "#e6edf3" } },
-                tooltip: {
-                  callbacks: {
-                    title: (items) => data.points[items[0].dataIndex].time_vn,
-                    label: (ctx) => getTooltipLines(data.points[ctx.dataIndex], marginCoin || data.margin_coin),
-                  },
-                },
-              },
-              scales: {
-                x: { ticks: { color: "#8b949e", maxRotation: 0, autoSkip: true }, grid: { color: "#21262d" } },
-                y: {
-                  ticks: { color: "#8b949e", callback: (value) => `${Number(value).toFixed(0)}` },
-                  grid: { color: "#21262d" },
-                },
-              },
-            },
-          };
-          if (data.baseline_equity != null && data.points.length > 0) {
-            config.data.datasets.push({
-              label: "Baseline",
-              data: data.points.map(() => data.baseline_equity),
-              borderColor: "#8b949e",
-              borderDash: [6, 4],
-              pointRadius: 0,
-              fill: false,
-            });
-          }
-          if (chart) {
-            chart.data = config.data;
-            chart.options = config.options;
-            chart.update();
-          } else {
-            chart = new Chart(canvas, config);
-          }
-        }
-        return { render };
-      }
-
-      const equityChart = makeLineChart({
-        canvas: document.getElementById("equityChart"),
-        emptyEl: document.getElementById("equityChartEmpty"),
-        valueKey: "equity",
-        label: "Equity",
-        color: "rgb(63, 185, 80)",
-        getTooltipLines: (point, coin) => [
-          `Equity: ${point.equity.toFixed(2)} ${coin}`,
-          `Available: ${point.available.toFixed(2)} ${coin}`,
-        ],
-      });
-
-      const spotChart = makeLineChart({
-        canvas: document.getElementById("spotChart"),
-        emptyEl: document.getElementById("spotChartEmpty"),
-        valueKey: "balance",
-        label: "Spot",
-        color: "rgb(88, 166, 255)",
-        getTooltipLines: (point, coin) => [`Spot: ${point.balance.toFixed(4)} ${coin}`],
-      });
-
-      let equityRange = "7d";
-      let spotRange = "7d";
-
-      async function loadEquity(range) {
-        equityRange = range;
-        const res = await fetch(`/api/equity-history?range=${encodeURIComponent(range)}`);
-        equityChart.render(await res.json());
-      }
-
-      async function loadSpot(range) {
-        spotRange = range;
-        const res = await fetch(`/api/spot-history?range=${encodeURIComponent(range)}`);
-        spotChart.render(await res.json());
-      }
-
-      document.querySelectorAll(".equity-range").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          document.querySelectorAll(".equity-range").forEach((b) => b.classList.remove("active"));
-          btn.classList.add("active");
-          loadEquity(btn.dataset.range);
-        });
-      });
-      document.querySelectorAll(".spot-range").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          document.querySelectorAll(".spot-range").forEach((b) => b.classList.remove("active"));
-          btn.classList.add("active");
-          loadSpot(btn.dataset.range);
-        });
-      });
-
-      loadEquity(equityRange);
-      loadSpot(spotRange);
-      // No auto-refresh — use chart range buttons / page reload manually.
-    })();
-
-    (function () {
-      const state = {
-        group: "position",
-        sort: "pnl_desc",
-        page: 1,
-        pageSize: 20,
-        tradingEnabled: {{ "true" if trading_enabled else "false" }},
-        rateLimited: false,
-        maxLotAgeDays: 0,
-        openSides: [],
-        openLegs: [],
-        pnlSummary: null,
-      };
-
-      const el = {
-        group: document.getElementById("posGroup"),
-        sort: document.getElementById("posSort"),
-        pageSize: document.getElementById("posPageSize"),
-        prev: document.getElementById("posPrev"),
-        next: document.getElementById("posNext"),
-        pageLabel: document.getElementById("posPageLabel"),
-        refresh: document.getElementById("posRefresh"),
-        summary: document.getElementById("posSummary"),
-        head: document.getElementById("posHead"),
-        body: document.getElementById("posBody"),
-        tradingPill: document.getElementById("tradingPill"),
-        ratePill: document.getElementById("rateLimitPill"),
-      };
-
-      function fmt(n, digits) {
-        if (n == null || Number.isNaN(n)) return "—";
-        return Number(n).toFixed(digits);
-      }
-
-      function pnlClass(n) {
-        if (n == null) return "";
-        return n >= 0 ? "green" : "red";
-      }
-
-      function formatAgeCountdown(deadlineAt) {
-        if (!deadlineAt || !(state.maxLotAgeDays > 0)) return "—";
-        const deadlineMs = Date.parse(deadlineAt);
-        if (Number.isNaN(deadlineMs)) return "—";
-        const remainingSec = (deadlineMs - Date.now()) / 1000;
-        if (remainingSec <= 0) return "overdue";
-        const total = Math.floor(remainingSec);
-        const days = Math.floor(total / 86400);
-        const hours = Math.floor((total % 86400) / 3600);
-        const minutes = Math.floor((total % 3600) / 60);
-        if (days > 0) return `${days}d ${hours}h ${String(minutes).padStart(2, "0")}m`;
-        if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
-        return `${minutes}m`;
-      }
-
-      function ageClass(deadlineAt) {
-        if (!deadlineAt || !(state.maxLotAgeDays > 0)) return "meta";
-        const remainingSec = (Date.parse(deadlineAt) - Date.now()) / 1000;
-        if (Number.isNaN(remainingSec)) return "meta";
-        if (remainingSec <= 0) return "age-overdue";
-        if (remainingSec <= 6 * 3600) return "age-soon";
-        return "meta";
-      }
-
-      function ageCell(deadlineAt) {
-        const text = formatAgeCountdown(deadlineAt);
-        return `<td class="${ageClass(deadlineAt)}" data-age-deadline="${deadlineAt || ""}">${text}</td>`;
-      }
-
-      function canClose() {
-        return state.tradingEnabled && !state.rateLimited;
-      }
-
-      function sortRows(rows) {
-        const key = state.sort;
-        const copy = rows.slice();
-        copy.sort((a, b) => {
-          if (key === "pnl_asc") return (a.pnl_usdt ?? -1e18) - (b.pnl_usdt ?? -1e18);
-          if (key === "pnl_desc") return (b.pnl_usdt ?? -1e18) - (a.pnl_usdt ?? -1e18);
-          if (key === "symbol") {
-            const s = String(a.symbol).localeCompare(String(b.symbol));
-            if (s !== 0) return s;
-            return String(a.side).localeCompare(String(b.side));
-          }
-          return String(a.opened_at || "").localeCompare(String(b.opened_at || ""));
-        });
-        return copy;
-      }
-
-      function pageSlice(rows) {
-        const totalPages = Math.max(1, Math.ceil(rows.length / state.pageSize) || 1);
-        if (state.page > totalPages) state.page = totalPages;
-        if (state.page < 1) state.page = 1;
-        const start = (state.page - 1) * state.pageSize;
-        return {
-          rows: rows.slice(start, start + state.pageSize),
-          totalPages,
-          total: rows.length,
-        };
-      }
-
-      async function closeSide(symbol, side, size) {
-        if (!canClose()) return;
-        const ok = window.confirm(
-          `Đóng toàn bộ ${side.toUpperCase()} ${symbol} (size≈${fmt(size, 4)})?`,
-        );
-        if (!ok) return;
-        const res = await fetch("/api/positions/close-side", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ symbol, side }),
-        });
-        const data = await res.json();
-        if (!data.ok) {
-          window.alert(data.message || "Close failed");
-        }
-        await loadPositions();
-      }
-
-      async function closeLeg(lotId, side, symbol, size) {
-        if (!canClose()) return;
-        const ok = window.confirm(
-          `Đóng lot #${lotId} ${side.toUpperCase()} ${symbol} (size≈${fmt(size, 4)})?`,
-        );
-        if (!ok) return;
-        const res = await fetch("/api/positions/close-leg", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ lot_id: lotId, side }),
-        });
-        const data = await res.json();
-        if (!data.ok) {
-          window.alert(data.message || "Close failed");
-        }
-        await loadPositions();
-      }
-
-      function closeBtn(label, onClick) {
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "btn-close";
-        btn.textContent = label;
-        btn.disabled = !canClose();
-        btn.addEventListener("click", onClick);
-        return btn;
-      }
-
-      function renderPositionView(pageRows) {
-        el.head.innerHTML = `<tr>
-          <th>Symbol</th><th>Side</th><th>Size</th><th>DB avg</th><th>Mark</th>
-          <th>Move %</th><th>PnL</th><th>TP</th><th>Đóng sau (3d)</th><th></th>
+      tbody.innerHTML = trades.map(t => {
+        const pnl = t.status === 'open' ? t.unrealized_pnl : t.pnl_usdt;
+        return `<tr>
+          <td>${t.symbol}</td>
+          <td class="${t.side === 'long' ? 'green' : 'red'}">${t.side.toUpperCase()}</td>
+          <td>${t.status}</td>
+          <td>${fmtPrice(t.entry)}</td>
+          <td>${fmtPrice(t.sl)}</td>
+          <td>${fmtPrice(t.tp)}</td>
+          <td>${fmtPrice(t.r)}</td>
+          <td>${fmtPrice(t.size)}</td>
+          <td class="${pnlClass(pnl)}">${fmtPnl(pnl)}</td>
+          <td>${t.close_reason || '—'}</td>
+          <td class="meta">${t.opened_at || '—'}</td>
+          <td class="meta">${t.closed_at || '—'}</td>
         </tr>`;
-        el.body.innerHTML = "";
-        if (!pageRows.length) {
-          el.body.innerHTML = `<tr><td colspan="10" class="empty">Không có vị thế mở.</td></tr>`;
-          return;
-        }
-        for (const sideRow of pageRows) {
-          const tr = document.createElement("tr");
-          tr.innerHTML = `
-            <td><strong>${sideRow.symbol}</strong></td>
-            <td class="${sideRow.side === "long" ? "green" : "red"}">${sideRow.side.toUpperCase()}</td>
-            <td>${fmt(sideRow.size, 4)}</td>
-            <td>${fmt(sideRow.entry, 6)}</td>
-            <td>${fmt(sideRow.mark, 6)}</td>
-            <td class="${pnlClass(sideRow.move_pct)}">${sideRow.move_pct == null ? "—" : fmt(sideRow.move_pct, 2) + "%"}</td>
-            <td class="${pnlClass(sideRow.pnl_usdt)}">${sideRow.pnl_usdt == null ? "—" : fmt(sideRow.pnl_usdt, 2)}</td>
-            <td class="${sideRow.tp_ready ? "tp-ready" : "meta"}">${sideRow.tp_ready ? "ready" : "—"}</td>
-            ${ageCell(sideRow.age_deadline_at)}
-            <td></td>`;
-          tr.lastElementChild.appendChild(
-            closeBtn("Đóng side", () => closeSide(sideRow.symbol, sideRow.side, sideRow.size)),
-          );
-          el.body.appendChild(tr);
+      }).join('');
+    }
 
-          for (const lot of sideRow.lots || []) {
-            const leg = lot[sideRow.side];
-            if (!leg || !leg.is_open) continue;
-            const nest = document.createElement("tr");
-            nest.className = "pos-nested";
-            nest.innerHTML = `
-              <td class="meta">↳ lot #${lot.lot_id}</td>
-              <td class="meta">${lot.entry_trigger || "—"}</td>
-              <td>${fmt(leg.size, 4)}</td>
-              <td>${fmt(leg.entry, 6)}</td>
-              <td></td>
-              <td class="${pnlClass(leg.move_pct)}">${leg.move_pct == null ? "—" : fmt(leg.move_pct, 2) + "%"}</td>
-              <td class="${pnlClass(leg.pnl_usdt)}">${leg.pnl_usdt == null ? "—" : fmt(leg.pnl_usdt, 2)}</td>
-              <td class="${leg.tp_ready ? "tp-ready" : "meta"}">${leg.tp_ready ? "ready" : "—"}</td>
-              ${ageCell(lot.age_deadline_at)}
-              <td></td>`;
-            nest.lastElementChild.appendChild(
-              closeBtn("Đóng leg", () =>
-                closeLeg(lot.lot_id, sideRow.side, sideRow.symbol, leg.size),
-              ),
-            );
-            el.body.appendChild(nest);
-          }
+    async function refreshStatus() {
+      try {
+        const res = await fetch('/api/status');
+        if (!res.ok) return;
+        const data = await res.json();
+        const pill = document.getElementById('tradingPill');
+        pill.textContent = 'Trading: ' + (data.trading_enabled ? 'ON' : 'OFF');
+        pill.className = 'status-pill ' + (data.trading_enabled ? 'running' : 'stopped');
+        const rl = document.getElementById('rateLimitPill');
+        if (data.rate_limited) {
+          rl.hidden = false;
+          rl.textContent = 'Rate-limit ' + Math.ceil(data.rate_limit_remaining_sec) + 's';
+        } else {
+          rl.hidden = true;
         }
+        if (data.ema_rsi && data.ema_rsi.trades) {
+          renderTrades(data.ema_rsi.trades);
+        }
+      } catch (_) {}
+    }
+
+    async function loadEquityChart(range) {
+      equityRange = range;
+      document.querySelectorAll('.range-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.range === range);
+      });
+      const res = await fetch('/api/equity-history?range=' + encodeURIComponent(range));
+      if (!res.ok) return;
+      const data = await res.json();
+      const canvas = document.getElementById('equityChart');
+      const empty = document.getElementById('equityEmpty');
+      if (!data.points || !data.points.length) {
+        canvas.hidden = true;
+        empty.hidden = false;
+        if (equityChart) { equityChart.destroy(); equityChart = null; }
+        return;
       }
-
-      function renderLegView(pageRows) {
-        el.head.innerHTML = `<tr>
-          <th>Symbol</th><th>Side</th><th>Lot</th><th>Size</th><th>Entry</th>
-          <th>Mark</th><th>Move %</th><th>PnL</th><th>TP</th><th>Trigger</th>
-          <th>Đóng sau (3d)</th><th></th>
-        </tr>`;
-        el.body.innerHTML = "";
-        if (!pageRows.length) {
-          el.body.innerHTML = `<tr><td colspan="12" class="empty">Không có leg mở.</td></tr>`;
-          return;
-        }
-        for (const row of pageRows) {
-          const tr = document.createElement("tr");
-          tr.innerHTML = `
-            <td><strong>${row.symbol}</strong></td>
-            <td class="${row.side === "long" ? "green" : "red"}">${row.side.toUpperCase()}</td>
-            <td>#${row.lot_id}</td>
-            <td>${fmt(row.size, 4)}</td>
-            <td>${fmt(row.entry, 6)}</td>
-            <td>${fmt(row.mark, 6)}</td>
-            <td class="${pnlClass(row.move_pct)}">${row.move_pct == null ? "—" : fmt(row.move_pct, 2) + "%"}</td>
-            <td class="${pnlClass(row.pnl_usdt)}">${row.pnl_usdt == null ? "—" : fmt(row.pnl_usdt, 2)}</td>
-            <td class="${row.tp_ready ? "tp-ready" : "meta"}">${row.tp_ready ? "ready" : "—"}</td>
-            <td class="meta">${row.entry_trigger || "—"}</td>
-            ${ageCell(row.age_deadline_at)}
-            <td></td>`;
-          tr.lastElementChild.appendChild(
-            closeBtn("Đóng", () => closeLeg(row.lot_id, row.side, row.symbol, row.size)),
-          );
-          el.body.appendChild(tr);
-        }
-      }
-
-      function render() {
-        const source = state.group === "leg" ? state.openLegs : state.openSides;
-        const sorted = sortRows(source);
-        const page = pageSlice(sorted);
-        el.pageLabel.textContent = `${state.page} / ${page.totalPages} (${page.total})`;
-        el.prev.disabled = state.page <= 1;
-        el.next.disabled = state.page >= page.totalPages;
-        const s = state.pnlSummary || {};
-        el.summary.textContent =
-          `Open lots: ${s.open_count ?? 0} · symbols: ${s.open_symbols ?? 0} · ` +
-          `legs: ${s.open_legs ?? 0} · unrealized≈${fmt(s.open_unrealized, 2)} USDT` +
-          (state.rateLimited ? " · RATE-LIMITED" : "") +
-          " · bấm Refresh để cập nhật";
-        if (state.group === "leg") renderLegView(page.rows);
-        else renderPositionView(page.rows);
-      }
-
-      function tickAgeCountdowns() {
-        el.body.querySelectorAll("[data-age-deadline]").forEach((td) => {
-          const deadline = td.getAttribute("data-age-deadline") || "";
-          td.textContent = formatAgeCountdown(deadline);
-          td.className = ageClass(deadline);
+      canvas.hidden = false;
+      empty.hidden = true;
+      const labels = data.points.map(p => p.time_vn);
+      const equity = data.points.map(p => p.equity);
+      const datasets = [{
+        label: 'Equity',
+        data: equity,
+        borderColor: '#58a6ff',
+        backgroundColor: 'rgba(88,166,255,0.1)',
+        fill: true,
+        tension: 0.2,
+        pointRadius: 0,
+      }];
+      if (data.baseline_equity != null) {
+        datasets.push({
+          label: 'Baseline',
+          data: labels.map(() => data.baseline_equity),
+          borderColor: '#8b949e',
+          borderDash: [6, 4],
+          pointRadius: 0,
         });
       }
+      if (equityChart) equityChart.destroy();
+      equityChart = new Chart(canvas, {
+        type: 'line',
+        data: { labels, datasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { labels: { color: '#e6edf3' } } },
+          scales: {
+            x: { ticks: { color: '#8b949e', maxTicksLimit: 8 } },
+            y: { ticks: { color: '#8b949e' } },
+          },
+        },
+      });
+    }
 
-      async function loadPositions() {
-        try {
-          const res = await fetch("/api/positions");
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          const data = await res.json();
-          state.openSides = data.open_sides || [];
-          state.openLegs = data.open_legs || [];
-          state.pnlSummary = data.pnl_summary || null;
-          state.tradingEnabled = !!data.trading_enabled;
-          state.rateLimited = !!data.rate_limited;
-          state.maxLotAgeDays = Number(data.max_lot_age_days) || 0;
-          el.tradingPill.textContent = `Trading: ${state.tradingEnabled ? "ON" : "OFF"}`;
-          el.tradingPill.className = `status-pill ${state.tradingEnabled ? "running" : "stopped"}`;
-          if (state.rateLimited) {
-            el.ratePill.hidden = false;
-            el.ratePill.textContent = `Rate-limit ${fmt(data.rate_limit_remaining_sec, 0)}s`;
-          } else {
-            el.ratePill.hidden = true;
-          }
-          render();
-        } catch (err) {
-          el.body.innerHTML = `<tr><td colspan="12" class="empty">Lỗi tải vị thế: ${err.message}</td></tr>`;
-        }
-      }
+    document.querySelectorAll('.range-btn').forEach(btn => {
+      btn.addEventListener('click', () => loadEquityChart(btn.dataset.range));
+    });
 
-      el.group.addEventListener("change", () => {
-        state.group = el.group.value;
-        state.page = 1;
-        render();
-      });
-      el.sort.addEventListener("change", () => {
-        state.sort = el.sort.value;
-        state.page = 1;
-        render();
-      });
-      el.pageSize.addEventListener("change", () => {
-        state.pageSize = Number(el.pageSize.value) || 20;
-        state.page = 1;
-        render();
-      });
-      el.prev.addEventListener("click", () => {
-        state.page -= 1;
-        render();
-      });
-      el.next.addEventListener("click", () => {
-        state.page += 1;
-        render();
-      });
-      el.refresh.addEventListener("click", () => loadPositions());
-
-      loadPositions();
-      // Local clock only — does not re-fetch /api/positions.
-      setInterval(tickAgeCountdowns, 30000);
-    })();
+    loadEquityChart('7d');
+    refreshStatus();
+    setInterval(refreshStatus, 15000);
+    setInterval(() => loadEquityChart(equityRange), 60000);
   </script>
 </body>
 </html>

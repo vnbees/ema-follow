@@ -175,7 +175,7 @@ def _infer_rest_priority(method: str, path: str) -> str:
     """
     p = (path or "").split("?")[0].rstrip("/")
     method_u = (method or "GET").upper()
-    if p.endswith("/order") or p.endswith("/batchOrders"):
+    if p.endswith("/order") or p.endswith("/batchOrders") or p.endswith("/algoOrder"):
         if method_u == "GET":
             return "optional"
         return "critical"
@@ -234,6 +234,18 @@ def _set_rate_limited_until(until_ms: float, *, kind: str = "padded") -> None:
                 kind,
             )
             _persist_rate_limit(until_ms, kind)
+            if kind in {"padded", "ban"}:
+                try:
+                    from src.notify import notify_error
+
+                    remaining = max(0.0, until_ms - _now_ms()) / 1000
+                    notify_error(
+                        "Binance REST ban",
+                        f"HTTP 418/429 — pause REST {remaining:.0f}s ({kind})",
+                        cooldown_sec=900,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 def _snapshot_rate_limit() -> tuple[float, str]:
@@ -479,6 +491,16 @@ def _private_post(
     return _private_request("POST", path, params, max_retries=max_retries, priority=priority)
 
 
+def _private_delete(
+    path: str,
+    params: dict[str, str | int | float | bool],
+    max_retries: int = 3,
+    *,
+    priority: str | None = None,
+) -> Any:
+    return _private_request("DELETE", path, params, max_retries=max_retries, priority=priority)
+
+
 def _spot_private_request(
     method: str,
     path: str,
@@ -694,6 +716,31 @@ def fetch_contract_spec(symbol: str) -> ContractSpec:
     return _SPEC_CACHE[symbol]
 
 
+def candle_rest_fresh(symbol: str) -> bool:
+    """True when this symbol was REST-seeded recently (BINANCE_CANDLE_REST_SEC)."""
+    from src.config import BINANCE_CANDLE_REST_SEC
+
+    symbol_u = symbol.upper()
+    with _candle_rest_lock:
+        last_rest = _candle_rest_at_mono.get(symbol_u, 0.0)
+    return last_rest > 0 and (time.monotonic() - last_rest) < BINANCE_CANDLE_REST_SEC
+
+
+def candles_trusted_for_entry(symbol: str) -> bool:
+    """WS kline live or recent REST seed — safe to open without another REST confirm."""
+    symbol_u = symbol.upper()
+    try:
+        from src.exchange.binance_ws.manager import is_ws_enabled, kline_fresh
+
+        if not is_ws_enabled():
+            return candle_rest_fresh(symbol_u)
+        if kline_fresh(symbol_u):
+            return True
+        return candle_rest_fresh(symbol_u)
+    except Exception:  # noqa: BLE001
+        return candle_rest_fresh(symbol_u)
+
+
 def fetch_candles_rest(
     symbol: str = SYMBOL,
     *,
@@ -731,40 +778,56 @@ def fetch_candles(
     granularity: str = GRANULARITY,
     limit: int = CANDLE_LIMIT,
     max_retries: int = 3,
+    require_confirmed: bool = False,
+    ws_only: bool = False,
 ) -> list[Candle]:
     global _last_candle_rest_mono
 
     symbol_u = symbol.upper()
-    try:
-        from src.exchange.binance_ws import get_candles_from_ws, watch_symbols
+    trusted = not require_confirmed or candles_trusted_for_entry(symbol_u)
+    if trusted:
+        try:
+            from src.exchange.binance_ws import get_candles_from_ws, watch_symbols
 
-        watch_symbols([symbol_u])
-        cached = get_candles_from_ws(symbol_u, granularity, limit)
-        if cached is not None and len(cached) >= min(limit, 20):
-            return cached
-    except Exception:  # noqa: BLE001 — fall through to REST
-        pass
+            watch_symbols([symbol_u])
+            cached = get_candles_from_ws(
+                symbol_u, granularity, limit, quiet=ws_only
+            )
+            if cached is not None and len(cached) >= min(limit, 20):
+                return cached
+        except Exception:  # noqa: BLE001 — fall through to REST
+            pass
 
-    # Within cooldown: reuse last REST seed if it is still a valid closed series.
-    try:
-        from src.candles import is_candle_series_stale
-        from src.config import BINANCE_CANDLE_REST_SEC, INTERVAL_MINUTES
-        from src.exchange.binance_ws.cache import CACHE
-        from src.exchange.binance_ws.manager import is_ws_enabled
+        # Within cooldown: reuse last REST seed if it is still a valid closed series.
+        try:
+            from src.candles import is_candle_series_stale
+            from src.config import BINANCE_CANDLE_REST_SEC, INTERVAL_MINUTES
+            from src.exchange.binance_ws.cache import CACHE
+            from src.exchange.binance_ws.manager import is_ws_enabled
 
-        with _candle_rest_lock:
-            last_rest = _candle_rest_at_mono.get(symbol_u, 0.0)
-        if last_rest > 0 and (time.monotonic() - last_rest) < BINANCE_CANDLE_REST_SEC:
-            if is_ws_enabled():
-                rows = CACHE.get_candles(symbol_u, granularity, limit)
-                if (
-                    rows is not None
-                    and len(rows) >= min(limit, 20)
-                    and not is_candle_series_stale(rows, interval_minutes=INTERVAL_MINUTES)
-                ):
-                    return rows
-    except Exception:  # noqa: BLE001
-        pass
+            with _candle_rest_lock:
+                last_rest = _candle_rest_at_mono.get(symbol_u, 0.0)
+            if last_rest > 0 and (time.monotonic() - last_rest) < BINANCE_CANDLE_REST_SEC:
+                if is_ws_enabled():
+                    rows = CACHE.get_candles(symbol_u, granularity, limit)
+                    if (
+                        rows is not None
+                        and len(rows) >= min(limit, 20)
+                        and not is_candle_series_stale(rows, interval_minutes=INTERVAL_MINUTES)
+                    ):
+                        return rows
+        except Exception:  # noqa: BLE001
+            pass
+    elif require_confirmed:
+        logging.info(
+            "Binance entry confirm — REST klines for %s (WS kline not fresh)",
+            symbol_u,
+        )
+
+    if ws_only:
+        raise ExchangeClientError(
+            f"WS candles unavailable for {symbol_u} (scan skips REST to avoid rate limit)"
+        )
 
     if is_optional_rest_blocked():
         raise RateLimitError(
@@ -1081,8 +1144,7 @@ def fetch_symbol_positions(symbol: str) -> dict[str, Position]:
         )
 
         watch_symbols([symbol])
-        # Never auto-flush here (see fetch_futures_balance). Explicit post-order
-        # flush lives in rsi_trading._flush_post_order_reconcile only.
+        # Never auto-flush here. Explicit post-order flush lives in ema_rsi trading paths only.
         cached = get_symbol_positions_from_ws(symbol)
         if cached is not None:
             return cached
@@ -1210,19 +1272,61 @@ def fetch_order_detail(symbol: str, order_id: str) -> dict:
             "REST resume/ban — optional GET /fapi/v1/order skipped "
             f"({optional_rest_blocked_sec():.0f}s remaining)"
         )
+    try:
+        data = _private_get(
+            "/fapi/v1/order",
+            {"symbol": symbol.upper(), "orderId": order_id},
+            priority="optional",
+        )
+        status = str(data.get("status", "")).lower()
+        avg_price = data.get("avgPrice")
+        return {
+            "orderId": str(data.get("orderId", order_id)),
+            "status": status,
+            "state": status,
+            "avgPrice": avg_price,
+            "priceAvg": avg_price,
+        }
+    except ExchangeClientError:
+        return fetch_algo_order_detail(symbol, order_id)
+
+
+def fetch_open_algo_orders(symbol: str) -> list[dict]:
+    """Open conditional (algo) orders for one symbol."""
+    if is_optional_rest_blocked():
+        return []
     data = _private_get(
-        "/fapi/v1/order",
-        {"symbol": symbol.upper(), "orderId": order_id},
+        "/fapi/v1/openAlgoOrders",
+        {"symbol": symbol.upper()},
         priority="optional",
     )
-    status = str(data.get("status", "")).lower()
-    avg_price = data.get("avgPrice")
+    if not isinstance(data, list):
+        return []
+    return data
+
+
+def fetch_algo_order_detail(symbol: str, algo_id: str) -> dict:
+    if is_optional_rest_blocked():
+        raise RateLimitError(
+            "REST resume/ban — optional GET /fapi/v1/algoOrder skipped "
+            f"({optional_rest_blocked_sec():.0f}s remaining)"
+        )
+    params: dict[str, str | int | float | bool] = {"symbol": symbol.upper()}
+    try:
+        params["algoId"] = int(algo_id)
+    except (TypeError, ValueError):
+        params["clientAlgoId"] = algo_id
+    data = _private_get("/fapi/v1/algoOrder", params, priority="optional")
+    status = str(data.get("algoStatus") or data.get("status") or "").lower()
+    avg = data.get("actualPrice") or data.get("avgPrice")
     return {
-        "orderId": str(data.get("orderId", order_id)),
+        "orderId": str(data.get("algoId") or algo_id),
         "status": status,
         "state": status,
-        "avgPrice": avg_price,
-        "priceAvg": avg_price,
+        "avgPrice": avg,
+        "priceAvg": avg,
+        "stopPrice": data.get("triggerPrice"),
+        "symbol": str(data.get("symbol") or symbol).upper(),
     }
 
 
@@ -1290,7 +1394,7 @@ def set_dual_side_position() -> None:
     try:
         _private_post("/fapi/v1/positionSide/dual", {"dualSidePosition": "true"})
     except ExchangeClientError as exc:
-        _ignore_config_error(exc, "-4059", "-4061")
+        _ignore_config_error(exc, "-4059", "-4061", "-4067")
 
 
 def set_margin_type(symbol: str) -> None:
@@ -1381,6 +1485,91 @@ def close_position_side(symbol: str, hold_side: str, size: str) -> dict:
     )
 
 
+def place_algo_close_order(
+    symbol: str,
+    *,
+    hold_side: str,
+    order_type: str,
+    stop_price: str,
+    client_oid: str | None = None,
+) -> dict:
+    """STOP_MARKET / TAKE_PROFIT_MARKET with closePosition (hedge mode)."""
+    kind = order_type.upper()
+    if kind not in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
+        raise ExchangeClientError(f"Unsupported algo type: {order_type}")
+    order_side, position_side = market_order_params(hold_side, "close")
+    oid = client_oid or f"bot_{uuid.uuid4().hex[:16]}"
+    params: dict[str, str | int | float | bool] = {
+        "algoType": "CONDITIONAL",
+        "symbol": symbol.upper(),
+        "type": kind,
+        "side": order_side,
+        "positionSide": position_side,
+        "triggerPrice": stop_price,
+        "closePosition": "true",
+        "workingType": "CONTRACT_PRICE",
+        "clientAlgoId": oid,
+    }
+    result = _private_post("/fapi/v1/algoOrder", params)
+    try:
+        from src.exchange.binance_ws import on_order_placed
+
+        on_order_placed(symbol)
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Binance WS post-algo reconcile skipped: %s", exc)
+    algo_id = str(result.get("algoId") or result.get("orderId") or "")
+    status = str(result.get("algoStatus") or result.get("status") or "").lower()
+    return {
+        "orderId": algo_id,
+        "clientOid": str(result.get("clientAlgoId") or result.get("clientOrderId") or oid),
+        "status": status,
+        "stopPrice": result.get("triggerPrice") or result.get("stopPrice") or stop_price,
+    }
+
+
+def cancel_order(symbol: str, order_id: str) -> dict:
+    if not order_id:
+        return {}
+    last_exc: ExchangeClientError | None = None
+    try:
+        algo_params: dict[str, str | int | float | bool] = {"symbol": symbol.upper()}
+        try:
+            algo_params["algoId"] = int(order_id)
+        except (TypeError, ValueError):
+            algo_params["clientAlgoId"] = order_id
+        result = _private_delete("/fapi/v1/algoOrder", algo_params)
+        return {
+            "orderId": str(result.get("algoId") or order_id),
+            "status": str(result.get("algoStatus") or result.get("status") or "canceled").lower(),
+        }
+    except ExchangeClientError as exc:
+        msg = str(exc).lower()
+        if "-2011" in msg or "unknown order" in msg:
+            return {"status": "canceled"}
+        last_exc = exc
+    try:
+        result = _private_delete(
+            "/fapi/v1/order",
+            {"symbol": symbol.upper(), "orderId": int(order_id)},
+        )
+    except (TypeError, ValueError):
+        result = _private_delete(
+            "/fapi/v1/order",
+            {"symbol": symbol.upper(), "orderId": order_id},
+        )
+    except ExchangeClientError as exc:
+        msg = str(exc).lower()
+        if "-2011" in msg or "unknown order" in msg:
+            return {"status": "canceled"}
+        if last_exc is not None:
+            raise last_exc from exc
+        raise
+    return {
+        "orderId": str(result.get("orderId", order_id)),
+        "status": str(result.get("status", "")).lower(),
+    }
+
+
 class BinanceExchange:
     has_credentials = staticmethod(has_credentials)
     fetch_candles = staticmethod(fetch_candles)
@@ -1396,6 +1585,8 @@ class BinanceExchange:
     fetch_order_detail = staticmethod(fetch_order_detail)
     configure_symbol_trading = staticmethod(configure_symbol_trading)
     place_market_order = staticmethod(place_market_order)
+    place_algo_close_order = staticmethod(place_algo_close_order)
+    cancel_order = staticmethod(cancel_order)
     close_position_side = staticmethod(close_position_side)
     transfer_futures_to_spot = staticmethod(transfer_futures_to_spot)
     fetch_spot_balance = staticmethod(fetch_spot_balance)

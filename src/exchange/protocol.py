@@ -18,6 +18,8 @@ class ExchangeClient(Protocol):
         *,
         granularity: str,
         limit: int,
+        require_confirmed: bool = False,
+        ws_only: bool = False,
     ) -> list[Candle]: ...
 
     def fetch_top_futures_by_volume(self, limit: int | None = None) -> list[tuple[str, float]]: ...
@@ -52,6 +54,18 @@ class ExchangeClient(Protocol):
         trade_side: str | None = None,
         reduce_only: bool = False,
     ) -> dict: ...
+
+    def place_algo_close_order(
+        self,
+        symbol: str,
+        *,
+        hold_side: str,
+        order_type: str,
+        stop_price: str,
+        client_oid: str | None = None,
+    ) -> dict: ...
+
+    def cancel_order(self, symbol: str, order_id: str) -> dict: ...
 
     def close_position_side(self, symbol: str, hold_side: str, size: str) -> dict: ...
 

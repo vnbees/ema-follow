@@ -52,7 +52,7 @@ class TestDashboardAuth(unittest.TestCase):
 
         home = self.client.get("/", follow_redirects=False)
         self.assertEqual(home.status_code, 200)
-        self.assertIn(b"RSI Bot", home.content)
+        self.assertIn(b"EMA RSI", home.content)
 
     def test_login_wrong_password(self) -> None:
         res = self.client.post(

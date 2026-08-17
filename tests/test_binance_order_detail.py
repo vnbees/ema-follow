@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from src.exchange.binance import fetch_order_detail
-from src.trading import _parse_fill_price
+from src.exchange.fills import parse_fill_price
 
 
 class TestBinanceOrderDetail(unittest.TestCase):
@@ -16,7 +16,7 @@ class TestBinanceOrderDetail(unittest.TestCase):
         }
         detail = fetch_order_detail("SYNUSDT", "1959162733")
         self.assertEqual(detail["status"], "filled")
-        self.assertAlmostEqual(_parse_fill_price(detail), 0.4285)
+        self.assertAlmostEqual(parse_fill_price(detail), 0.4285)
         private_get.assert_called_once()
         self.assertEqual(private_get.call_args.kwargs.get("priority"), "optional")
 

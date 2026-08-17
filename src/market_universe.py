@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timezone
 
 from src.exchange import ExchangeClientError, fetch_top_futures_by_volume
+from src.notify import notify_error
 
 _lock = threading.Lock()
 _volume_rank: list[tuple[str, float]] = []
@@ -41,6 +42,7 @@ def refresh_volume_rank(
         rows = fetch_top_futures_by_volume(limit=None)
     except ExchangeClientError as exc:
         logging.warning("Failed to refresh volume rank: %s", exc)
+        notify_error("EMA-RSI volume rank", str(exc))
         with _lock:
             return list(_volume_rank)
 

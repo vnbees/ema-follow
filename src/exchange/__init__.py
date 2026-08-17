@@ -61,12 +61,20 @@ def has_credentials() -> bool:
 def fetch_candles(symbol: str, **kwargs):
     granularity = kwargs.get("granularity")
     limit = kwargs.get("limit")
+    require_confirmed = kwargs.get("require_confirmed", False)
+    ws_only = kwargs.get("ws_only", False)
     if granularity is None or limit is None:
         from src.config import CANDLE_LIMIT, GRANULARITY
 
         granularity = granularity or GRANULARITY
         limit = limit or CANDLE_LIMIT
-    return _client().fetch_candles(symbol, granularity=granularity, limit=limit)
+    return _client().fetch_candles(
+        symbol,
+        granularity=granularity,
+        limit=limit,
+        require_confirmed=require_confirmed,
+        ws_only=ws_only,
+    )
 
 
 def fetch_top_futures_by_volume(limit: int | None = None, **kwargs) -> list[tuple[str, float]]:
@@ -139,6 +147,27 @@ def place_market_order(
     )
 
 
+def place_algo_close_order(
+    symbol: str,
+    *,
+    hold_side: str,
+    order_type: str,
+    stop_price: str,
+    client_oid: str | None = None,
+) -> dict:
+    return _client().place_algo_close_order(
+        symbol,
+        hold_side=hold_side,
+        order_type=order_type,
+        stop_price=stop_price,
+        client_oid=client_oid,
+    )
+
+
+def cancel_order(symbol: str, order_id: str) -> dict:
+    return _client().cancel_order(symbol, order_id)
+
+
 def close_position_side(symbol: str, hold_side: str, size: str, **kwargs) -> dict:
     _ = kwargs
     return _client().close_position_side(symbol, hold_side, size)
@@ -189,6 +218,8 @@ __all__ = [
     "get_client",
     "has_credentials",
     "notional_to_size",
+    "place_algo_close_order",
     "place_market_order",
+    "cancel_order",
     "transfer_futures_to_spot",
 ]

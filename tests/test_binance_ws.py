@@ -496,7 +496,8 @@ class TestRateLimitPersist(unittest.TestCase):
             try:
                 binance._RATE_LIMIT_FILE = path
                 binance._rate_limited_until_ms = 0.0
-                binance._set_rate_limited_until(until, kind="padded")
+                with patch("src.notify.notify_error"):
+                    binance._set_rate_limited_until(until, kind="padded")
                 self.assertTrue(path.is_file())
                 binance._rate_limited_until_ms = 0.0
                 binance._rate_limit_kind = "ban"

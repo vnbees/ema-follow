@@ -8,7 +8,17 @@ class BitgetExchange:
     def has_credentials(self) -> bool:
         return bg.has_credentials()
 
-    def fetch_candles(self, symbol: str, *, granularity: str, limit: int) -> list:
+    def fetch_candles(
+        self,
+        symbol: str,
+        *,
+        granularity: str,
+        limit: int,
+        require_confirmed: bool = False,
+        ws_only: bool = False,
+    ) -> list:
+        _ = require_confirmed
+        _ = ws_only
         return bg.fetch_candles(symbol=symbol, granularity=granularity, limit=limit)
 
     def fetch_top_futures_by_volume(self, limit: int | None = None) -> list[tuple[str, float]]:
@@ -65,6 +75,21 @@ class BitgetExchange:
 
     def close_position_side(self, symbol: str, hold_side: str, size: str) -> dict:
         return bg.close_position_side(symbol, hold_side, size)
+
+    def place_algo_close_order(
+        self,
+        symbol: str,
+        *,
+        hold_side: str,
+        order_type: str,
+        stop_price: str,
+        client_oid: str | None = None,
+    ) -> dict:
+        raise ExchangeClientError("Algo SL/TP orders are only supported on Binance")
+
+    def cancel_order(self, symbol: str, order_id: str) -> dict:
+        bg.cancel_order(symbol, order_id)
+        return {"orderId": order_id, "status": "canceled"}
 
     def transfer_futures_to_spot(self, asset: str, amount: float) -> dict:
         try:

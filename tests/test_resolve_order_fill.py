@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from src.trading import resolve_order_fill
+from src.exchange.fills import resolve_order_fill
 
 
 class TestResolveOrderFill(unittest.TestCase):
@@ -13,12 +13,12 @@ class TestResolveOrderFill(unittest.TestCase):
         )
         self.assertAlmostEqual(price, 100.5)
 
-    @patch("src.trading.time.sleep")
-    @patch("src.trading._fill_from_ws", return_value=None)
-    @patch("src.trading.fetch_side_mark_price", return_value=101.0)
-    @patch("src.trading.exchange_fetch_order_detail")
-    @patch("src.trading._uds_connected", return_value=False)
-    @patch("src.trading._optional_rest_blocked", return_value=False)
+    @patch("src.exchange.fills.time.sleep")
+    @patch("src.exchange.fills._fill_from_ws", return_value=None)
+    @patch("src.exchange.fills.fetch_side_mark_price", return_value=101.0)
+    @patch("src.exchange.fills.exchange_fetch_order_detail")
+    @patch("src.exchange.fills._uds_connected", return_value=False)
+    @patch("src.exchange.fills._optional_rest_blocked", return_value=False)
     def test_poll_order_detail(self, _blocked, _uds, fetch_detail, _mark, _ws, _sleep):
         fetch_detail.return_value = {"status": "filled", "avgPrice": "98.25"}
         price = resolve_order_fill(
@@ -29,26 +29,28 @@ class TestResolveOrderFill(unittest.TestCase):
         self.assertAlmostEqual(price, 98.25)
         fetch_detail.assert_called_once()
 
-    @patch("src.trading.time.sleep")
-    @patch("src.trading._fill_from_ws", return_value=None)
-    @patch("src.trading.fetch_side_mark_price", return_value=0.0)
-    @patch("src.trading.exchange_fetch_order_detail")
-    @patch("src.trading._uds_connected", return_value=False)
-    @patch("src.trading._optional_rest_blocked", return_value=False)
+    @patch("src.exchange.fills.time.sleep")
+    @patch("src.exchange.fills._fill_from_ws", return_value=None)
+    @patch("src.exchange.fills.fetch_side_mark_price", return_value=0.0)
+    @patch("src.exchange.fills.exchange_fetch_order_detail")
+    @patch("src.exchange.fills._uds_connected", return_value=False)
+    @patch("src.exchange.fills._optional_rest_blocked", return_value=False)
     def test_fallback_price(self, _blocked, _uds, fetch_detail, _mark, _ws, _sleep):
         fetch_detail.return_value = {"status": "new", "avgPrice": "0"}
-        price = resolve_order_fill(
-            "BTCUSDT",
-            {"orderId": "99"},
-            fallback_price=96.5,
-        )
+        with patch("src.exchange.fills.notify_error") as nerr:
+            price = resolve_order_fill(
+                "BTCUSDT",
+                {"orderId": "99"},
+                fallback_price=96.5,
+            )
         self.assertAlmostEqual(price, 96.5)
+        nerr.assert_called_once()
 
-    @patch("src.trading.time.sleep")
-    @patch("src.trading._fill_from_ws", return_value=None)
-    @patch("src.trading.fetch_side_mark_price", return_value=0.3309)
-    @patch("src.trading.exchange_fetch_order_detail")
-    @patch("src.trading._optional_rest_blocked", return_value=True)
+    @patch("src.exchange.fills.time.sleep")
+    @patch("src.exchange.fills._fill_from_ws", return_value=None)
+    @patch("src.exchange.fills.fetch_side_mark_price", return_value=0.3309)
+    @patch("src.exchange.fills.exchange_fetch_order_detail")
+    @patch("src.exchange.fills._optional_rest_blocked", return_value=True)
     def test_skip_rest_fill_poll_during_resume(self, _blocked, fetch_detail, _mark, _ws, _sleep):
         price = resolve_order_fill(
             "TRXUSDT",
@@ -58,12 +60,12 @@ class TestResolveOrderFill(unittest.TestCase):
         self.assertAlmostEqual(price, 0.3309)
         fetch_detail.assert_not_called()
 
-    @patch("src.trading.time.sleep")
-    @patch("src.trading._fill_from_ws", return_value=None)
-    @patch("src.trading.fetch_side_mark_price", return_value=0.3309)
-    @patch("src.trading.exchange_fetch_order_detail")
-    @patch("src.trading._uds_connected", return_value=True)
-    @patch("src.trading._optional_rest_blocked", return_value=False)
+    @patch("src.exchange.fills.time.sleep")
+    @patch("src.exchange.fills._fill_from_ws", return_value=None)
+    @patch("src.exchange.fills.fetch_side_mark_price", return_value=0.3309)
+    @patch("src.exchange.fills.exchange_fetch_order_detail")
+    @patch("src.exchange.fills._uds_connected", return_value=True)
+    @patch("src.exchange.fills._optional_rest_blocked", return_value=False)
     def test_skip_rest_fill_poll_when_uds_connected(
         self, _blocked, _uds, fetch_detail, _mark, _ws, _sleep
     ):
@@ -75,9 +77,9 @@ class TestResolveOrderFill(unittest.TestCase):
         self.assertAlmostEqual(price, 0.3309)
         fetch_detail.assert_not_called()
 
-    @patch("src.trading.time.sleep")
-    @patch("src.trading._fill_from_ws", return_value=0.5797)
-    @patch("src.trading.exchange_fetch_order_detail")
+    @patch("src.exchange.fills.time.sleep")
+    @patch("src.exchange.fills._fill_from_ws", return_value=0.5797)
+    @patch("src.exchange.fills.exchange_fetch_order_detail")
     def test_prefers_ws_fill(self, fetch_detail, _ws, _sleep):
         price = resolve_order_fill(
             "JTOUSDT",

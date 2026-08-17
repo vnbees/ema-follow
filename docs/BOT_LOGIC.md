@@ -1,10 +1,10 @@
-# Tổng hợp logic bot RSI hedged (USDT-M)
+# Bot EMA200 + RSI swing (USDT-M)
 
-Bot chạy vòng **5 phút**, chiến lược **cặp long + short** (hedge mode), tín hiệu **RSI(14)** trên nến **5m**, chốt lãi theo **% giá** (mặc định 2%).
+Bot chạy vòng **5 phút**, chiến lược **một chiều** (long hoặc short), tín hiệu **EMA200 + RSI swing** trên nến **5m**, thoát bằng **SL/TP algo** (RR 1:2).
 
 Hỗ trợ **Bitget** hoặc **Binance** USDT-M qua `EXCHANGE=bitget|binance`.
 
-**Path đang chạy:** `python -m src.main` → RSI hedge + dashboard. Các module legacy (EMA/SAR, Supertrend, Ichimoku, OFI trading) vẫn có trong repo nhưng **không** được `main.py` gọi.
+**Entry point:** `python -m src.main` → `src/ema_rsi/cycle.py`
 
 ---
 
@@ -12,758 +12,219 @@ Hỗ trợ **Bitget** hoặc **Binance** USDT-M qua `EXCHANGE=bitget|binance`.
 
 | Env | Ý nghĩa |
 |-----|---------|
-| `EXCHANGE=bitget` | Default — Bitget USDT-M |
-| `EXCHANGE=binance` | Binance USDT-M mainnet (`fapi.binance.com`) |
+| `EXCHANGE=bitget` | Bitget USDT-M |
+| `EXCHANGE=binance` | Binance USDT-M (`fapi.binance.com`) |
 | `BITGET_*` | API key Bitget (passphrase bắt buộc) |
 | `BINANCE_API_KEY` / `BINANCE_SECRET_KEY` | API key Binance Futures |
 
-**Checklist đổi sàn:**
-
-1. Tắt bot (`TRADING_ENABLED=false` hoặc Ctrl+C)
-2. Đổi `EXCHANGE` + credentials tương ứng
-3. Dùng `DATABASE_PATH` riêng hoặc `clear_dashboard_history()` — tránh lot lẫn sàn
-4. Bật **Hedge Mode** (Dual Side Position) trên app sàn
-5. Binance: API key cần quyền **Futures**
-6. Restart `python -m src.main`
-
-Code: [`src/exchange/`](src/exchange/) — facade; Bitget adapter bọc [`src/bitget_client.py`](src/bitget_client.py); Binance tại [`src/exchange/binance.py`](src/exchange/binance.py).
+Code: [`src/exchange/`](src/exchange/) — facade; Bitget bọc [`src/bitget_client.py`](../src/bitget_client.py); Binance tại [`src/exchange/binance.py`](../src/exchange/binance.py).
 
 ---
 
-## 1. Kiến trúc tổng quan
+## 1. Kiến trúc
 
 ```mermaid
 flowchart TB
-    main["main.py — vòng lặp 5m"]
-    main --> blocked["close_all_blocked_symbols"]
-    main --> mg["process_margin_guard_cycle"]
-    main --> refresh["refresh_volume_rank"]
-    main --> sync_pos["get_managed_symbols / sync sàn"]
-    main --> profit_chk["check_profit_target"]
-    main --> managed["Quét symbol đang track"]
-    main --> scan["Quét coin mới theo volume"]
-    managed --> eval["evaluate_rsi_trade"]
-    scan --> eval
-    eval --> preflight["ensure_available_for_pair"]
-    eval --> exchange["Exchange API hedge mode"]
-    eval --> db["rsi_pair_lots DB"]
+    main["main.py → ema_rsi/cycle.py"]
+    main --> ws["Binance WS (optional)"]
+    main --> scan["Volume rank scan"]
+    main --> entry["open_signal — market + SL/TP algo"]
+    main --> watcher["watcher.py — đóng lệnh"]
+    entry --> db["ema_rsi_trades SQLite"]
     main --> web["Dashboard :8080"]
-    mg --> delev["deleverage / liquidate_all_hedge_pairs"]
+    watcher --> db
 ```
 
-| Thành phần | Vai trò |
-|------------|---------|
-| `main.py` | Điều phối cycle, scan, margin guard, log balance |
-| `rsi_trading.py` | Mở/đóng cặp, chốt lãi, stack, blocked symbol, hedge liquidate |
-| `rsi_signals.py` | RSI cross, công thức TP theo % giá |
-| `rsi_positions.py` | Sync sàn ↔ DB, danh sách symbol quản lý |
-| `margin_guard.py` | Phân tầng maintenance margin, chặn mở mới, deleverage |
-| `margin_preflight.py` | Check available trước `_open_pair`, giải phóng margin |
-| `order_sizing.py` | Tính margin/size từ equity |
-| `exchange/symbols.py` | Filter USDC / symbol không trade được |
-| `database.py` | Bảng `rsi_pair_lots` — FIFO từng lần vào cặp |
-| `src/exchange/` | Facade Bitget / Binance, hedge orders |
-| `profit_target.py` | Chốt toàn portfolio (optional) |
-| `web/app.py` | Dashboard lot FIFO, margin guard, PnL calendar |
-
-**Đã bỏ khỏi path RSI:** RSI 1 chiều, DCA, thoát RSI 75/25, manual hold UI.
+| Module | Vai trò |
+|--------|---------|
+| `src/ema_rsi/cycle.py` | Vòng 5m: scan, mở lệnh, log balance/equity |
+| `src/ema_rsi/signals.py` | EMA cross + RSI zone, tính SL/TP |
+| `src/ema_rsi/trading.py` | Mở/đóng, sizing, algo SL/TP, orphan reconcile |
+| `src/ema_rsi/watcher.py` | Theo dõi fill SL/TP qua WS + REST confirm |
+| `src/ema_rsi/store.py` | SQLite `ema_rsi_trades`, dedupe signal |
+| `src/exchange/` | REST + WS, hedge orders, algo orders |
+| `src/web/app.py` | Dashboard EMA-RSI |
 
 ---
 
-## 2. Khởi động (`python -m src.main`)
+## 2. Tín hiệu vào lệnh
 
-1. `init_db()` — tạo/migrate DB (`rsi_pair_lots`, …)
-2. `restore_tracked_positions()` — log lot đang mở từ DB
-3. `refresh_volume_rank()` — load ranking volume USDT-M (đã lọc USDC)
-4. Nếu `TRADING_ENABLED`: `close_all_blocked_symbols()` (startup)
-5. Bật **dashboard** FastAPI port `WEB_PORT` (8080)
-6. Vòng lặp vô hạn: `run_cycle()` → sleep đến **mốc 5 phút** tiếp theo
+**Khung:** nến 5m đã đóng.
 
-**Yêu cầu:** API sàn + **hedge mode**. `TRADING_ENABLED=false` → chỉ sync/dashboard, không đặt lệnh.
+**Long:**
+1. Trong cùng swing trước đó, RSI(14) đã **< 25**
+2. Nến hiện tại **đóng cửa cắt lên** EMA200 (cross up)
+3. SL = **đáy thấp nhất** trong vùng RSI < 25
+4. TP = entry + 2×R (RR 1:2)
 
----
+**Short:** đối xứng — RSI **> 75**, cross **xuống** EMA200, SL = **đỉnh cao nhất** vùng RSI > 75.
 
-## 3. Một cycle 5 phút (`run_cycle`)
-
-```mermaid
-sequenceDiagram
-    participant C as Cycle
-    participant MG as MarginGuard
-    participant P as ProfitTarget
-    participant M as Managed symbols
-    participant S as Volume scan
-
-    C->>C: refresh_volume_rank
-    C->>C: close_all_blocked_symbols
-    C->>MG: process_margin_guard_cycle
-    alt critical liquidation
-        MG->>MG: liquidate_all_hedge_pairs → skip cycle
-    end
-    C->>C: get_managed_symbols
-    C->>P: check_profit_target
-    alt PROFIT_TARGET_PCT hit
-        P->>P: liquidate_all_hedge_pairs → skip cycle
-    end
-    loop Mỗi symbol managed
-        C->>M: evaluate_rsi_trade
-    end
-    alt count_open_symbols < MAX và không block scan
-        loop Volume rank (dừng khi có cross)
-            C->>S: scan_only symbol mới (is_tradeable_symbol)
-        end
-    end
-    C->>C: log balance + margin stats dashboard
-```
-
-**Thứ tự chi tiết:**
-
-1. Refresh volume rank (~600+ perpetual, **bỏ USDC**)
-2. `close_all_blocked_symbols()` — đóng mọi vị thế symbol blocked (vd. USDCUSDT)
-3. `process_margin_guard_cycle()` — đo maint margin, có thể deleverage / đóng hết / chặn scan
-4. Nếu `guard.skip_cycle` (critical) → **bỏ qua** phần còn lại của cycle
-5. Sync managed symbols
-6. `check_profit_target()` — nếu hit → `liquidate_all_hedge_pairs`, skip cycle
-7. Với **mỗi symbol managed**: RSI + `evaluate_rsi_trade` (luôn chạy cycle TP)
-8. Scan coin mới nếu: `count_open_symbols < MAX_OPEN_SYMBOLS` **và** margin guard **không** `block_new_entries`
-9. Log balance (equity, available, maint %, initial %)
-
-**Symbol được track** = có lot open trong DB **hoặc** còn size trên sàn (`sync_exchange_positions`).
+**Bỏ qua nếu:**
+- SL sai phía (long: SL ≥ entry; short: SL ≤ entry)
+- Symbol đã có position (DB hoặc sàn)
+- Đạt `EMA_RSI_MAX_OPEN` (mặc định 20)
+- Signal candle đã xử lý (`ema_rsi_seen_signals`)
+- **Entry confirm fail:** WS kline chưa fresh → bắt buộc REST klines; signal không khớp sau confirm → skip (`signal_mismatch`, `candles_unconfirmed`, …)
 
 ---
 
-## 4. Lọc symbol (scan & trade)
-
-[`src/exchange/symbols.py`](src/exchange/symbols.py):
-
-| Rule | Mô tả |
-|------|--------|
-| `is_scan_symbol` / `is_tradeable_symbol` | Chỉ `*USDT`, loại `*USDC`, `USDCUSDT`, mọi symbol chứa `USDC` |
-| Scan volume | Binance + Bitget đều áp dụng filter khi rank |
-| Tuổi niêm yết (Binance) | `MIN_LISTING_AGE_DAYS` (mặc định 30): loại khỏi **scan universe** symbol có `onboardDate` mới hơn N ngày (exchangeInfo, cache sẵn). Chỉ chặn entry mới qua scan — lot đang có không bị force-close |
-| `_open_pair` | Từ chối symbol blocked |
-| `evaluate_rsi_trade` | Gọi `_force_close_blocked_symbol` nếu symbol blocked còn lot/vị thế |
-| `close_all_blocked_symbols` | Startup + đầu mỗi cycle — đóng L+S + sync DB |
-
----
-
-## 5. Sử dụng vốn (sizing)
-
-Công thức trong `order_sizing.py`:
+## 3. Sizing
 
 | Bước | Công thức |
 |------|-----------|
-| Margin mỗi **leg** | `max(ORDER_MARGIN_MIN_USDT, equity × ORDER_MARGIN_PCT / 100)` |
+| Equity | REST `/fapi/v2/account` mỗi lần vào lệnh (không dùng cache WS) |
+| Margin | `max(MIN, equity × EMA_RSI_MARGIN_PCT / 100)` — mặc định **1%** |
 | Notional | `margin × LEVERAGE` |
-| Size coin | `notional / price` (làm tròn theo contract spec sàn) |
+| Size | `notional / entry` (làm tròn theo contract spec) |
 
-**Ví dụ** (`.env` mặc định): equity 200 USDT, `ORDER_MARGIN_PCT=0.5`, `LEVERAGE=10`
-
-- Margin/leg = max(1, 200×0.5%) = **1 USDT**
-- Notional/leg = **10 USDT**
-- **Một cặp** (long + short) ≈ **2 USDT margin**, ~20 USDT notional tổng
-
-Margin **tính lại mỗi lần** `_open_pair` theo **equity** (không phải available). Mỗi lot lưu `margin_usdt` tại thời điểm mở.
-
-**Giới hạn exposure:**
-
-- `MAX_OPEN_SYMBOLS=20` → tối đa **20 coin distinct**
-- Mỗi coin có thể **nhiều lot** (stack) → margin thực tế có thể >> 20×2 leg
+Mặc định: `LEVERAGE=10`, `EMA_RSI_MARGIN_PCT=1` → equity 1000 USDT → margin 10 USDT → notional 100 USDT.
 
 ---
 
-## 6. Hedge mode — Bitget & Binance
+## 4. Thực thi lệnh
 
-### Bitget
+1. `configure_symbol_trading` — cross margin + leverage
+2. Market open (long hoặc short, hedge mode)
+3. Đặt **STOP_MARKET** (SL) và **TAKE_PROFIT_MARKET** (TP) qua `/fapi/v1/algoOrder`
+4. Ghi DB + Discord notify mở lệnh
 
-- `set_position_mode` → **hedge_mode**
-- Mỗi lệnh: `holdSide` (long/short) + `tradeSide` (open/close)
-- Long luôn `buy`, short luôn `sell` (cả mở và đóng)
-
-| Hành động | `side` | `tradeSide` | `holdSide` |
-|-----------|--------|-------------|------------|
-| Mở long | `buy` | `open` | `long` |
-| Mở short | `sell` | `open` | `short` |
-| Đóng long | `buy` | `close` | `long` |
-| Đóng short | `sell` | `close` | `short` |
-
-### Binance
-
-- Dual Side Position (hedge) qua `set_dual_side_position()`
-- `market_order_params(hold_side, trade_side)` → `(side, positionSide)`:
-
-| Hành động | side | positionSide |
-|-----------|------|--------------|
-| Mở long | BUY | LONG |
-| Mở short | SELL | SHORT |
-| Đóng long | SELL | LONG |
-| Đóng short | BUY | SHORT |
-
-- Hedge close: **không** dùng `reduceOnly` (Binance `-1106` trên hedge mode)
-- `MARGIN_MODE=crossed`, `LEVERAGE=10` (config)
-
-### Chung
-
-- Mở cặp: market open long + market open short cùng size
-- Đóng leg: `close_position_side(symbol, hold_side, size)`
-- `close_hedge_symbol` — đóng cả long + short, sync DB
-- `liquidate_all_hedge_pairs` — đóng mọi symbol (margin critical, profit target)
-- `_verify_side_reduced` — log nếu size không giảm sau close
+**Một symbol = một vị thế** — không stack, không flip.
 
 ---
 
-## 7. Tín hiệu RSI
+## 5. Đóng lệnh (watcher)
 
-- Nến **5m** đã đóng, RSI **14** (Wilder)
-- Cần tối thiểu `RSI_PERIOD + 2` nến
+Thread riêng (`EMA_RSI_WATCHER_INTERVAL_SEC`, mặc định 2s):
 
-| Cross | Điều kiện | Trigger |
-|-------|-----------|---------|
-| **cross↑25** | `prev_rsi ≤ 25` và `rsi > 25` | `rsi_cross_25` |
-| **cross↓75** | `prev_rsi ≥ 75` và `rsi < 75` | `rsi_cross_75` |
+- Chỉ đóng DB khi **REST xác nhận position flat** (tránh false close từ WS stale)
+- SL/TP algo phải **filled** (không coi `triggered` là đóng xong)
+- Hủy lệnh còn lại (TP khi hit SL, SL khi hit TP) sau khi position thật sự flat
+- **Orphan reconcile:** nếu DB closed nhưng sàn còn position → reopen + đặt lại SL/TP thiếu
 
-`cross↑75` và `cross↓25` **không** dùng để vào/ra lệnh.
+Discord notify khi hit SL / TP / invalid SL.
 
-**Gate giao dịch:** chỉ `cross↑25` **hoặc** `cross↓75` kích hoạt **mở cặp / stack / TP cross**.  
-**Chốt lãi cycle** chạy **mọi cycle** dù không có cross.
-
-**Công thức % giá (chốt lãi):**
-
-- Long: `(mark - entry) / entry × 100`
-- Short: `(entry - mark) / entry × 100`
-
-`should_take_profit(entry, mark, target_pct)` — ngưỡng mặc định `PAIR_PROFIT_TARGET_PCT` (2%), hoặc `effective_tp_pct()` từ margin guard (1% khi tier **high**).
+**Discord lỗi** (`notify_error`, cooldown 180s / context; REST ban 900s):
+- Cycle 5m crash, watcher crash
+- Mở lệnh fail, equity REST = 0, SL/TP algo fail, flatten fail
+- Restore SL/TP fail, re-adopt orphan
+- Volume rank fail / empty, WS start fail, kline WS không connect
+- REST 418/429 ban, fill order không resolve được
+- Binance WS disconnect lâu
 
 ---
 
-## 8. Vào lệnh — `_open_pair`
+## 6. Cycle 5 phút
 
-### Luồng đầy đủ
+1. Refresh volume rank (top USDT perpetuals)
+2. Sync WS klines cho symbol đang mở + top scan
+3. `reconcile_orphan_positions()` + `reconcile_open_trades()`
+4. Scan top-N coin (mặc định 50) **chỉ qua WS** — bỏ qua symbol chưa `kline_fresh`; không REST klines khi scan
+5. Trước mở lệnh: **REST confirm nến** chỉ khi có signal và WS kline chưa fresh (tối đa 3 REST/cycle)
+6. Log balance + ghi `equity_snapshots`
 
-```
-1. is_tradeable_symbol? — không → skip
-2. ensure_available_for_pair (preflight) — không đủ → skip
-3. fetch balance → tính margin/leg, size
-4. Snapshot position size (trước mở)
-5. Market open LONG → resolve avgPrice fill từ sàn
-6. Market open SHORT → resolve avgPrice fill từ sàn (nếu fail → rollback đóng long)
-7. Verify size tăng đúng trên sàn
-8. insert_pair_lot (long_entry + short_entry = fill thực)
-```
+**Startup:** chờ miniTicker + kline WS connect, pre-subscribe top scan symbols (~2s) trước cycle đầu.
 
-### Nguồn giá (đồng bộ sàn)
-
-| Sự kiện | Nguồn giá ghi DB / hiển thị |
-|---------|------------------------------|
-| Mở lot mới — `long_entry` / `short_entry` | `avgPrice` từ order response → poll `fetch_order_detail` nếu cần |
-| Quyết định chốt lot | `long_entry`/`short_entry` DB + `markPrice` |
-| Quyết định chốt aggregate (nếu `AGGREGATE_TP_ENABLED`) | **wavg open lots DB** + `markPrice` (không dùng `entryPrice` sàn) |
-| Đóng leg / aggregate — `close_price` | `avgPrice` fill lệnh đóng (không dùng mark) |
-| Dashboard unrealized | `unRealizedProfit` sàn, chia theo tỷ lệ size lot |
-| Lot cũ (trước deploy) | Entry DB **không** sửa; chỉ `close_price` fill khi đóng sau deploy |
-
-Helper: `resolve_order_fill()` trong [`trading.py`](src/trading.py).
-
-### Margin preflight ([`margin_preflight.py`](src/margin_preflight.py))
-
-Trước khi đặt lệnh, nếu `MARGIN_PREFLIGHT_ENABLED=true`:
-
-```
-required = 2 × margin_per_leg × (1 + MARGIN_PREFLIGHT_BUFFER_PCT / 100)
-```
-
-Mặc định buffer **10%** (tránh fail leg thứ 2).
-
-Nếu `available < required`:
-
-**Phase A — đóng từng leg (lot-level):**
-
-- Thu thập mọi leg `open` từ DB
-- Sort PnL **giảm dần** (lãi cao trước; leg lỗ → lỗ ít nhất trước)
-- Ưu tiên symbol **≠** symbol đang mở
-- `close_lot_leg()` — 1 lot/lần, không reopen
-
-**Phase B — nếu hết leg mà vẫn thiếu:**
-
-- Chọn symbol net PnL tốt nhất (ưu tiên symbol khác)
-- `close_hedge_symbol()` — đóng cả L+S
-
-Lặp tối đa `MARGIN_PREFLIGHT_MAX_CLOSES` (10). Vẫn thiếu → **skip** `_open_pair`.
-
-Preflight **chỉ** gọi từ `_open_pair`, **không** gọi từ reopen sau TP (tránh vòng lặp).
-
-### Khi nào mở cặp
-
-| Tình huống | Trigger ví dụ |
-|------------|----------------|
-| Symbol **mới**, còn slot, có cross, không bị margin guard block | `rsi_cross_25` / `rsi_cross_75` |
-| Symbol **đã có lot**, cross, không chốt lãi, không block | `rsi_cross_25_stack` |
-| Chốt lãi trên **cross** + reopen | `rsi_cross_75_tp_agg_long`, … |
-
-**Scan coin mới:** duyệt volume rank; coin đầu tiên cross → mở cặp → **dừng scan** (1 coin/cycle từ scan).
+Sleep đến mốc 5 phút tiếp theo.
 
 ---
 
-## 9. Chốt lãi — DB-weighted side + lot-level
+## 7. Binance WebSocket
 
-Ngưỡng: `PAIR_PROFIT_TARGET_PCT` (2%) hoặc `MARGIN_HIGH_TP_PCT` (1%) khi margin guard tier **high**. Cả hai tầng nhận `tp_target_pct` từ `effective_tp_pct()`.
+`BINANCE_WS_ENABLED=true` (mặc định):
 
-### Aggregate = avg từ open lots DB (không dùng entry sàn)
+| Stream | Dùng cho |
+|--------|----------|
+| `!miniTicker@arr` | Volume rank |
+| `!markPrice@arr@1s` | Mark price dashboard + unrealized PnL |
+| `{symbol}@kline_5m` | Tín hiệu (ưu tiên WS, fallback REST) |
+| User data stream | Position/order updates, fill detection |
 
-`AGGREGATE_TP_ENABLED=true` (default):
-
-- Tính **wavg** `Σ(entry×size)/Σ(size)` từ các lot DB còn `open` trên side.
-- Nếu wavg vs **mark** ≥ ngưỡng → đóng **hết** side trên sàn + `close_all_lot_sides` (1 order).
-- Tránh case entry sàn ≥2% trong khi nhiều lot DB vẫn lỗ (BEAMX/VELO).
-- Tắt: `AGGREGATE_TP_ENABLED=false` → chỉ lot-level.
-
-### 9a. Mỗi cycle 5 phút (`trigger=cycle`, `reopen_pair=False`)
-
-Chạy cho **mọi** symbol managed — **không cần RSI cross**.
-
-Thứ tự `_scan_take_profits`:
-
-1. **DB-avg LONG** (nếu flag) — wavg lots ≥ ngưỡng → đóng hết long
-2. **DB-avg SHORT** — tương tự
-3. **Lot-level LONG** — mọi lot đủ ngưỡng → **một** order `sum(size)` *(nếu side chưa bị aggregate đóng)*
-4. **Lot-level SHORT** — tương tự
-
-- **Không** `_open_pair` sau chốt
-
-### 9b. Khi RSI cross (`reopen_pair=True`)
-
-Cùng thứ tự, nhưng sau chốt → `_open_pair` **một lần** / side (có preflight).
-
-Nếu **có chốt** trên cross → return, **không** stack.
-
-Nếu **không chốt**:
-
-- Đã có lot → **stack** (`{trigger}_stack`) — trừ khi margin guard block
-- Chưa có lot + còn slot → entry đầu
-- Đủ `MAX_OPEN_SYMBOLS` → skip
-
-### So sánh
-
-| | Mỗi cycle 5m | RSI cross |
-|---|--------------|-----------|
-| Chốt lot (≥ ngưỡng theo entry lot) | Có | Có |
-| Chốt DB-avg side | Nếu `AGGREGATE_TP_ENABLED` | Nếu flag bật |
-| Ngưỡng TP | `effective_tp_pct()` | `effective_tp_pct()` |
-| Sau chốt | Không mở cặp | `_open_pair` ×1 (+ preflight) |
-| Không chốt | — | Stack hoặc entry |
-
-### 9c. Quy tắc tuổi lot (`MAX_LOT_AGE_DAYS`)
-
-Chống tích tụ lỗ treo: leg nào mở quá `MAX_LOT_AGE_DAYS` ngày (mặc định **0 = tắt**; rollout khuyến nghị 7 → 5 → 3) bị **tự đóng theo giá thị trường**, kể cả đang lỗ.
-
-- `_scan_max_age_closes` chạy **sau** cycle TP **và** BE trong `evaluate_rsi_trade` — leg đủ TP/BE luôn được xử lý trước, quy tắc tuổi chỉ xử lý phần còn lại
-- Batch **1 order/side** (giống lot-level TP), cap theo size sàn, ghi `close_lot_side` với fill thực, trigger log `max_age_{N}d`, **không reopen**
-- Budget toàn cục `MAX_AGE_CLOSES_PER_CYCLE` (mặc định **4** order/cycle, reset trong `run_cycle`) — backlog lớn được trải ra nhiều cycle, tránh 418
-- Notify Discord như mọi lần đóng lệnh
-
-### 9c2. Break-even khi lỗ sau N giờ (`BREAKEVEN_WHEN_LOSING_ENABLED`)
-
-Sau `BREAKEVEN_AFTER_HOURS` (mặc định **24**), lot **đang lỗ** được **arm sticky** target = 0% (đóng khi giá về entry). Lot chưa lỗ vẫn giữ TP thường (`effective_tp_pct()`).
-
-- `_scan_breakeven_closes` chạy **sau** TP và **trước** age — thứ tự: TP → BE → age
-- Sticky in-memory `(lot_id, side)`: một lần đã lỗ sau ngưỡng giờ thì giữ BE đến khi đóng (tránh miss lúc giá vừa vượt entry). Restart mất arm → re-arm khi còn underwater
-- Batch 1 order/side, trigger `be_after_{N}h`, **không reopen**
-- Realtime watcher cũng arm + đóng BE (cùng `TP_CLOSE_LOCK`)
-- Tắt mặc định (`false`); bật bằng env
-
-### 9d. Realtime TP watcher ([`realtime_tp.py`](src/realtime_tp.py))
-
-Chốt lãi ngay khi giá chạm ngưỡng thay vì chờ mốc 5 phút (tránh tuột TP khi giá spike rồi rơi lại):
-
-- Thread riêng, mỗi `REALTIME_TP_INTERVAL_SEC` (mặc định **2s**) đọc giá mark từ **WS cache sẵn có** (`!markPrice@arr@1s`) — không thêm REST call để phát hiện
-- Leg nào đạt `effective_tp_pct()` → đóng qua `_scan_take_profits_locked` (trigger `realtime`, không reopen)
-- Cùng vòng lặp: arm BE + đóng BE khi sticky-armed và mark ≥ entry
-- **Chống double-close:** dùng chung `TP_CLOSE_LOCK` với cycle 5m + dashboard manual close; trong lock re-đọc status lot từ DB trước khi đặt lệnh
-- Tự tạm dừng khi: trading disabled, rate-limit 418, hoặc WS stale (`get_mark_from_ws` trả None) — cycle 5m vẫn là lưới an toàn
-- Điều kiện chạy: `REALTIME_TP_ENABLED=true` + `EXCHANGE=binance` + `BINANCE_WS_ENABLED`
-- Dashboard hiển thị trạng thái watcher (đang chạy / tạm dừng / số đợt chốt)
-
-### Dashboard đóng tay
-
-- `POST /api/positions/close-side` — đóng cả side (không cần đạt 2%)
-- `POST /api/positions/close-leg` — đóng 1 lot/leg
-- Tôn trọng rate-limit 418; chỉ REST khi user bấm đóng
-- Dùng chung `TP_CLOSE_LOCK` với cycle + realtime watcher
-
+REST vẫn dùng cho: đặt lệnh, algo SL/TP, equity sizing, confirm position flat.
 
 ---
 
-## 10. Margin guard ([`margin_guard.py`](src/margin_guard.py))
+## 8. Dashboard (`WEB_PORT=8080`)
 
-Theo dõi **maintenance margin / equity** mỗi cycle.
+- Bảng lệnh EMA-RSI (open + closed)
+- Summary PnL (unrealized / realized)
+- Biểu đồ equity (24h / 7d / 30d)
+- Start/Stop trading
+- Đăng nhập bắt buộc (`DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD`)
 
-```
-maint_margin_pct = totalMaintMargin / totalMarginBalance × 100
-```
-
-| Tier | Điều kiện | Hành động bot |
-|------|-----------|---------------|
-| **ok** | ≤ 15% | Bình thường |
-| **watch** | 15–20% | Log + dashboard |
-| **elevated** | > 20% | Chặn scan, stack, reopen; TP 2%; vẫn cycle TP |
-| **high** | > 25% **hoặc** elevated ≥ 3 cycle không cải thiện ≥ 0.3% | TP **1%**; chặn mở mới; có thể `deleverage_one_symbol` (1 cặp/cycle) |
-| **critical** | > 35% | `liquidate_all_hedge_pairs` → **skip cycle** |
-
-**Deleverage (high):** đóng **cả cặp L+S** 1 symbol — ưu tiên stack nhiều nhất (LIFO), net PnL nhỏ. **Không** đóng riêng leg thua nhất.
-
-**Gợi ý nạp tiền:** khi maint > 20%, dashboard hiển thị USDT cần nạp để về ~18% (không tự nạp).
-
-**Tương tác evaluate_rsi_trade:**
-
-- `should_block_new_entries()` → skip stack/entry/reopen trên cross; **vẫn** chạy cycle TP
-- `effective_tp_pct()` → thay ngưỡng chốt lãi khi high
-
-Config: `MARGIN_GUARD_ENABLED`, `MARGIN_MAINT_*_PCT`, `MARGIN_HIGH_TP_PCT`, `MARGIN_ELEVATED_CYCLE_LIMIT`, `MARGIN_HIGH_CYCLE_LIMIT`, `MARGIN_MAINT_DELEVERAGE_PCT`, `MARGIN_DEPOSIT_TARGET_PCT`.
+API:
+- `GET /api/status` — account + trades
+- `GET /api/ema-rsi/trades`
+- `GET /api/equity-history?range=24h|7d|30d`
 
 ---
 
-## 11. `evaluate_rsi_trade` — luồng đầy đủ
+## 9. Database
 
-```
-1. TRADING_ENABLED? — false → sync + dashboard only
-2. snap.ready? — false → skip
-3. is_tradeable_symbol? — false → _force_close_blocked_symbol
-4. ensure_symbol_configured — **chỉ trong `_open_pair`** (lazy; DB persist margin/leverage)
-5. _sync_lots_with_exchange (warning nếu lệch size)
-6. _update_status (RSI, mark, positions → dashboard)
-7. _scan_take_profits(cycle, reopen=False, tp=effective_tp_pct)
-7a. _scan_breakeven_closes — arm/đóng BE khi lot > BREAKEVEN_AFTER_HOURS và đã lỗ (không reopen)
-7b. _scan_max_age_closes — đóng leg quá MAX_LOT_AGE_DAYS (budget/cycle, không reopen)
+| Bảng | Mục đích |
+|------|----------|
+| `ema_rsi_trades` | Lệnh bot (entry, sl, tp, status, pnl, order ids) |
+| `ema_rsi_seen_signals` | Dedupe signal theo (symbol, signal_ts) |
+| `equity_snapshots` | Chart equity mỗi cycle |
+| `settings` | `trading_enabled`, baseline equity |
 
-Nếu có RSI cross 25/75:
-8. margin guard block? — yes → return (không stack/entry)
-9. _scan_take_profits(cross, reopen=True, tp=effective_tp_pct)
-10. Nếu đã chốt → return
-11. symbol_has_open_lots → _open_pair(stack)  [preflight + ensure config bên trong]
-12. can_open_new_symbol → _open_pair(entry)
-13. else → log max symbols
-```
-
-**Cấu hình symbol (lazy + DB):** `ensure_symbol_configured` chỉ chạy trước khi mở cặp mới (`_open_pair`). Nếu bảng `symbol_trading_config` đã ghi đúng `MARGIN_MODE` + `LEVERAGE` hiện tại thì bỏ qua gọi API Binance. Restart/deploy không setup hàng loạt 20 symbol mỗi cycle; TP/đóng lệnh không cần re-config.
+`clear_dashboard_history()` — xóa lịch sử EMA-RSI + equity chart (không đóng vị thế sàn).
 
 ---
 
-## 12. Quản lý lệnh — DB `rsi_pair_lots`
-
-Mỗi lần `_open_pair` = **1 lot** (1 row):
-
-| Cột | Ý nghĩa |
-|-----|---------|
-| `long_*` / `short_*` | size, entry, status (`open`/`closed`) |
-| `margin_usdt` | margin/leg lúc mở |
-| `entry_trigger` | `rsi_cross_25`, `*_stack`, `margin_preflight_leg`, `adopted`, … |
-| `*_realized_pnl_usdt`, `*_close_price` | PnL khi đóng từng phía |
-
-**Đếm giới hạn:**
-
-- `count_open_symbols()` — DISTINCT symbol có leg `open`
-- `count_open_legs()` — tổng leg `open`
-
-**Sync (`_sync_lots_with_exchange`):** so tổng size lot vs sàn; DB > sàn → **tự đóng phantom lot sides** (FIFO); sàn > DB → log warning (không invent lot).
-
-**REST cache (Binance, chống IP ban):** `positionRisk` / `account` cache TTL ~2.5s trong process; tái sử dụng trong cùng lần evaluate 1 symbol. Invalidate ngay sau `place_market_order` / close. `fetch_total_unrealized_pnl` = **một** `positionRisk` (all). Cycle: nghỉ ~80ms giữa các symbol; `ticker/24hr` TTL **15 phút** khi đã đủ `MAX_OPEN_SYMBOLS`, **5 phút** khi còn slot scan.
-
-**WebSocket (Binance, mặc định bật `BINANCE_WS_ENABLED=true`):** giảm REST poll bằng push streams; facade `ExchangeClient` không đổi; Bitget không dùng path này.
-
-Hai connection market riêng (tránh miniTicker “nuôi” `market_fresh` trong khi kline chết):
-
-| Connection | Streams | Endpoint |
-|------------|---------|----------|
-| All-market | `!miniTicker@arr`, `!markPrice@arr@1s` | `wss://fstream.binance.com/market/ws` (raw array OK) |
-| Klines | `{symbol}@kline_5m` (managed + scan lazy) | `/market/ws` riêng + SUBSCRIBE (tách khỏi miniTicker; legacy `/ws` ACK nhưng không đẩy kline) |
-| User data | listenKey account/order/position | `wss://fstream.binance.com/private/ws/{listenKey}` |
-
-| REST | WS / hành vi |
-|------|----------------|
-| `klines` | Kline WS + REST lazy **từng** symbol; cooldown `BINANCE_CANDLE_REST_SEC` + stagger chống burst 418 |
-| `ticker/24hr` | `!miniTicker@arr` (REST seed **tắt** mặc định; fallback throttle `BINANCE_VOLUME_RANK_REST_SEC`) |
-| `premiumIndex` | `!markPrice@arr@1s` |
-| `positionRisk` / `account` | UDS + disk snapshot lúc boot (**không** REST verify first connect); soft reconcile mỗi `BINANCE_WS_RECONCILE_SEC` khi IP sạch; sau order: debounce → `flush_pending_reconcile` |
-| `POST /order`, dual/margin/leverage, spot | **Vẫn REST** |
-| Lot-level TP nhiều lot cùng side | **1** `POST /order` (`sum` size), không N lệnh |
-
-**Kline health:** `candle_last_msg_at` per-symbol; im lặng > `BINANCE_WS_KLINE_SILENCE_SEC` → resubscribe kline socket. Mỗi cycle `set_watched_symbols(managed)` prune streams thừa.
-
-**Chống ban lặp khi redeploy:** cooldown 418 ghi file cạnh DB (`binance_rate_limit_until_ms` trên volume). Process mới đọc file → **không** gọi REST khi IP còn ban. Boot WS **không** gọi `ticker/24hr` + force reconcile.
-
-**WS khi REST đang ban:** All-market + kline + UDS (listenKey disk) vẫn chạy. Nến + positions snapshot trên volume. **Không thể** đặt/đóng lệnh. Keepalive PUT skip khi ban. **Deploy/restart** trong lúc ban: đọc file cooldown → UDS first connect **không** gọi REST reconcile (tránh 418 lặp).
-
-Module: [`src/exchange/binance_ws/`](src/exchange/binance_ws/). Candle series stale → fallback REST (có throttle). Disconnect lâu → Discord `notify_error`.
-
-**Adopt:** vị thế sàn không có lot DB → tạo lot `adopted` (`LEGACY_MARGIN_USDT`).
-
-**Đóng tay trên sàn:** bot **không** tự đóng lot DB khi sàn flat — chỉ warning mismatch; có thể stack lại khi RSI cross. Cần sync thủ công hoặc dùng dashboard reset nếu cần.
-
-**Đóng leg helpers:**
-
-- `close_lot_leg` — đóng 1 leg 1 lot, ghi PnL DB
-- `close_hedge_symbol` — đóng L+S symbol, sync DB
-- `close_all_lot_sides` — đóng mọi lot open một phía (aggregate TP)
-
----
-
-## 13. Giới hạn & scan
-
-| Config | Mặc định | Ý nghĩa |
-|--------|----------|---------|
-| `MAX_OPEN_SYMBOLS` | 20 | Tối đa 20 coin distinct |
-| Volume scan | USDT-M ranked | Chỉ khi slot còn **và** margin guard không block |
-
-**Stack:** không giới hạn số lot/symbol — chỉ giới hạn **số symbol distinct**.
-
----
-
-## 14. Chốt lời toàn portfolio (`PROFIT_TARGET_PCT`)
-
-Tách với chốt 2%/leg:
-
-- `PROFIT_TARGET_PCT=0` → **tắt** (mặc định)
-- Nếu > 0: khi **tổng unrealized PnL / equity** ≥ ngưỡng → `liquidate_all_hedge_pairs`, ghi `profit_takes`, reset baseline, skip cycle
-
-Dashboard: nút manual profit take / reset baseline.
-
----
-
-## 15. Dashboard (`WEB_PORT=8080`)
-
-- **Margin & rủi ro:** maint %, initial %, tier margin guard, TP hiện tại, gợi ý nạp USDT
-- **Tổng PnL:** floating (sàn), realized (DB lot legs), tổng
-- **Symbol groups:** aggregate LONG/SHORT sàn + bảng lot **FIFO**
-- Badge **≥TP%** (`tp_ready`) trên leg sắp chốt
-- Lịch PnL theo **leg đóng** (timezone VN)
-- **Biểu đồ equity:** line chart (Chart.js), nút 24h / 7 ngày / 30 ngày; cập nhật mỗi 60s
-- **Rút spot hàng ngày:** bật/tắt + % equity trên dashboard; lịch sử chuyển; biểu đồ spot
-- **Đăng nhập bắt buộc:** cookie session; chỉ tài khoản `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` (env)
-- **Discord notify đóng lệnh:** webhook; title `COIN đóng LONG|SHORT|L+S` + body Futures balance (available / equity / maint / initial)
-- **Discord notify lỗi chạy bot:** cùng webhook; title `Bot lỗi: …` + body message lỗi (Cycle failed / Trading failed / Position management / Scan); cooldown ~3 phút/context; không fetch balance (tránh gọi API lúc rate-limit)
-- API: `/`, `/api/pnl-calendar`, `/api/status`, `/api/profit-takes`, `/api/equity-history`, `/api/spot-history`, `/api/spot-transfers`
-
-Env auth:
+## 10. Config `.env`
 
 ```env
-DASHBOARD_USERNAME=you@example.com
-DASHBOARD_PASSWORD=...
-DASHBOARD_SESSION_SECRET=<random ≥32 chars>
-DASHBOARD_COOKIE_SECURE=true   # Railway HTTPS
-```
-
-Env Discord notify:
-
-```env
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
-```
-
-Cách bật trên điện thoại:
-
-1. Cài Discord, vào channel nhận webhook
-2. Bật thông báo channel (mobile app)
-3. Lần đóng lệnh / lỗi cycle tiếp theo sẽ hiện tin trong channel
-
-Bot trading **không** phụ thuộc đăng nhập dashboard / Discord.
-
-### Lịch sử equity (`equity_snapshots`)
-
-| Field | Ý nghĩa |
-|-------|---------|
-| `recorded_at` | Thời điểm snapshot (ISO UTC) |
-| `equity` | `account_equity` từ sàn |
-| `available` | Available balance |
-| `maint_margin_pct` | Maintenance margin % (nullable) |
-
-- Ghi **mỗi cycle 5 phút** trong `log_futures_balance_once()` ([`main.py`](src/main.py))
-- Tự prune bản ghi > **90 ngày** (mỗi 100 insert)
-- `GET /api/equity-history?range=24h|7d|30d` — trả `points[]` + `baseline_equity` (đường tham chiếu trên chart)
-- Xóa cùng `clear_dashboard_history()`
-
-### Rút futures → spot hàng ngày ([`spot_transfer.py`](src/spot_transfer.py))
-
-| Mốc (giờ VN) | Hành động |
-|--------------|-----------|
-| `06:55` | Nếu `available < amount` → đóng leg lãi / lỗ ít nhất (giống margin preflight) |
-| `≥ 07:00` | Free nếu thiếu → transfer **1 lần success / ngày** (catch-up nếu miss 7h) |
-
-**Hai chế độ tính tiền (`SPOT_TRANSFER_MODE`):**
-
-| Mode | Công thức | Ghi chú |
-|------|-----------|---------|
-| `pct` (mặc định) | `floor(equity × SPOT_TRANSFER_PCT / 100, 2dp)` | % chỉnh được qua dashboard (`settings.spot_transfer_pct`) |
-| `hwm` (Binance only) | `floor(max(0, equity − HWM) × SPOT_TRANSFER_HWM_SHARE / 100, 2dp)` | Chỉ rút khi equity **vượt đỉnh cũ**; drawdown → 0, ghi 1 row `skipped`/ngày, **không** đóng leg lấy tiền |
-
-**Mode `hwm` chi tiết:**
-
-- `equity_hwm` lưu trong bảng `settings`, khởi tạo = equity lần chạy đầu
-- Sau transfer thành công: `equity_hwm = equity − amount` (đỉnh mới sau khi trích lãi)
-- **Auto-sync nạp/rút tay:** trước khi tính amount (trong khung 06:55–07:00+), bot gọi `GET /fapi/v1/income?incomeType=TRANSFER` từ mốc `equity_hwm_synced_at_ms`, **loại tranId của chính bot** (đã lưu trong `spot_transfers`, kèm fallback khớp ngày+số tiền) rồi cộng/trừ phần nạp/rút tay vào HWM — tiền nạp không bị coi là "lãi" để rút
-- Income API lỗi → **hoãn rút hôm đó** (row `skipped`, 1 lần/ngày), thử lại hôm sau — không bao giờ rút với HWM chưa sync
-- Bitget không có path này → `SPOT_TRANSFER_MODE=hwm` tự fallback về `pct`
-
-- Nếu `available < amount` → đóng leg lãi / lỗ ít nhất rồi cả cặp (giống margin preflight)
-- Trong cùng cycle: **rút spot trước**, mở lệnh sau
-- Binance: `POST /sapi/v1/asset/transfer` type `UMFUTURE_MAIN` (cần quyền Universal Transfer + Spot trên API key)
-- Bitget: `POST /api/v2/spot/wallet/transfer` `usdt_futures` → `spot`
-- Bảng `spot_transfers` + `spot_snapshots`; chart `/api/spot-history`
-
-PnL leg đóng: ưu tiên `realized_pnl_usdt` + `close_price` từ DB; nếu thiếu → ước tính theo `PAIR_PROFIT_TARGET_PCT`.
-
----
-
-## 16. Config `.env` đầy đủ
-
-```env
-# Sàn
-EXCHANGE=binance              # bitget | binance
-
-# Bitget
-BITGET_API_KEY=
-BITGET_SECRET_KEY=
-BITGET_PASSPHRASE=
-
-# Binance USDT-M
+EXCHANGE=binance
 BINANCE_API_KEY=
 BINANCE_SECRET_KEY=
-BINANCE_API_BASE=https://fapi.binance.com
 BINANCE_WS_ENABLED=true
-BINANCE_WS_STALE_SEC=45
-BINANCE_WS_RECONCILE_SEC=300
-BINANCE_WS_DISCONNECT_NOTIFY_SEC=120
-BINANCE_WS_KLINE_SILENCE_SEC=90
-BINANCE_CANDLE_REST_SEC=45
-BINANCE_CANDLE_REST_STAGGER_SEC=0.15
-BINANCE_VOLUME_RANK_REST_SEC=300
 
 TRADING_ENABLED=true
-
-# Vốn
-ORDER_MARGIN_PCT=0.5
-ORDER_MARGIN_MIN_USDT=1
-LEGACY_MARGIN_USDT=5
 LEVERAGE=10
-MARGIN_MODE=crossed
 
-# Chiến lược RSI
-MAX_OPEN_SYMBOLS=20
-PAIR_PROFIT_TARGET_PCT=2
-AGGREGATE_TP_ENABLED=true
+# EMA-RSI strategy
+EMA_RSI_EMA_PERIOD=200
+EMA_RSI_RSI_PERIOD=14
+EMA_RSI_RSI_LOW=25
+EMA_RSI_RSI_HIGH=75
+EMA_RSI_RR=2
+EMA_RSI_MARGIN_PCT=1
+EMA_RSI_MAX_OPEN=20
+EMA_RSI_SCAN_LIMIT=50
+EMA_RSI_ENTRIES_PER_CYCLE=3
+EMA_RSI_WATCHER_INTERVAL_SEC=2
 
-# Quy tắc tuổi lot (0 = tắt; rollout 7 -> 5 -> 3)
-MAX_LOT_AGE_DAYS=0
-MAX_AGE_CLOSES_PER_CYCLE=4
-
-# BE khi lỗ sau N giờ (sticky; lot chưa lỗ giữ TP)
-BREAKEVEN_WHEN_LOSING_ENABLED=false
-BREAKEVEN_AFTER_HOURS=24
-
-# Realtime TP watcher (Binance + WS)
-REALTIME_TP_ENABLED=true
-REALTIME_TP_INTERVAL_SEC=2
-
-# Lọc coin mới niêm yết (0 = tắt)
-MIN_LISTING_AGE_DAYS=30
 GRANULARITY=5m
 INTERVAL_MINUTES=5
-RSI_PERIOD=14
-RSI_LONG_ENTRY=25
-RSI_SHORT_ENTRY=75
+MIN_LISTING_AGE_DAYS=30
 
-# Chốt toàn portfolio (0=off)
-PROFIT_TARGET_PCT=0
-
-# Margin guard (maintenance margin / equity)
-MARGIN_GUARD_ENABLED=true
-MARGIN_MAINT_OK_PCT=15
-MARGIN_MAINT_WARN_PCT=20
-MARGIN_MAINT_HIGH_PCT=25
-MARGIN_MAINT_CRITICAL_PCT=35
-MARGIN_MAINT_DELEVERAGE_PCT=30
-MARGIN_HIGH_TP_PCT=1
-MARGIN_DEPOSIT_TARGET_PCT=18
-MARGIN_ELEVATED_CYCLE_LIMIT=3
-MARGIN_HIGH_CYCLE_LIMIT=2
-MARGIN_IMPROVEMENT_PCT=0.3
-
-# Preflight available trước khi mở cặp
-MARGIN_PREFLIGHT_ENABLED=true
-MARGIN_PREFLIGHT_BUFFER_PCT=10
-MARGIN_PREFLIGHT_MAX_CLOSES=10
-
-# Dashboard login
+# Dashboard
+WEB_PORT=8080
 DASHBOARD_USERNAME=
 DASHBOARD_PASSWORD=
 DASHBOARD_SESSION_SECRET=
 DASHBOARD_COOKIE_SECURE=true
 
-# Discord notify (đóng lệnh + lỗi cycle)
+# Discord
 DISCORD_WEBHOOK_URL=
 
-# Rút futures → spot (giờ VN)
-SPOT_TRANSFER_ENABLED=true
-SPOT_TRANSFER_MODE=pct        # pct | hwm (hwm chỉ Binance)
-SPOT_TRANSFER_PCT=1
-SPOT_TRANSFER_HWM_SHARE=50
-SPOT_TRANSFER_PREPARE_HHMM=0655
-SPOT_TRANSFER_EXECUTE_HHMM=0700
-
-# App
-WEB_PORT=8080
 DATABASE_PATH=data/bot.db
 ```
 
 ---
 
-## 17. Vận hành thực tế
+## 11. File tham chiếu
 
-1. Bật **hedge mode** trên sàn; đóng vị thế one-way cũ nếu có
-2. `TRADING_ENABLED=true` → lệnh thật trên sàn active (`EXCHANGE`)
-3. Restart bot sau đổi code/config
-4. `clear_dashboard_history()` — xóa lịch sử lot dashboard, **không** đóng vị thế sàn
-5. Theo dõi card **Margin & rủi ro** trên dashboard
-6. Không trade USDC — bot tự filter và force-close nếu còn sót
-
----
-
-## 18. Tóm tắt hành vi
-
-Bot **mỗi 5 phút**:
-
-1. Đóng symbol blocked (USDC)
-2. Kiểm tra **maintenance margin** — có thể chặn mở mới, hạ TP, deleverage, hoặc đóng hết (critical)
-3. Sync + **chốt lãi** mọi leg đủ ngưỡng (chỉ đóng, không mở thêm trên cycle TP)
-4. **Đóng leg quá tuổi** (`MAX_LOT_AGE_DAYS`, budget 4 order/cycle) — sau TP, không reopen
-5. Khi **RSI cắt 25/75** (nếu không bị block): chốt + mở lại, hoặc stack
-6. Trước mỗi lần mở cặp: **preflight available** — nếu thiếu thì đóng leg lãi cao / lỗ ít, rồi mới vào lệnh
-7. Sizing: **0.5% equity/leg**, max **20 coin**, hedge **long+short**, lot **FIFO** trong DB
-
-Song song, **watcher realtime** (2s) chốt lãi ngay khi mark WS chạm ngưỡng TP; sáng 07:00 VN rút spot theo mode `pct` hoặc `hwm`.
-
----
-
-## 19. File tham chiếu
-
-| File | Nội dung chính |
-|------|----------------|
-| `src/main.py` | Vòng lặp 5m, scan, margin guard, blocked symbols |
-| `src/rsi_trading.py` | TP, BE khi lỗ, quy tắc tuổi lot, `_open_pair`, preflight hook, rollback, hedge close |
-| `src/realtime_tp.py` | Watcher chốt lãi/BE realtime từ WS markPrice |
-| `src/spot_transfer.py` | Rút spot hàng ngày, mode pct/HWM + auto-sync income |
-| `src/rsi_signals.py` | `detect_pair_event`, `should_take_profit` |
-| `src/rsi_positions.py` | `sync_exchange_positions`, adopt |
-| `src/margin_guard.py` | Tier maint margin, deleverage, critical liquidate |
-| `src/margin_preflight.py` | `ensure_available_for_pair`, phase A/B |
-| `src/exchange/symbols.py` | USDC filter |
-| `src/order_sizing.py` | `compute_entry_margin_usdt` |
-| `src/exchange/__init__.py` | Facade exchange |
-| `src/exchange/binance.py` | Binance hedge API |
-| `src/exchange/binance_ws/` | Market + User Data WebSocket cache |
-| `src/exchange/bitget.py` | Bitget adapter |
-| `src/bitget_client.py` | Bitget REST implementation |
-| `src/database.py` | `rsi_pair_lots`, migrations |
-| `src/profit_target.py` | Portfolio profit take |
-| `src/bot_state.py` | Dashboard account + margin fields |
-| `src/web/app.py` | Dashboard routes |
-| `src/market_universe.py` | Volume rank scan |
-
-**Legacy (không trong main path):** `supertrend_*`, `ichimoku_*`, `trading.py` (EMA), `orderflow/` (OFI display qua `/api/ofi`).
+| File | Nội dung |
+|------|----------|
+| `src/main.py` | Entry → `ema_rsi.cycle.main()` |
+| `src/ema_rsi/cycle.py` | Vòng lặp 5m |
+| `src/ema_rsi/signals.py` | Logic EMA + RSI zone |
+| `src/ema_rsi/trading.py` | Open/close, sizing, protective orders |
+| `src/ema_rsi/watcher.py` | SL/TP fill detection |
+| `src/ema_rsi/store.py` | SQLite schema + CRUD |
+| `src/exchange/binance.py` | Algo orders, REST |
+| `src/exchange/binance_ws/` | WS cache |
+| `src/exchange/fills.py` | `resolve_order_fill` |
+| `src/database.py` | Settings + equity snapshots |
+| `src/web/app.py` | Dashboard |

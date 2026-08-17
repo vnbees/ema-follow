@@ -54,32 +54,69 @@ def _send_discord(title: str, body: str) -> None:
         )
 
 
-def notify_close(
+def _fmt_px(value: float) -> str:
+    if value >= 100:
+        return f"{value:.2f}"
+    if value >= 1:
+        return f"{value:.4f}"
+    return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
+def notify_ema_rsi_open(
     symbol: str,
-    detail: str,
+    side: str,
     *,
-    reason: str | None = None,
-    reason_text: str | None = None,
+    entry: float,
+    sl: float,
+    tp: float,
+    r: float,
+    rr: float,
+    margin_usdt: float,
 ) -> None:
-    """Send close notification to Discord. Never raises to callers."""
+    """Discord when EMA-RSI trade is opened. Fail-soft."""
     try:
         if not discord_configured():
             logging.debug("Discord notify skipped: DISCORD_WEBHOOK_URL not set")
             return
+        title = f"{symbol.upper()} {side.upper()} mở"
+        body = (
+            f"entry={_fmt_px(entry)}\n"
+            f"SL={_fmt_px(sl)}\n"
+            f"TP={_fmt_px(tp)}\n"
+            f"R={_fmt_px(r)}  RR=1:{rr:g}\n"
+            f"margin={margin_usdt:.2f} USDT"
+        )
+        _send_discord(title, body)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_ema_rsi_open failed: %s", exc)
 
-        from src.close_reasons import reason_label_vi
 
-        title = f"{symbol.upper()} đóng {detail}"
-        label = (reason_text or "").strip() or (reason_label_vi(reason) if reason else "")
-        if label:
-            title = f"{title} — {label}"
-        body = _format_balance_body()
-        try:
-            _send_discord(title, body)
-        except Exception as exc:  # noqa: BLE001 — fail-soft
-            logging.warning("Discord notify send failed: %s", exc)
-    except Exception as exc:  # noqa: BLE001 — never break trading
-        logging.warning("Discord notify_close failed: %s", exc)
+def notify_ema_rsi_close(
+    symbol: str,
+    side: str,
+    *,
+    reason: str,
+    entry: float,
+    sl: float,
+    tp: float,
+    close_price: float,
+    pnl_usdt: float,
+) -> None:
+    """Discord when EMA-RSI SL/TP (or invalid-SL flatten) hits. Fail-soft."""
+    try:
+        if not discord_configured():
+            logging.debug("Discord notify skipped: DISCORD_WEBHOOK_URL not set")
+            return
+        label = reason.replace("_", " ").strip()
+        title = f"{symbol.upper()} {side.upper()} đóng — {label}"
+        pnl_s = f"{pnl_usdt:+.2f}"
+        body = (
+            f"entry={_fmt_px(entry)}  SL={_fmt_px(sl)}  TP={_fmt_px(tp)}\n"
+            f"close={_fmt_px(close_price)}  pnl={pnl_s} USDT"
+        )
+        _send_discord(title, body)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_ema_rsi_close failed: %s", exc)
 
 
 def notify_error(context: str, detail: str, *, cooldown_sec: float | None = None) -> None:

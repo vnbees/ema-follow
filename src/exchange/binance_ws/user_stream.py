@@ -82,6 +82,11 @@ def parse_order_trade_update(payload: dict[str, Any]) -> tuple[dict | None, Pend
         "avgPrice": avg,
         "priceAvg": avg,
         "symbol": str(o.get("s") or "").upper(),
+        "type": str(o.get("o") or ""),
+        "origType": str(o.get("ot") or o.get("o") or ""),
+        "clientOid": str(o.get("c") or ""),
+        "stopPrice": o.get("sp"),
+        "realizedPnl": o.get("rp"),
     }
     order_type = str(o.get("o") or "").upper()
     symbol = str(o.get("s") or "").upper()
@@ -129,6 +134,13 @@ def apply_user_payload(payload: dict[str, Any]) -> None:
                 note_uds_position_refresh(touched)
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                from src.ema_rsi.watcher import on_position_flat
+
+                for symbol, side in closed:
+                    on_position_flat(symbol, side)
+            except Exception as exc:  # noqa: BLE001
+                logging.debug("EMA-RSI position-flat hook skipped: %s", exc)
         # ACCOUNT_UPDATE "wb" is wallet balance, NOT margin equity / available.
         # Overwriting those fields skewed dashboard + equity snapshots. Keep the
         # last REST-reconciled balance; positions above are still applied.
@@ -157,6 +169,12 @@ def apply_user_payload(payload: dict[str, Any]) -> None:
                 symbol,
                 [o for o in existing if o.order_id != str(detail.get("orderId"))],
             )
+        try:
+            from src.ema_rsi.watcher import on_order_update
+
+            on_order_update(detail)
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("EMA-RSI order-update hook skipped: %s", exc)
 
 
 class UserStream:

@@ -148,54 +148,5 @@ class TestVolumeRankTtl(unittest.TestCase):
             mu.refresh_volume_rank(max_age_sec=900)
             self.assertEqual(mock_fetch.call_count, 2)
 
-
-class TestLotTpTargetPct(unittest.TestCase):
-    def test_lot_tp_uses_effective_target_pct(self) -> None:
-        from src.rsi import RsiSnapshot
-        from src.rsi_trading import _take_profit_lot_side
-
-        lot = {
-            "id": 1,
-            "long_status": "open",
-            "long_entry": 100.0,
-            "long_size": 1.0,
-            "short_status": "closed",
-            "short_entry": 0.0,
-            "short_size": 0.0,
-        }
-        snap = RsiSnapshot(ready=True, rsi=50.0, prev_rsi=50.0, close=101.5)
-
-        with (
-            patch("src.rsi_trading.close_lot_leg") as mock_close,
-            patch("src.rsi_trading.is_tradeable_symbol", return_value=True),
-            patch("src.rsi_trading._open_pair"),
-        ):
-            # 1.5% move — passes 1% target, would fail default 2%
-            _take_profit_lot_side(
-                "TESTUSDT",
-                lot,
-                "long",
-                101.5,
-                snap,
-                "cycle",
-                reopen_pair=False,
-                tp_target_pct=1.0,
-            )
-            mock_close.assert_called_once()
-
-            mock_close.reset_mock()
-            _take_profit_lot_side(
-                "TESTUSDT",
-                lot,
-                "long",
-                101.5,
-                snap,
-                "cycle",
-                reopen_pair=False,
-                tp_target_pct=2.0,
-            )
-            mock_close.assert_not_called()
-
-
 if __name__ == "__main__":
     unittest.main()

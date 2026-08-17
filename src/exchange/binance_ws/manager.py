@@ -414,14 +414,15 @@ def start_binance_ws() -> None:
         )
 
     try:
-        from src.rsi_positions import get_managed_symbols
+        from src.ema_rsi import store
 
-        managed = get_managed_symbols()
+        open_rows = store.get_open_trades()
+        managed = [str(row["symbol"]) for row in open_rows]
         if managed:
             set_watched_symbols(managed)
-            logging.info("Binance WS pre-subscribe klines for %d managed symbols", len(managed))
+            logging.info("Binance WS pre-subscribe klines for %d open symbols", len(managed))
     except Exception as exc:  # noqa: BLE001
-        logging.debug("Binance WS managed-symbol preload skipped: %s", exc)
+        logging.debug("Binance WS open-symbol preload skipped: %s", exc)
 
     remaining = binance_mod.rate_limit_remaining_sec()
     if remaining > 0:
@@ -464,7 +465,13 @@ def stop_binance_ws() -> None:
         _stop_event = None
 
 
-def get_candles_from_ws(symbol: str, interval: str, limit: int) -> list[Candle] | None:
+def get_candles_from_ws(
+    symbol: str,
+    interval: str,
+    limit: int,
+    *,
+    quiet: bool = False,
+) -> list[Candle] | None:
     if not is_ws_enabled():
         return None
     from src.candles import is_candle_series_stale
@@ -474,10 +481,11 @@ def get_candles_from_ws(symbol: str, interval: str, limit: int) -> list[Candle] 
     if candles is not None and len(candles) >= min(limit, 20):
         if not is_candle_series_stale(candles, interval_minutes=INTERVAL_MINUTES):
             return candles
-        logging.info(
-            "Binance WS candle cache stale for %s — will REST refresh",
-            symbol.upper(),
-        )
+        if not quiet:
+            logging.info(
+                "Binance WS candle cache stale for %s — will REST refresh",
+                symbol.upper(),
+            )
     return None
 
 
