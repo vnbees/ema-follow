@@ -193,6 +193,10 @@ def main() -> None:
     setup_logging()
     init_db()
     store.ensure_schema()
+
+    web_thread = threading.Thread(target=start_web_server, daemon=True)
+    web_thread.start()
+
     try:
         from src.config import EXCHANGE
         from src.exchange.binance_ws import start_binance_ws
@@ -254,9 +258,6 @@ def main() -> None:
         logging.info("Trading: LIVE")
     else:
         logging.info("Trading: DISABLED — analysis and dashboard only")
-
-    web_thread = threading.Thread(target=start_web_server, daemon=True)
-    web_thread.start()
 
     while True:
         try:
