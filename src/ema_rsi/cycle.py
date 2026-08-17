@@ -16,6 +16,8 @@ from src.config import (
     INTERVAL_MINUTES,
     LOG_DIR,
     WEB_PORT,
+    BINANCE_CLEAR_RATE_LIMIT,
+    BINANCE_VOLUME_RANK_REST_SEC,
 )
 from src.database import init_db, insert_equity_snapshot
 from src.ema_rsi.config import (
@@ -113,8 +115,63 @@ def _log_balance() -> None:
         logging.debug("EMA-RSI balance log skipped: %s", exc)
 
 
+def _wait_binance_ws_ready() -> None:
+    """Wait for miniTicker seed + kline WS before first volume rank (avoid REST burst)."""
+    for _ in range(80):
+        time.sleep(0.5)
+        try:
+            from src.exchange.binance_ws.cache import CACHE
+
+            if CACHE.mini_ticker_seeded:
+                break
+        except Exception:  # noqa: BLE001
+            break
+    else:
+        logging.warning(
+            "Binance miniTicker not seeded after 40s — volume rank may defer to next cycle"
+        )
+        notify_error(
+            "Binance miniTicker",
+            "miniTicker not seeded after 40s — volume rank may defer to next cycle",
+        )
+
+    for _ in range(60):
+        time.sleep(0.5)
+        try:
+            from src.exchange.binance_ws.cache import CACHE
+
+            if CACHE.kline_connected:
+                return
+        except Exception:  # noqa: BLE001
+            return
+    logging.warning(
+        "Binance kline WS not connected after 30s — entries will REST-confirm candles"
+    )
+    notify_error(
+        "Binance kline WS",
+        "kline WS not connected after 30s — entries will REST-confirm candles",
+    )
+
+
+def _maybe_clear_stale_rate_limit() -> None:
+    if not BINANCE_CLEAR_RATE_LIMIT:
+        return
+    try:
+        from src.config import EXCHANGE
+        from src.exchange import binance as binance_mod
+
+        if EXCHANGE != "binance":
+            return
+        if binance_mod.clear_rate_limit_cooldown():
+            logging.warning(
+                "Binance REST cooldown cleared on boot (BINANCE_CLEAR_RATE_LIMIT)"
+            )
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Binance cooldown clear skipped: %s", exc)
+
+
 def run_cycle() -> None:
-    ranked = refresh_volume_rank()
+    ranked = refresh_volume_rank(max_age_sec=BINANCE_VOLUME_RANK_REST_SEC)
     open_rows = store.get_open_trades()
     open_symbols = [str(row["symbol"]) for row in open_rows]
     _sync_watched(open_symbols, ranked)
@@ -202,39 +259,15 @@ def main() -> None:
         from src.exchange.binance_ws import start_binance_ws
 
         if EXCHANGE == "binance" and has_credentials():
+            _maybe_clear_stale_rate_limit()
             start_binance_ws()
-            for _ in range(20):
-                time.sleep(0.5)
-                try:
-                    from src.exchange.binance_ws.cache import CACHE
-
-                    if CACHE.mini_ticker_seeded or len(CACHE.ranked_volumes()) >= 30:
-                        break
-                except Exception:  # noqa: BLE001
-                    break
-            for _ in range(60):
-                time.sleep(0.5)
-                try:
-                    from src.exchange.binance_ws.cache import CACHE
-
-                    if CACHE.kline_connected:
-                        break
-                except Exception:  # noqa: BLE001
-                    break
-            else:
-                logging.warning(
-                    "Binance kline WS not connected after 30s — entries will REST-confirm candles"
-                )
-                notify_error(
-                    "Binance kline WS",
-                    "kline WS not connected after 30s — entries will REST-confirm candles",
-                )
+            _wait_binance_ws_ready()
     except Exception as exc:  # noqa: BLE001
         logging.warning("Binance WS start skipped: %s", exc)
         notify_error("Binance WS start", str(exc))
 
     start_watcher()
-    ranked = refresh_volume_rank()
+    ranked = refresh_volume_rank(max_age_sec=BINANCE_VOLUME_RANK_REST_SEC)
     if not ranked:
         logging.warning("Volume rank empty at startup — will retry each cycle")
         notify_error(
@@ -243,7 +276,6 @@ def main() -> None:
         )
     elif ranked:
         _sync_watched([], ranked)
-        time.sleep(2.0)
 
     logging.info("%s EMA-RSI bot started", EXCHANGE_DISPLAY_NAME)
     logging.info("Dashboard: http://localhost:%d", WEB_PORT)

@@ -345,6 +345,17 @@ def is_rate_limited() -> bool:
     return rate_limit_remaining_sec() > 0
 
 
+def clear_rate_limit_cooldown() -> bool:
+    """Clear in-memory and persisted REST ban cooldown (e.g. after egress IP change)."""
+    global _rate_limited_until_ms, _rate_limit_kind
+    with _rate_limit_lock:
+        had = _rate_limited_until_ms > _now_ms()
+        _rate_limited_until_ms = 0.0
+        _rate_limit_kind = "ban"
+    _clear_persisted_rate_limit()
+    return had
+
+
 def is_optional_rest_blocked() -> bool:
     return optional_rest_blocked_sec() > 0
 
@@ -962,6 +973,17 @@ def fetch_top_futures_by_volume(limit: int | None = None) -> list[tuple[str, flo
                 # already had a rank. Listing-age filter applies on REST fallback only.
                 if ranked:
                     return ranked if limit is None else ranked[:limit]
+                ws_scan = [(s, v) for s, v in ranked_raw if _is_scan(s)]
+                if ws_scan:
+                    logging.info(
+                        "Volume rank WS-only (%d symbols) — skip REST after filter empty",
+                        len(ws_scan),
+                    )
+                    return ws_scan if limit is None else ws_scan[:limit]
+                logging.info(
+                    "Volume rank WS miniTicker ready but no scan symbols — skip REST"
+                )
+                return []
             from src.config import BINANCE_WS_REST_TICKER_SEED
 
             # Default: wait for miniTicker. ticker/24hr + exchangeInfo on deploy 418'd

@@ -93,6 +93,13 @@ class TestBinanceRateLimit(unittest.TestCase):
         # Trading loop catches ExchangeClientError — cooldown must not crash it.
         self.assertTrue(issubclass(binance.RateLimitError, ExchangeClientError))
 
+    def test_clear_rate_limit_cooldown(self) -> None:
+        until = binance._now_ms() + 60_000
+        binance._set_rate_limited_until(until, kind="padded")
+        self.assertTrue(binance.clear_rate_limit_cooldown())
+        self.assertEqual(binance.rate_limit_remaining_sec(), 0.0)
+        self.assertFalse(binance._RATE_LIMIT_FILE.is_file())
+
     def test_normal_error_still_retries(self) -> None:
         resp = _response(500, {"code": -1000, "msg": "Internal error"})
         with (

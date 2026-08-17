@@ -165,6 +165,12 @@ BINANCE_SPOT_API_BASE = os.getenv("BINANCE_SPOT_API_BASE", "https://api.binance.
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
 BINANCE_WS_ENABLED = os.getenv("BINANCE_WS_ENABLED", "true").lower() in ("1", "true", "yes")
+# One-shot: clear persisted 418 cooldown on boot (e.g. after Railway region / IP change).
+BINANCE_CLEAR_RATE_LIMIT = os.getenv("BINANCE_CLEAR_RATE_LIMIT", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 # Post April 2026: legacy wss://fstream.binance.com/ws ACKs SUBSCRIBE but
 # delivers no kline/miniTicker/markPrice data. Use /market for public market
 # streams and /private for user data (listenKey).
