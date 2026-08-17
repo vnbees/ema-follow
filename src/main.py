@@ -15,11 +15,14 @@ from src.config import (
     LEVERAGE,
     LOG_DIR,
     MARGIN_COIN,
+    MAX_LOT_AGE_DAYS,
     MAX_OPEN_SYMBOLS,
     ORDER_MARGIN_MIN_USDT,
     ORDER_MARGIN_PCT,
     PAIR_PROFIT_TARGET_PCT,
+    PAIR_REOPEN_ON_CLOSE,
     PROFIT_TARGET_PCT,
+    RSI_ENTRY_ENABLED,
     RSI_MIN_CANDLES,
     RSI_PERIOD,
     SPOT_SNAPSHOT_INTERVAL_SEC,
@@ -47,7 +50,9 @@ from src.rsi_signals import detect_entry_signal
 from src.rsi_trading import (
     can_open_new_symbol,
     close_all_blocked_symbols,
+    ensure_one_inventory_symbol,
     evaluate_rsi_trade,
+    manage_pair_symbol,
     reset_age_close_budget,
 )
 from src.exchange.symbols import is_tradeable_symbol
@@ -144,7 +149,8 @@ def log_futures_balance_once(
             now = time.time()
             due_rest = (
                 BALANCE_MONITOR_REST_SEC > 0
-                and not binance_mod.is_rate_limited()
+                and not binance_mod.is_optional_rest_blocked()
+                and _last_balance_monitor_rest_at > 0
                 and (now - _last_balance_monitor_rest_at) >= BALANCE_MONITOR_REST_SEC
             )
             if due_rest:
@@ -194,7 +200,8 @@ def log_futures_balance_once(
             now = time.time()
             spot_due = (
                 SPOT_SNAPSHOT_INTERVAL_SEC > 0
-                and not binance_mod.is_rate_limited()
+                and not binance_mod.is_optional_rest_blocked()
+                and _last_spot_snapshot_at > 0
                 and (now - _last_spot_snapshot_at) >= SPOT_SNAPSHOT_INTERVAL_SEC
             )
             if spot_due:
@@ -239,6 +246,13 @@ def run_analysis_for_symbol(
     scan_only: bool = False,
     scan_rank: int = 0,
 ) -> tuple[str, str | None] | None:
+    if not RSI_ENTRY_ENABLED:
+        # Inventory mode: manage with WS mark only (no candle REST).
+        if scan_only:
+            return None
+        manage_pair_symbol(symbol)
+        return None
+
     snap, last_candle = _fetch_rsi_snapshot(symbol)
     signal = detect_entry_signal(snap)
     signal_side = signal.side
@@ -344,7 +358,30 @@ def run_cycle() -> None:
     signal_symbol = ""
     checked = 0
     block_scan = get_margin_guard_state().block_new_entries
-    if can_open_new_symbol() and not block_scan:
+    if not RSI_ENTRY_ENABLED:
+        if can_open_new_symbol() and not block_scan:
+            opened = ensure_one_inventory_symbol(ranked, exclude=scanned)
+            if opened:
+                signal_symbol = opened
+                checked = 1
+                logging.info(
+                    "Inventory bootstrap: opened %s (%d/%d symbols)",
+                    opened,
+                    db.count_open_symbols(),
+                    MAX_OPEN_SYMBOLS,
+                )
+        elif block_scan:
+            logging.info(
+                "  Margin guard — skip inventory bootstrap (tier=%s)",
+                get_margin_guard_state().tier,
+            )
+        else:
+            logging.info(
+                "Max open symbols reached (%d/%d) — skip inventory bootstrap",
+                get_open_position_count(),
+                MAX_OPEN_SYMBOLS,
+            )
+    elif can_open_new_symbol() and not block_scan:
         for rank, (symbol, _volume) in enumerate(ranked, 1):
             if symbol in scanned:
                 continue
@@ -384,7 +421,7 @@ def run_cycle() -> None:
     set_scan_progress(checked, signal_symbol)
     if not signal_symbol and not cycle_symbols:
         logging.info(
-            "Scan complete: checked %d/%d coins, no RSI entry",
+            "Scan complete: checked %d/%d coins, no new entry",
             checked,
             len(ranked),
         )
@@ -436,18 +473,26 @@ def main() -> None:
             close_all_blocked_symbols()
         except ExchangeClientError as exc:
             logging.warning("Startup blocked-symbol close skipped: %s", exc)
-    logging.info("%s RSI Bot started", EXCHANGE_DISPLAY_NAME)
+    logging.info("%s Pair Inventory Bot started", EXCHANGE_DISPLAY_NAME)
     logging.info("Dashboard: http://localhost:%d", WEB_PORT)
+    # First cycle uses WS/disk — do not fire /account + spot REST immediately on deploy.
+    global _last_balance_monitor_rest_at, _last_spot_snapshot_at
+    now_boot = time.time()
+    _last_balance_monitor_rest_at = now_boot
+    _last_spot_snapshot_at = now_boot
     logging.info(
-        "Scan mode: TP %.1f%% mỗi cycle (đóng only%s) | cross 25/75: TP+reopen/stack | max %d symbols",
+        "Mode: inventory (RSI_ENTRY=%s) | TP %.2f%% | reopen_on_close=%s | age %.0fd | max %d symbols",
+        RSI_ENTRY_ENABLED,
         PAIR_PROFIT_TARGET_PCT,
-        ", lot-only" if not AGGREGATE_TP_ENABLED else ", agg+lot",
+        PAIR_REOPEN_ON_CLOSE,
+        MAX_LOT_AGE_DAYS,
         MAX_OPEN_SYMBOLS,
     )
-    logging.info("Cycle: %dm | RSI period: %d", INTERVAL_MINUTES, RSI_PERIOD)
+    logging.info("Cycle: %dm | aggregate_tp=%s", INTERVAL_MINUTES, AGGREGATE_TP_ENABLED)
     if is_trading_enabled():
         logging.info(
-            "Trading: LIVE hedged RSI — cycle TP %.1f%% (%s) | cross 25/75 pair+stack | margin/leg max(%.0f USDT, %.1f%% equity) @ %dx",
+            "Trading: LIVE hedged pairs — TP %.2f%% (%s) | orphan BE when partner closed | "
+            "margin/leg max(%.0f USDT, %.1f%% equity) @ %dx",
             PAIR_PROFIT_TARGET_PCT,
             "lot-level only; AGGREGATE_TP_ENABLED=false" if not AGGREGATE_TP_ENABLED else "aggregate+lot",
             ORDER_MARGIN_MIN_USDT,

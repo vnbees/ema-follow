@@ -71,6 +71,8 @@ def _open_sides_by_symbol() -> dict[str, set[str]]:
 
 
 def _side_has_tp_candidate(symbol: str, side: str, mark: float, tp_pct: float) -> bool:
+    from src.rsi_trading import leg_tp_target_pct
+
     for lot in db.get_open_pair_lots(symbol):
         status_key = "long_status" if side == "long" else "short_status"
         if lot[status_key] != "open":
@@ -79,7 +81,8 @@ def _side_has_tp_candidate(symbol: str, side: str, mark: float, tp_pct: float) -
         size = float(lot["long_size"] if side == "long" else lot["short_size"])
         if size <= 0 or entry <= 0:
             continue
-        if should_take_profit(side, entry, mark, target_pct=tp_pct):
+        target = leg_tp_target_pct(lot, side, base_tp_pct=tp_pct)
+        if should_take_profit(side, entry, mark, target_pct=target):
             return True
     return False
 
@@ -87,7 +90,8 @@ def _side_has_tp_candidate(symbol: str, side: str, mark: float, tp_pct: float) -
 def _run_once() -> None:
     from src.exchange import binance as binance_mod
     from src.exchange.binance_ws import get_mark_from_ws
-    from src.margin_guard import effective_tp_pct
+    from src.margin_guard import effective_tp_pct, should_block_new_entries
+    from src.config import PAIR_REOPEN_ON_CLOSE
     from src.rsi_trading import (
         AlreadyFlatError,
         TP_CLOSE_LOCK,
@@ -97,6 +101,7 @@ def _run_once() -> None:
         _trading_enabled,
         arm_breakeven_lots_for_symbol,
         side_has_breakeven_candidate,
+        side_has_orphan_be_candidate,
     )
 
     if not _trading_enabled() or not has_credentials():
@@ -107,6 +112,7 @@ def _run_once() -> None:
         return
 
     tp_pct = effective_tp_pct()
+    reopen = PAIR_REOPEN_ON_CLOSE and not should_block_new_entries()
     open_sides = _open_sides_by_symbol()
     if not open_sides:
         _set_status(paused_reason=None, last_check_at=_now_str())
@@ -119,7 +125,7 @@ def _run_once() -> None:
             continue
         ws_ok = True
 
-        # Arm sticky BE for old underwater lots (DB-only, no exchange).
+        # Arm sticky BE for old underwater lots (DB-only, no exchange) when enabled.
         arm_breakeven_lots_for_symbol(symbol, mark)
 
         hit_sides = [
@@ -130,7 +136,11 @@ def _run_once() -> None:
         be_sides = [
             side
             for side in ("long", "short")
-            if side in sides and side_has_breakeven_candidate(symbol, side, mark)
+            if side in sides
+            and (
+                side_has_breakeven_candidate(symbol, side, mark)
+                or side_has_orphan_be_candidate(symbol, side, mark)
+            )
         ]
         if not hit_sides and not be_sides:
             continue
@@ -142,18 +152,22 @@ def _run_once() -> None:
             # Locked scan re-reads DB + exchange, so a concurrent 5m cycle
             # close is detected and nothing is closed twice.
             try:
-                if hit_sides:
+                if hit_sides or be_sides:
+                    # Orphan BE is handled inside TP scan (target 0% when partner closed).
                     took = _scan_take_profits_locked(
                         symbol,
                         mark,
                         snap,
                         trigger="realtime",
-                        reopen_pair=False,
+                        reopen_pair=reopen,
                         tp_target_pct=tp_pct,
                     )
                 if be_sides or hit_sides:
-                    # Re-check BE after TP (lot may still be open / newly at BE).
-                    be_took = _scan_breakeven_closes(symbol, mark)
+                    # Legacy sticky BE (optional); orphan already covered above.
+                    # Sticky-BE / age never reopen — only TP path may.
+                    be_took = _scan_breakeven_closes(
+                        symbol, mark, reopen_pair=False
+                    )
             except ExchangeClientError as exc:
                 if isinstance(exc, AlreadyFlatError) or _is_already_flat_error(exc):
                     logging.info("  [%s] Realtime TP/BE already flat: %s", symbol, exc)

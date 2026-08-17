@@ -35,6 +35,32 @@ class TestDiscordNotify(unittest.TestCase):
             self.assertIn("**AAVEUSDT đóng LONG**", content)
             self.assertIn("Futures balance:", content)
 
+    def test_title_includes_close_reason(self) -> None:
+        mock_resp = MagicMock(ok=True, status_code=204, text="")
+        with (
+            patch.object(notify, "DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/test/token"),
+            patch.object(notify, "_format_balance_body", return_value="balance"),
+            patch("src.notify.requests.post", return_value=mock_resp) as mock_post,
+        ):
+            notify.notify_close("ETHUSDT", "SHORT×1", reason="tp")
+            content = mock_post.call_args.kwargs["json"]["content"]
+            self.assertIn("**ETHUSDT đóng SHORT×1 — chạm TP", content)
+
+    def test_title_uses_reason_text_for_mixed_batch(self) -> None:
+        mock_resp = MagicMock(ok=True, status_code=204, text="")
+        with (
+            patch.object(notify, "DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/test/token"),
+            patch.object(notify, "_format_balance_body", return_value="balance"),
+            patch("src.notify.requests.post", return_value=mock_resp) as mock_post,
+        ):
+            notify.notify_close(
+                "BTCUSDT",
+                "LONG×3",
+                reason_text="chạm TP 0.5% ×2; chạm entry (chân còn lại đã TP) ×1",
+            )
+            content = mock_post.call_args.kwargs["json"]["content"]
+            self.assertIn("**BTCUSDT đóng LONG×3 — chạm TP 0.5% ×2; chạm entry", content)
+
     def test_http_error_does_not_raise(self) -> None:
         mock_resp = MagicMock(ok=False, status_code=500, text="err")
         with (

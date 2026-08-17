@@ -63,6 +63,8 @@ class TestLazyOpenOnly(unittest.TestCase):
         self.tmp.cleanup()
 
     @patch("src.rsi_trading.ensure_symbol_configured")
+    @patch("src.rsi_trading._scan_max_age_closes", return_value=False)
+    @patch("src.rsi_trading._scan_breakeven_closes", return_value=False)
     @patch("src.rsi_trading._scan_take_profits", return_value=False)
     @patch("src.rsi_trading._update_status")
     @patch("src.rsi_trading._sync_lots_with_exchange")
@@ -79,6 +81,8 @@ class TestLazyOpenOnly(unittest.TestCase):
         _sync,
         _status,
         _scan,
+        _be,
+        _age,
         mock_ensure,
     ) -> None:
         snap = RsiSnapshot(ready=True, rsi=50.0, close=100.0)

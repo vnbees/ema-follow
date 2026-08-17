@@ -611,7 +611,7 @@ def _reconcile_symbols_rest(symbols: set[str]) -> bool:
         return True
     from src.exchange import binance as binance_mod
 
-    if binance_mod.is_rate_limited():
+    if binance_mod.is_optional_rest_blocked():
         return False
     try:
         CACHE.bump_rest("reconcile_account")
@@ -668,11 +668,6 @@ def flush_pending_reconcile(*, wait_uds_sec: float | None = None) -> bool:
         if not _pending_reconcile:
             return False
         symbols = set(_pending_reconcile_symbols)
-
-    from src.exchange import binance as binance_mod
-
-    if binance_mod.is_rate_limited():
-        return False
 
     wait = _UDS_WAIT_SEC if wait_uds_sec is None else max(0.0, wait_uds_sec)
     deadline = time.monotonic() + wait

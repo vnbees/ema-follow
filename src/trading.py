@@ -213,6 +213,16 @@ def _optional_rest_blocked() -> bool:
         return False
 
 
+def _uds_connected() -> bool:
+    try:
+        from src.exchange.binance_ws.cache import CACHE
+        from src.exchange.binance_ws.manager import is_ws_enabled
+
+        return bool(is_ws_enabled() and CACHE.user_connected)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def resolve_order_fill(
     symbol: str,
     order_result: dict,
@@ -248,7 +258,21 @@ def resolve_order_fill(
             time.sleep(_FILL_WS_DELAY_SEC)
 
     rest_blocked = _optional_rest_blocked()
-    if not rest_blocked:
+    uds_up = _uds_connected()
+    # UDS already polled above. GET /order after market fills re-banned Railway IPs.
+    if rest_blocked:
+        logging.info(
+            "  [%s] Skip REST fill poll for order %s — ban/resume cooldown",
+            symbol,
+            order_id,
+        )
+    elif uds_up:
+        logging.debug(
+            "  [%s] Skip REST fill poll for order %s — UDS connected, using mark fallback",
+            symbol,
+            order_id,
+        )
+    else:
         for attempt in range(_FILL_REST_ATTEMPTS):
             try:
                 detail = exchange_fetch_order_detail(symbol, order_id)
@@ -266,12 +290,6 @@ def resolve_order_fill(
                     order_id,
                     exc,
                 )
-    else:
-        logging.info(
-            "  [%s] Skip REST fill poll for order %s — ban/resume cooldown",
-            symbol,
-            order_id,
-        )
 
     try:
         mark = fetch_side_mark_price(symbol)

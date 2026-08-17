@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from pathlib import Path
 
 from src.config import DATABASE_PATH, GRANULARITY
@@ -15,6 +16,7 @@ _DATA_DIR = Path(DATABASE_PATH).expanduser().resolve().parent
 _LISTEN_KEY_FILE = _DATA_DIR / "binance_listen_key"
 _CANDLES_FILE = _DATA_DIR / "binance_ws_candles.json"
 _ACCOUNT_FILE = _DATA_DIR / "binance_ws_account.json"
+_EXCHANGE_INFO_FILE = _DATA_DIR / "binance_exchange_info.json"
 _io_lock = threading.Lock()
 
 
@@ -197,3 +199,35 @@ def load_account_snapshot() -> bool:
         # Treat disk restore as a successful reconcile so boot skips force REST.
         CACHE.mark_reconciled()
     return loaded
+
+
+def load_exchange_info_snapshot() -> tuple[dict, float] | None:
+    """Return (exchangeInfo JSON, saved_at unix) from volume, or None."""
+    try:
+        if not _EXCHANGE_INFO_FILE.is_file():
+            return None
+        raw = json.loads(_EXCHANGE_INFO_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    info = raw.get("info")
+    if not isinstance(info, dict) or "symbols" not in info:
+        return None
+    try:
+        saved_at = float(raw.get("saved_at") or 0)
+    except (TypeError, ValueError):
+        saved_at = 0.0
+    return info, saved_at
+
+
+def save_exchange_info_snapshot(info: dict) -> None:
+    if not isinstance(info, dict) or "symbols" not in info:
+        return
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"saved_at": time.time(), "info": info}
+        with _io_lock:
+            _EXCHANGE_INFO_FILE.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError as exc:
+        logging.debug("exchangeInfo persist failed: %s", exc)

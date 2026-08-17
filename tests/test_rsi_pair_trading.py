@@ -39,12 +39,16 @@ class TestScanTakeProfits(unittest.TestCase):
     @patch("src.rsi_trading._open_pair")
     @patch("src.rsi_trading._take_profit_lot_side")
     @patch("src.rsi_trading._take_profit_aggregate_side")
-    @patch("src.rsi_trading.db.compute_open_lot_side_avg")
+    @patch("src.rsi_trading._side_has_orphan_open", return_value=False)
+    @patch("src.rsi_trading._compute_pair_active_side_avg")
+    @patch("src.rsi_trading.db.get_open_pair_lots", return_value=[])
     @patch("src.rsi_trading.fetch_symbol_positions")
     def test_cycle_no_reopen(
         self,
         fetch_positions,
-        db_avg,
+        _lots,
+        pair_avg,
+        _orphan,
         take_agg,
         take_lot,
         open_pair,
@@ -58,10 +62,11 @@ class TestScanTakeProfits(unittest.TestCase):
                 return (100.0, 2.0)
             return (102.5, 2.0)  # short: 0% move
 
-        db_avg.side_effect = _avg
+        pair_avg.side_effect = _avg
         snap = RsiSnapshot(ready=True, rsi=50.0, close=102.5)
         result = _scan_take_profits(
             "BTCUSDT", 102.5, snap, trigger="cycle", reopen_pair=False,
+            tp_target_pct=2.0,
         )
         self.assertTrue(result)
         take_agg.assert_called_once()
@@ -96,12 +101,16 @@ class TestScanTakeProfits(unittest.TestCase):
     @patch("src.rsi_trading.AGGREGATE_TP_ENABLED", True)
     @patch("src.rsi_trading._open_pair")
     @patch("src.rsi_trading._take_profit_aggregate_side")
-    @patch("src.rsi_trading.db.compute_open_lot_side_avg", return_value=(100.0, 2.0))
+    @patch("src.rsi_trading._side_has_orphan_open", return_value=False)
+    @patch("src.rsi_trading._compute_pair_active_side_avg", return_value=(100.0, 2.0))
+    @patch("src.rsi_trading.db.get_open_pair_lots", return_value=[])
     @patch("src.rsi_trading.fetch_symbol_positions")
     def test_cross_reopen_passed(
         self,
         fetch_positions,
-        _db_avg,
+        _lots,
+        _pair_avg,
+        _orphan,
         take_agg,
         open_pair,
     ):
@@ -111,6 +120,7 @@ class TestScanTakeProfits(unittest.TestCase):
         snap = RsiSnapshot(ready=True, rsi=26.0, cross_up_25=True, close=102.5)
         _scan_take_profits(
             "BTCUSDT", 102.5, snap, trigger="rsi_cross_25", reopen_pair=True,
+            tp_target_pct=2.0,
         )
         self.assertTrue(take_agg.call_args.kwargs["reopen_pair"])
 
@@ -118,12 +128,14 @@ class TestScanTakeProfits(unittest.TestCase):
     @patch("src.rsi_trading._open_pair")
     @patch("src.rsi_trading._take_profit_lots_side_batched")
     @patch("src.rsi_trading._take_profit_aggregate_side")
-    @patch("src.rsi_trading.db.compute_open_lot_side_avg")
+    @patch("src.rsi_trading._side_has_orphan_open", return_value=False)
+    @patch("src.rsi_trading._compute_pair_active_side_avg")
     @patch("src.rsi_trading.fetch_symbol_positions")
     def test_db_wavg_hits_tp_closes_aggregate(
         self,
         fetch_positions,
-        db_avg,
+        pair_avg,
+        _orphan,
         take_agg,
         take_batch,
         open_pair,
@@ -132,7 +144,7 @@ class TestScanTakeProfits(unittest.TestCase):
         fetch_positions.return_value = _positions(
             long_size=3.0, long_avg=99.0, short_size=0.0,
         )
-        db_avg.side_effect = lambda _s, side: (100.0, 3.0) if side == "long" else None
+        pair_avg.side_effect = lambda _s, side: (100.0, 3.0) if side == "long" else None
         snap = RsiSnapshot(ready=True, rsi=50.0, close=102.5)
         result = _scan_take_profits(
             "BTCUSDT", 102.5, snap, trigger="cycle", reopen_pair=False,
@@ -193,8 +205,9 @@ class TestScanTakeProfits(unittest.TestCase):
         self.assertEqual(close_side.call_args[0][1], "long")
         self.assertAlmostEqual(close_side.call_args[0][2], 1.0)
         self.assertEqual(close_db.call_count, 1)
-        open_pair.assert_called_once()
-        self.assertIn("tp_batch_long", open_pair.call_args[0][2])
+        self.assertEqual(close_db.call_args.kwargs.get("close_reason"), "orphan_be")
+        # Orphan-BE close must not reopen a fresh pair.
+        open_pair.assert_not_called()
         notify.assert_called_once()
 
     @patch("src.rsi_trading._flush_post_order_reconcile")
@@ -288,6 +301,9 @@ class TestScanTakeProfits(unittest.TestCase):
         self.assertEqual(close_db.call_count, 2)
         sides = [c.args[1] for c in close_db.call_args_list]
         self.assertEqual(sides, ["short", "short"])
+        self.assertTrue(
+            all(c.kwargs.get("close_reason") == "sync" for c in close_db.call_args_list)
+        )
 
 
 class TestSyncLotsWithExchange(unittest.TestCase):
@@ -307,16 +323,23 @@ class TestSyncLotsWithExchange(unittest.TestCase):
         self.assertTrue(all(c.args[1] == "short" for c in close_db.call_args_list))
         closed_ids = {c.args[0] for c in close_db.call_args_list}
         self.assertEqual(closed_ids, {1, 2})
+        self.assertTrue(
+            all(c.kwargs.get("close_reason") == "sync" for c in close_db.call_args_list)
+        )
 
 
 class TestEvaluateRsiTrade(unittest.TestCase):
     def test_no_cross_runs_cycle_scan_only(self):
         with (
+            patch("src.rsi_trading.RSI_ENTRY_ENABLED", True),
+            patch("src.rsi_trading.PAIR_REOPEN_ON_CLOSE", True),
             patch("src.margin_guard.should_block_new_entries", return_value=False),
             patch("src.margin_guard.effective_tp_pct", return_value=2.0),
             patch("src.rsi_trading.MARGIN_PREFLIGHT_ENABLED", False),
             patch("src.rsi_trading._open_pair") as open_pair,
             patch("src.rsi_trading._scan_take_profits") as scan_tp,
+            patch("src.rsi_trading._scan_breakeven_closes"),
+            patch("src.rsi_trading._scan_max_age_closes"),
             patch("src.rsi_trading._update_status"),
             patch("src.rsi_trading._sync_lots_with_exchange"),
             patch("src.rsi_trading.ensure_symbol_configured"),
@@ -328,16 +351,19 @@ class TestEvaluateRsiTrade(unittest.TestCase):
             snap = RsiSnapshot(ready=True, rsi=50.0, prev_rsi=49.0)
             evaluate_rsi_trade("BTCUSDT", snap)
             scan_tp.assert_called_once()
-            self.assertFalse(scan_tp.call_args.kwargs["reopen_pair"])
+            self.assertTrue(scan_tp.call_args.kwargs["reopen_pair"])
             open_pair.assert_not_called()
 
     def test_cross_tp_then_no_stack(self):
         with (
+            patch("src.rsi_trading.RSI_ENTRY_ENABLED", True),
             patch("src.margin_guard.should_block_new_entries", return_value=False),
             patch("src.margin_guard.effective_tp_pct", return_value=2.0),
             patch("src.rsi_trading.MARGIN_PREFLIGHT_ENABLED", False),
             patch("src.rsi_trading._open_pair") as open_pair,
             patch("src.rsi_trading._scan_take_profits") as scan_tp,
+            patch("src.rsi_trading._scan_breakeven_closes"),
+            patch("src.rsi_trading._scan_max_age_closes"),
             patch("src.rsi_trading._update_status"),
             patch("src.rsi_trading._sync_lots_with_exchange"),
             patch("src.rsi_trading.ensure_symbol_configured"),
@@ -356,11 +382,14 @@ class TestEvaluateRsiTrade(unittest.TestCase):
 
     def test_cross_stack_when_no_tp(self):
         with (
+            patch("src.rsi_trading.RSI_ENTRY_ENABLED", True),
             patch("src.margin_guard.should_block_new_entries", return_value=False),
             patch("src.margin_guard.effective_tp_pct", return_value=2.0),
             patch("src.rsi_trading.MARGIN_PREFLIGHT_ENABLED", False),
             patch("src.rsi_trading._open_pair") as open_pair,
             patch("src.rsi_trading._scan_take_profits", return_value=False),
+            patch("src.rsi_trading._scan_breakeven_closes"),
+            patch("src.rsi_trading._scan_max_age_closes"),
             patch("src.rsi_trading.db.symbol_has_open_lots", return_value=True),
             patch("src.rsi_trading._update_status"),
             patch("src.rsi_trading._sync_lots_with_exchange"),
@@ -378,11 +407,14 @@ class TestEvaluateRsiTrade(unittest.TestCase):
 
     def test_first_pair_entry_for_new_symbol(self):
         with (
+            patch("src.rsi_trading.RSI_ENTRY_ENABLED", True),
             patch("src.margin_guard.should_block_new_entries", return_value=False),
             patch("src.margin_guard.effective_tp_pct", return_value=2.0),
             patch("src.rsi_trading.MARGIN_PREFLIGHT_ENABLED", False),
             patch("src.rsi_trading._open_pair") as open_pair,
             patch("src.rsi_trading._scan_take_profits", return_value=False),
+            patch("src.rsi_trading._scan_breakeven_closes"),
+            patch("src.rsi_trading._scan_max_age_closes"),
             patch("src.rsi_trading.db.symbol_has_open_lots", return_value=False),
             patch("src.rsi_trading.can_open_new_symbol", return_value=True),
             patch("src.rsi_trading._update_status"),

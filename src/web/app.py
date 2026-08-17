@@ -667,6 +667,8 @@ def _build_pnl_calendar_payload(year: int, month: int) -> dict:
 
 
 def _build_recent_orders(limit: int = 10) -> list[dict]:
+    from src.close_reasons import reason_label_vi
+
     rows = db.get_recent_leg_events(limit)
     orders: list[dict] = []
     for row in rows:
@@ -675,6 +677,7 @@ def _build_recent_orders(limit: int = 10) -> list[dict]:
         entry = float(row["entry"] or 0)
         size = float(row["size"] or 0)
         pnl = None
+        close_reason = None
         if event_type == "close":
             pnl = leg_realized_pnl(
                 side,
@@ -683,6 +686,8 @@ def _build_recent_orders(limit: int = 10) -> list[dict]:
                 realized_pnl_usdt=row["realized_pnl_usdt"],
                 close_price=row["close_price"],
             )
+            if "close_reason" in row.keys():
+                close_reason = row["close_reason"]
         orders.append(
             {
                 "time_vn": format_vn_time(str(row["event_at"])),
@@ -694,9 +699,27 @@ def _build_recent_orders(limit: int = 10) -> list[dict]:
                 "pnl": pnl,
                 "trigger": row["entry_trigger"] or "—",
                 "lot_id": int(row["lot_id"]),
+                "close_reason": close_reason,
+                "close_reason_label": (
+                    reason_label_vi(str(close_reason)) if close_reason else "—"
+                ),
             }
         )
     return orders
+
+
+def _close_report_payload(days: int = 30) -> dict:
+    from src.close_reasons import REASON_AGE, REASON_ORPHAN_BE, REASON_TP, reason_label_vi
+
+    report = db.get_daily_close_report(days=days)
+    return {
+        **report,
+        "labels": {
+            "tp": reason_label_vi(REASON_TP),
+            "orphan_be": reason_label_vi(REASON_ORPHAN_BE),
+            "age": reason_label_vi(REASON_AGE),
+        },
+    }
 
 
 def _simple_dashboard_context() -> dict:
@@ -708,6 +731,7 @@ def _simple_dashboard_context() -> dict:
         "exchange_name": EXCHANGE_DISPLAY_NAME,
         "account": account,
         "recent_orders": _build_recent_orders(10),
+        "close_report": _close_report_payload(30),
         "last_cycle_at": get_last_cycle_at(),
         "trading_enabled": is_trading_enabled(),
         "spot_transfer": spot_status,
@@ -782,6 +806,11 @@ def api_pnl_calendar(
 ) -> dict:
     cal_year, cal_month = _resolve_calendar_month(year, month)
     return _build_pnl_calendar_payload(cal_year, cal_month)
+
+
+@app.get("/api/close-report")
+def api_close_report(days: int = Query(default=30, ge=1, le=365)) -> dict:
+    return _close_report_payload(days)
 
 
 @app.get("/api/ofi")

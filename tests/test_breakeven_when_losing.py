@@ -30,6 +30,14 @@ def _iso_hours_ago(hours: float) -> str:
     return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
 
 
+def setUpModule() -> None:
+    rsi_trading.PAIR_REOPEN_ON_CLOSE = False
+
+
+def tearDownModule() -> None:
+    rsi_trading.PAIR_REOPEN_ON_CLOSE = True
+
+
 def _make_lot(**kwargs) -> dict:
     base = {
         "id": 1,
@@ -162,6 +170,7 @@ class TestBreakevenWhenLosing(unittest.TestCase):
         close_lot_side.assert_called_once()
         self.assertEqual(close_lot_side.call_args[0][0], 1)
         self.assertEqual(close_lot_side.call_args[0][1], "long")
+        self.assertEqual(close_lot_side.call_args.kwargs.get("close_reason"), "be_time")
         self.assertFalse(is_breakeven_armed(1, "long"))
 
     @patch("src.rsi_trading.BREAKEVEN_AFTER_HOURS", 24.0)
@@ -209,9 +218,10 @@ class TestBreakevenWhenLosing(unittest.TestCase):
         self.assertEqual(close_lot_side.call_args[0][0], 3)
 
     @patch("src.notify.notify_close")
-    @patch("src.rsi_trading._open_pair")
+    @patch("src.rsi_trading._maybe_reopen_pair")
     @patch("src.rsi_trading.BREAKEVEN_AFTER_HOURS", 24.0)
     @patch("src.rsi_trading.BREAKEVEN_WHEN_LOSING_ENABLED", True)
+    @patch("src.rsi_trading.PAIR_REOPEN_ON_CLOSE", True)
     @patch("src.rsi_trading.db.close_lot_side")
     @patch("src.rsi_trading._close_side_and_resolve_fill", return_value=100.0)
     @patch("src.rsi_trading.db.get_open_pair_lots")
@@ -222,15 +232,20 @@ class TestBreakevenWhenLosing(unittest.TestCase):
         get_lots,
         _close_fill,
         _close_lot_side,
-        _open_pair,
+        maybe_reopen,
         _notify,
         _fmt,
     ):
-        fetch_positions.return_value = _positions(long_size=1.0)
-        get_lots.return_value = [_make_lot(opened_at=_iso_hours_ago(30))]
-        _scan_breakeven_closes("BTCUSDT", 95.0)
-        _scan_breakeven_closes("BTCUSDT", 100.0)
-        _open_pair.assert_not_called()
+        # Sticky BE closes must not reopen even when PAIR_REOPEN_ON_CLOSE is on.
+        rsi_trading.PAIR_REOPEN_ON_CLOSE = True
+        try:
+            fetch_positions.return_value = _positions(long_size=1.0)
+            get_lots.return_value = [_make_lot(opened_at=_iso_hours_ago(30))]
+            _scan_breakeven_closes("BTCUSDT", 95.0)
+            _scan_breakeven_closes("BTCUSDT", 100.0)
+            maybe_reopen.assert_not_called()
+        finally:
+            rsi_trading.PAIR_REOPEN_ON_CLOSE = False
 
 
 class TestIsUnderwater(unittest.TestCase):

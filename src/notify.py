@@ -54,14 +54,25 @@ def _send_discord(title: str, body: str) -> None:
         )
 
 
-def notify_close(symbol: str, detail: str) -> None:
+def notify_close(
+    symbol: str,
+    detail: str,
+    *,
+    reason: str | None = None,
+    reason_text: str | None = None,
+) -> None:
     """Send close notification to Discord. Never raises to callers."""
     try:
         if not discord_configured():
             logging.debug("Discord notify skipped: DISCORD_WEBHOOK_URL not set")
             return
 
+        from src.close_reasons import reason_label_vi
+
         title = f"{symbol.upper()} đóng {detail}"
+        label = (reason_text or "").strip() or (reason_label_vi(reason) if reason else "")
+        if label:
+            title = f"{title} — {label}"
         body = _format_balance_body()
         try:
             _send_discord(title, body)

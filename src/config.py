@@ -24,6 +24,12 @@ RSI_SHORT_ENTRY = float(os.getenv("RSI_SHORT_ENTRY", "75"))
 RSI_SHORT_EXIT = float(os.getenv("RSI_SHORT_EXIT", "25"))
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "5"))
 RSI_MIN_CANDLES = RSI_PERIOD + 2
+# Inventory mode: open/maintain pairs without RSI cross entry/stack.
+RSI_ENTRY_ENABLED = os.getenv("RSI_ENTRY_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 ORDER_SIZE_USDT = float(os.getenv("ORDER_SIZE_USDT", "5"))
 ORDER_MARGIN_PCT = float(os.getenv("ORDER_MARGIN_PCT", "0.5"))
@@ -35,7 +41,7 @@ TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() in ("1", "true",
 MAX_OPEN_SYMBOLS = int(os.getenv("MAX_OPEN_SYMBOLS", os.getenv("MAX_OPEN_POSITIONS", "20")))
 MAX_OPEN_POSITIONS = MAX_OPEN_SYMBOLS
 MAX_OPEN_LEGS = MAX_OPEN_SYMBOLS * 2
-PAIR_PROFIT_TARGET_PCT = float(os.getenv("PAIR_PROFIT_TARGET_PCT", "2"))
+PAIR_PROFIT_TARGET_PCT = float(os.getenv("PAIR_PROFIT_TARGET_PCT", "0.5"))
 # Close whole LONG/SHORT side when DB-weighted avg of open lots vs mark ≥ TP,
 # then fall through to per-lot TP when side avg is below threshold.
 # Uses lot entries in DB (not exchange entryPrice) to avoid closing underwater
@@ -45,13 +51,23 @@ AGGREGATE_TP_ENABLED = os.getenv("AGGREGATE_TP_ENABLED", "true").lower() in (
     "true",
     "yes",
 )
+# After a TP close (0.5% hit), open a fresh L+S on the same symbol.
+# Orphan-BE (partner already TP'd) and max-age closes do not reopen.
+PAIR_REOPEN_ON_CLOSE = os.getenv("PAIR_REOPEN_ON_CLOSE", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# Bootstrap missing inventory slots: max new symbols opened per 5m cycle (anti-418).
+INVENTORY_BOOTSTRAP_PER_CYCLE = int(os.getenv("INVENTORY_BOOTSTRAP_PER_CYCLE", "1"))
 
 # Auto-close lot legs older than this many days (0 = disabled).
-MAX_LOT_AGE_DAYS = float(os.getenv("MAX_LOT_AGE_DAYS", "0"))
+MAX_LOT_AGE_DAYS = float(os.getenv("MAX_LOT_AGE_DAYS", "3"))
 # Global budget of age-close exchange orders per 5m cycle (stagger to avoid 418).
 MAX_AGE_CLOSES_PER_CYCLE = int(os.getenv("MAX_AGE_CLOSES_PER_CYCLE", "4"))
 
 # After N hours, underwater lots arm sticky BE (close at entry); still-green lots keep TP.
+# Inventory mode uses orphan-BE (partner closed → target 0%) instead; leave off by default.
 BREAKEVEN_WHEN_LOSING_ENABLED = os.getenv(
     "BREAKEVEN_WHEN_LOSING_ENABLED", "false"
 ).lower() in ("1", "true", "yes")
@@ -70,7 +86,7 @@ MARGIN_MAINT_WARN_PCT = float(os.getenv("MARGIN_MAINT_WARN_PCT", "20"))
 MARGIN_MAINT_HIGH_PCT = float(os.getenv("MARGIN_MAINT_HIGH_PCT", "25"))
 MARGIN_MAINT_CRITICAL_PCT = float(os.getenv("MARGIN_MAINT_CRITICAL_PCT", "35"))
 MARGIN_MAINT_DELEVERAGE_PCT = float(os.getenv("MARGIN_MAINT_DELEVERAGE_PCT", "30"))
-MARGIN_HIGH_TP_PCT = float(os.getenv("MARGIN_HIGH_TP_PCT", "1"))
+MARGIN_HIGH_TP_PCT = float(os.getenv("MARGIN_HIGH_TP_PCT", "0.5"))
 MARGIN_DEPOSIT_TARGET_PCT = float(os.getenv("MARGIN_DEPOSIT_TARGET_PCT", "18"))
 MARGIN_ELEVATED_CYCLE_LIMIT = int(os.getenv("MARGIN_ELEVATED_CYCLE_LIMIT", "3"))
 MARGIN_HIGH_CYCLE_LIMIT = int(os.getenv("MARGIN_HIGH_CYCLE_LIMIT", "2"))
@@ -174,6 +190,10 @@ BINANCE_WS_REST_TICKER_SEED = os.getenv("BINANCE_WS_REST_TICKER_SEED", "false").
 )
 # Min interval between ticker/24hr volume-rank fallbacks when WS miniTicker is empty.
 BINANCE_VOLUME_RANK_REST_SEC = float(os.getenv("BINANCE_VOLUME_RANK_REST_SEC", "300"))
+# Reuse disk exchangeInfo this long (lot/tick filters). 0 = never REST-refresh if disk exists.
+BINANCE_EXCHANGE_INFO_MAX_AGE_SEC = float(
+    os.getenv("BINANCE_EXCHANGE_INFO_MAX_AGE_SEC", str(7 * 86_400))
+)
 # Resubscribe kline socket when a watched symbol is silent this long.
 BINANCE_WS_KLINE_SILENCE_SEC = float(os.getenv("BINANCE_WS_KLINE_SILENCE_SEC", "90"))
 # Per-symbol cooldown between REST kline refreshes (anti-418; still correct within interval).

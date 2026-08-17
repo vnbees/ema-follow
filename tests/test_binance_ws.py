@@ -253,7 +253,23 @@ class TestApplyMarketPayload(unittest.TestCase):
 
 
 class TestVolumeRankFallback(unittest.TestCase):
-    def test_fetch_top_futures_rest_when_ws_mini_ticker_empty(self) -> None:
+    def test_fetch_top_futures_skips_rest_when_ws_enabled_and_empty(self) -> None:
+        from src.exchange import binance
+
+        binance._volume_rank_rest_at_mono = 0.0
+        binance._volume_rank_rest_cache = []
+        CACHE.quote_volumes.clear()
+        CACHE.mini_ticker_seeded = False
+        with (
+            patch("src.exchange.binance_ws.manager.is_ws_enabled", return_value=True),
+            patch("src.exchange.binance.fetch_top_futures_by_volume_rest") as mock_rest,
+            patch("src.exchange.binance.is_optional_rest_blocked", return_value=False),
+        ):
+            ranked = binance.fetch_top_futures_by_volume(limit=2)
+            self.assertEqual(ranked, [])
+            mock_rest.assert_not_called()
+
+    def test_fetch_top_futures_rest_when_ws_ticker_seed_enabled(self) -> None:
         from src.exchange import binance
 
         binance._volume_rank_rest_at_mono = 0.0
@@ -263,13 +279,86 @@ class TestVolumeRankFallback(unittest.TestCase):
         fake = [("BTCUSDT", 1e9), ("ETHUSDT", 5e8)]
         with (
             patch("src.exchange.binance_ws.manager.is_ws_enabled", return_value=True),
+            patch("src.config.BINANCE_WS_REST_TICKER_SEED", True),
             patch("src.exchange.binance.fetch_top_futures_by_volume_rest", return_value=fake) as mock_rest,
-            patch("src.exchange.binance.is_rate_limited", return_value=False),
+            patch("src.exchange.binance.is_optional_rest_blocked", return_value=False),
         ):
             ranked = binance.fetch_top_futures_by_volume(limit=2)
             self.assertEqual(ranked, fake)
             mock_rest.assert_called_once()
             self.assertTrue(CACHE.mini_ticker_seeded)
+
+    def test_fetch_top_futures_uses_ws_rank_without_exchange_info_rest(self) -> None:
+        from src.exchange import binance
+
+        binance._volume_rank_rest_at_mono = 0.0
+        binance._volume_rank_rest_cache = []
+        CACHE.set_quote_volumes({"BTCUSDT": 1e9, "ETHUSDT": 5e8}, seeded=True)
+        with (
+            patch("src.exchange.binance_ws.manager.is_ws_enabled", return_value=True),
+            patch("src.exchange.binance._load_exchange_info") as mock_info,
+            patch(
+                "src.exchange.binance._perpetual_universe_from_disk",
+                return_value=None,
+            ),
+            patch("src.exchange.binance.fetch_top_futures_by_volume_rest") as mock_rest,
+            patch("src.exchange.binance._public_get") as mock_get,
+        ):
+            ranked = binance.fetch_top_futures_by_volume(limit=2)
+        self.assertEqual(ranked[0][0], "BTCUSDT")
+        mock_info.assert_not_called()
+        mock_rest.assert_not_called()
+        mock_get.assert_not_called()
+
+    def test_ws_rank_drops_tradifi_via_disk_universe(self) -> None:
+        from src.exchange import binance
+
+        binance._volume_rank_rest_at_mono = 0.0
+        binance._volume_rank_rest_cache = []
+        CACHE.set_quote_volumes(
+            {"SNDKUSDT": 2e9, "BTCUSDT": 1e9, "ETHUSDT": 5e8},
+            seeded=True,
+        )
+        with (
+            patch("src.exchange.binance_ws.manager.is_ws_enabled", return_value=True),
+            patch(
+                "src.exchange.binance._perpetual_universe_from_disk",
+                return_value={"BTCUSDT", "ETHUSDT"},
+            ),
+            patch("src.exchange.binance._load_exchange_info") as mock_info,
+            patch("src.exchange.binance.fetch_top_futures_by_volume_rest") as mock_rest,
+            patch("src.exchange.binance._public_get") as mock_get,
+        ):
+            ranked = binance.fetch_top_futures_by_volume(limit=5)
+        self.assertEqual([s for s, _ in ranked], ["BTCUSDT", "ETHUSDT"])
+        mock_info.assert_not_called()
+        mock_rest.assert_not_called()
+        mock_get.assert_not_called()
+
+    def test_scan_universe_excludes_tradifi_perpetual(self) -> None:
+        from src.exchange import binance
+
+        info = {
+            "symbols": [
+                {
+                    "symbol": "BTCUSDT",
+                    "contractType": "PERPETUAL",
+                    "status": "TRADING",
+                    "quoteAsset": "USDT",
+                    "marginAsset": "USDT",
+                },
+                {
+                    "symbol": "SNDKUSDT",
+                    "contractType": "TRADIFI_PERPETUAL",
+                    "status": "TRADING",
+                    "quoteAsset": "USDT",
+                    "marginAsset": "USDT",
+                },
+            ]
+        }
+        universe = binance._scan_universe_from_info(info)
+        self.assertIn("BTCUSDT", universe)
+        self.assertNotIn("SNDKUSDT", universe)
 
     def test_fetch_top_futures_uses_rest_cache_within_throttle(self) -> None:
         from src.exchange import binance

@@ -7,6 +7,14 @@ from src import rsi_trading
 from src.rsi_trading import _scan_max_age_closes, reset_age_close_budget
 
 
+def setUpModule() -> None:
+    rsi_trading.PAIR_REOPEN_ON_CLOSE = False
+
+
+def tearDownModule() -> None:
+    rsi_trading.PAIR_REOPEN_ON_CLOSE = True
+
+
 def _positions(
     symbol: str = "BTCUSDT",
     long_size: float = 0.0,
@@ -73,6 +81,7 @@ class TestMaxAgeRule(unittest.TestCase):
         close_lot_side.assert_called_once()
         self.assertEqual(close_lot_side.call_args[0][0], 1)
         self.assertEqual(close_lot_side.call_args[0][1], "long")
+        self.assertEqual(close_lot_side.call_args.kwargs.get("close_reason"), "age")
 
     @patch("src.rsi_trading.MAX_LOT_AGE_DAYS", 0.0)
     @patch("src.rsi_trading.fetch_symbol_positions")
@@ -172,6 +181,34 @@ class TestMaxAgeRule(unittest.TestCase):
         close_fill.assert_called_once()
         self.assertAlmostEqual(close_fill.call_args[0][2], 1.0)
         close_lot_side.assert_called_once()
+
+    @patch("src.notify.notify_close")
+    @patch("src.rsi_trading._maybe_reopen_pair")
+    @patch("src.rsi_trading.PAIR_REOPEN_ON_CLOSE", True)
+    @patch("src.rsi_trading.MAX_LOT_AGE_DAYS", 3.0)
+    @patch("src.rsi_trading.db.close_lot_side")
+    @patch("src.rsi_trading._close_side_and_resolve_fill", return_value=99.0)
+    @patch("src.rsi_trading.db.get_open_pair_lots")
+    @patch("src.rsi_trading.fetch_symbol_positions")
+    def test_age_close_does_not_reopen(
+        self,
+        fetch_positions,
+        get_lots,
+        _close_fill,
+        _close_lot_side,
+        maybe_reopen,
+        _notify,
+        _fmt,
+    ):
+        rsi_trading.PAIR_REOPEN_ON_CLOSE = True
+        try:
+            reset_age_close_budget()
+            fetch_positions.return_value = _positions(long_size=1.0)
+            get_lots.return_value = [_make_lot(id=1, opened_at=_iso_days_ago(6))]
+            self.assertTrue(_scan_max_age_closes("BTCUSDT", 99.0, reopen_pair=True))
+            maybe_reopen.assert_not_called()
+        finally:
+            rsi_trading.PAIR_REOPEN_ON_CLOSE = False
 
 
 if __name__ == "__main__":

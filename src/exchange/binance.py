@@ -598,10 +598,47 @@ def _decimals_from_step(step: str) -> int:
     return len(trimmed.split(".")[1])
 
 
-def _load_exchange_info() -> dict:
+def _load_exchange_info(*, force_rest: bool = False) -> dict:
+    """Lot/tick filters. Prefer volume snapshot so Railway deploys skip GET /exchangeInfo."""
     global _EXCHANGE_INFO_CACHE
-    if _EXCHANGE_INFO_CACHE is None:
-        _EXCHANGE_INFO_CACHE = _public_get("/fapi/v1/exchangeInfo", {})
+    if _EXCHANGE_INFO_CACHE is not None and not force_rest:
+        return _EXCHANGE_INFO_CACHE
+
+    from src.config import BINANCE_EXCHANGE_INFO_MAX_AGE_SEC
+    from src.exchange.binance_ws.persist import (
+        load_exchange_info_snapshot,
+        save_exchange_info_snapshot,
+    )
+
+    if not force_rest:
+        disk = load_exchange_info_snapshot()
+        if disk is not None:
+            info, saved_at = disk
+            _EXCHANGE_INFO_CACHE = info
+            age = time.time() - saved_at if saved_at > 0 else 1e18
+            stale = (
+                BINANCE_EXCHANGE_INFO_MAX_AGE_SEC > 0
+                and age > BINANCE_EXCHANGE_INFO_MAX_AGE_SEC
+            )
+            if not stale or is_optional_rest_blocked():
+                return _EXCHANGE_INFO_CACHE
+            logging.info(
+                "Binance exchangeInfo disk cache stale (%.0fs) — REST refresh",
+                age,
+            )
+
+    if is_optional_rest_blocked():
+        if _EXCHANGE_INFO_CACHE is not None:
+            return _EXCHANGE_INFO_CACHE
+        raise RateLimitError(
+            f"REST ban/resume — optional GET /fapi/v1/exchangeInfo skipped "
+            f"({optional_rest_blocked_sec():.0f}s remaining)"
+        )
+    _EXCHANGE_INFO_CACHE = _public_get("/fapi/v1/exchangeInfo", {})
+    try:
+        save_exchange_info_snapshot(_EXCHANGE_INFO_CACHE)
+    except Exception:  # noqa: BLE001
+        pass
     return _EXCHANGE_INFO_CACHE
 
 
@@ -642,7 +679,18 @@ def _parse_contract_spec(symbol: str, info: dict) -> ContractSpec:
 def fetch_contract_spec(symbol: str) -> ContractSpec:
     symbol = symbol.upper()
     if symbol not in _SPEC_CACHE:
-        _SPEC_CACHE[symbol] = _parse_contract_spec(symbol, _load_exchange_info())
+        try:
+            _SPEC_CACHE[symbol] = _parse_contract_spec(symbol, _load_exchange_info())
+        except ExchangeClientError:
+            if is_optional_rest_blocked():
+                raise
+            logging.info(
+                "Contract spec missing for %s on disk snapshot — REST exchangeInfo",
+                symbol,
+            )
+            _SPEC_CACHE[symbol] = _parse_contract_spec(
+                symbol, _load_exchange_info(force_rest=True)
+            )
     return _SPEC_CACHE[symbol]
 
 
@@ -718,10 +766,10 @@ def fetch_candles(
     except Exception:  # noqa: BLE001
         pass
 
-    if is_rate_limited():
+    if is_optional_rest_blocked():
         raise RateLimitError(
-            f"Rate-limit cooldown active — {rate_limit_remaining_sec():.0f}s remaining, "
-            "no candle cache yet (wait for WS history or ban end)"
+            f"REST ban/resume — skip kline REST "
+            f"({optional_rest_blocked_sec():.0f}s remaining, wait for WS history)"
         )
 
     try:
@@ -784,6 +832,25 @@ def _scan_universe_from_info(info: dict) -> set[str]:
     }
 
 
+def _perpetual_universe_from_disk() -> set[str] | None:
+    """USDT-M PERPETUAL set from memory/disk only — never triggers REST.
+
+    Used to drop TradFi / delivery contracts from WS miniTicker volume rank.
+    """
+    global _EXCHANGE_INFO_CACHE
+    info = _EXCHANGE_INFO_CACHE
+    if info is None:
+        from src.exchange.binance_ws.persist import load_exchange_info_snapshot
+
+        disk = load_exchange_info_snapshot()
+        if disk is None:
+            return None
+        info, _saved_at = disk
+        _EXCHANGE_INFO_CACHE = info
+    universe = _scan_universe_from_info(info)
+    return universe or None
+
+
 def fetch_top_futures_by_volume_rest(limit: int | None = None) -> list[tuple[str, float]]:
     info = _load_exchange_info()
     trading_perps = _scan_universe_from_info(info)
@@ -819,19 +886,38 @@ def fetch_top_futures_by_volume(limit: int | None = None) -> list[tuple[str, flo
             ranked_raw = CACHE.ranked_volumes()
             if ranked_raw and (CACHE.mini_ticker_seeded or len(ranked_raw) >= 30):
                 ranked = [(s, v) for s, v in ranked_raw if _is_scan(s)]
-                if not is_rate_limited():
-                    try:
-                        info = _load_exchange_info()
-                        trading_perps = _scan_universe_from_info(info)
-                        ranked = [(s, v) for s, v in ranked if s in trading_perps]
-                    except Exception:  # noqa: BLE001
-                        pass
+                # Prefer disk PERPETUAL universe (no REST) so TradFi / delivery
+                # tickers from miniTicker never enter bootstrap (e.g. SNDKUSDT).
+                try:
+                    universe = _perpetual_universe_from_disk()
+                    if universe:
+                        ranked = [(s, v) for s, v in ranked if s in universe]
+                except Exception:  # noqa: BLE001
+                    pass
+                # Do NOT call GET /fapi/v1/exchangeInfo here — that REST on every
+                # restart re-banned the shared Railway IP (418) even when miniTicker
+                # already had a rank. Listing-age filter applies on REST fallback only.
                 if ranked:
                     return ranked if limit is None else ranked[:limit]
+            from src.config import BINANCE_WS_REST_TICKER_SEED
+
+            # Default: wait for miniTicker. ticker/24hr + exchangeInfo on deploy 418'd
+            # the shared egress IP. Opt in with BINANCE_WS_REST_TICKER_SEED=true.
+            if not BINANCE_WS_REST_TICKER_SEED:
+                if _volume_rank_rest_cache:
+                    return (
+                        _volume_rank_rest_cache
+                        if limit is None
+                        else _volume_rank_rest_cache[:limit]
+                    )
+                logging.info(
+                    "Volume rank waiting for miniTicker — skip REST ticker/24hr"
+                )
+                return []
     except Exception:  # noqa: BLE001
         pass
 
-    if is_rate_limited():
+    if is_optional_rest_blocked():
         if _volume_rank_rest_cache:
             return _volume_rank_rest_cache if limit is None else _volume_rank_rest_cache[:limit]
         return []
@@ -958,7 +1044,11 @@ def _positions_dict_from_rows(symbol: str, rows: list) -> dict[str, Position]:
     return result
 
 
-def fetch_symbol_positions_rest(symbol: str) -> dict[str, Position]:
+def fetch_symbol_positions_rest(
+    symbol: str,
+    *,
+    priority: str = "critical",
+) -> dict[str, Position]:
     symbol = symbol.upper()
     now = _now_ms()
     with _rest_cache_lock:
@@ -969,7 +1059,11 @@ def fetch_symbol_positions_rest(symbol: str) -> dict[str, Position]:
                 "short": cached[1]["short"],
             }
 
-    rows = _private_get("/fapi/v2/positionRisk", {"symbol": symbol})
+    rows = _private_get(
+        "/fapi/v2/positionRisk",
+        {"symbol": symbol},
+        priority=priority,
+    )
     if not isinstance(rows, list):
         rows = []
     result = _positions_dict_from_rows(symbol, rows)
@@ -999,6 +1093,12 @@ def fetch_symbol_positions(symbol: str) -> dict[str, Position]:
             return lenient
     except Exception:  # noqa: BLE001
         pass
+    # Do not treat "no WS cache" as flat during ban/resume — that phantom-closed lots.
+    if is_optional_rest_blocked():
+        raise RateLimitError(
+            "REST ban/resume — skip positionRisk "
+            f"{symbol} ({optional_rest_blocked_sec():.0f}s remaining)"
+        )
     return fetch_symbol_positions_rest(symbol)
 
 
@@ -1058,6 +1158,8 @@ def fetch_side_mark_price(symbol: str) -> float:
             return mark
     except Exception:  # noqa: BLE001
         pass
+    if is_optional_rest_blocked():
+        return 0.0
     data = _public_get("/fapi/v1/premiumIndex", {"symbol": symbol.upper()})
     if isinstance(data, list):
         data = data[0] if data else {}

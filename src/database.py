@@ -85,6 +85,7 @@ def init_db() -> None:
         _migrate_rsi_trades_sizing_pnl(conn)
         _migrate_manual_hold_symbols(conn)
         _migrate_rsi_pair_lots(conn)
+        _migrate_rsi_pair_lot_close_reason(conn)
         _migrate_equity_snapshots(conn)
         _migrate_spot_transfer_tables(conn)
         _migrate_push_subscriptions(conn)
@@ -934,7 +935,9 @@ def _migrate_rsi_pair_lots(conn: sqlite3.Connection) -> None:
             long_realized_pnl_usdt REAL,
             short_realized_pnl_usdt REAL,
             long_close_price REAL,
-            short_close_price REAL
+            short_close_price REAL,
+            long_close_reason TEXT,
+            short_close_reason TEXT
         )
         """
     )
@@ -944,6 +947,14 @@ def _migrate_rsi_pair_lots(conn: sqlite3.Connection) -> None:
         ON rsi_pair_lots(symbol, opened_at)
         """
     )
+
+
+def _migrate_rsi_pair_lot_close_reason(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(rsi_pair_lots)").fetchall()}
+    if "long_close_reason" not in cols:
+        conn.execute("ALTER TABLE rsi_pair_lots ADD COLUMN long_close_reason TEXT")
+    if "short_close_reason" not in cols:
+        conn.execute("ALTER TABLE rsi_pair_lots ADD COLUMN short_close_reason TEXT")
 
 
 def insert_pair_lot(
@@ -1072,6 +1083,7 @@ def close_lot_side(
     *,
     realized_pnl_usdt: float | None = None,
     close_price: float | None = None,
+    close_reason: str | None = None,
 ) -> None:
     side = side.lower()
     now = _utc_now()
@@ -1081,10 +1093,11 @@ def close_lot_side(
                 """
                 UPDATE rsi_pair_lots
                 SET long_status = 'closed', long_closed_at = ?, updated_at = ?,
-                    long_realized_pnl_usdt = ?, long_close_price = ?
+                    long_realized_pnl_usdt = ?, long_close_price = ?,
+                    long_close_reason = ?
                 WHERE id = ?
                 """,
-                (now, now, realized_pnl_usdt, close_price, lot_id),
+                (now, now, realized_pnl_usdt, close_price, close_reason, lot_id),
             )
         return
     with get_connection() as conn:
@@ -1092,10 +1105,11 @@ def close_lot_side(
             """
             UPDATE rsi_pair_lots
             SET short_status = 'closed', short_closed_at = ?, updated_at = ?,
-                short_realized_pnl_usdt = ?, short_close_price = ?
+                short_realized_pnl_usdt = ?, short_close_price = ?,
+                short_close_reason = ?
             WHERE id = ?
             """,
-            (now, now, realized_pnl_usdt, close_price, lot_id),
+            (now, now, realized_pnl_usdt, close_price, close_reason, lot_id),
         )
 
 
@@ -1105,6 +1119,7 @@ def close_all_lot_sides(
     *,
     close_price: float | None = None,
     mark: float | None = None,
+    close_reason: str | None = None,
 ) -> None:
     side = side.lower()
     price = close_price if close_price is not None else mark
@@ -1125,6 +1140,7 @@ def close_all_lot_sides(
             side,
             realized_pnl_usdt=realized,
             close_price=price,
+            close_reason=close_reason,
         )
 
 
@@ -1172,7 +1188,8 @@ def get_recent_leg_events(limit: int = 10) -> list[sqlite3.Row]:
                 entry,
                 close_price,
                 realized_pnl_usdt,
-                entry_trigger
+                entry_trigger,
+                close_reason
             FROM (
                 SELECT
                     opened_at AS event_at,
@@ -1184,7 +1201,8 @@ def get_recent_leg_events(limit: int = 10) -> list[sqlite3.Row]:
                     long_entry AS entry,
                     NULL AS close_price,
                     NULL AS realized_pnl_usdt,
-                    entry_trigger
+                    entry_trigger,
+                    NULL AS close_reason
                 FROM rsi_pair_lots
                 UNION ALL
                 SELECT
@@ -1197,7 +1215,8 @@ def get_recent_leg_events(limit: int = 10) -> list[sqlite3.Row]:
                     short_entry,
                     NULL,
                     NULL,
-                    entry_trigger
+                    entry_trigger,
+                    NULL
                 FROM rsi_pair_lots
                 UNION ALL
                 SELECT
@@ -1210,7 +1229,8 @@ def get_recent_leg_events(limit: int = 10) -> list[sqlite3.Row]:
                     long_entry,
                     long_close_price,
                     long_realized_pnl_usdt,
-                    entry_trigger
+                    entry_trigger,
+                    long_close_reason
                 FROM rsi_pair_lots
                 WHERE long_closed_at IS NOT NULL
                 UNION ALL
@@ -1224,7 +1244,8 @@ def get_recent_leg_events(limit: int = 10) -> list[sqlite3.Row]:
                     short_entry,
                     short_close_price,
                     short_realized_pnl_usdt,
-                    entry_trigger
+                    entry_trigger,
+                    short_close_reason
                 FROM rsi_pair_lots
                 WHERE short_closed_at IS NOT NULL
             )
@@ -1250,7 +1271,8 @@ def get_closed_lot_side_events() -> list[sqlite3.Row]:
                 size,
                 margin_usdt,
                 entry_trigger,
-                lot_id
+                lot_id,
+                close_reason
             FROM (
                 SELECT
                     symbol,
@@ -1262,7 +1284,8 @@ def get_closed_lot_side_events() -> list[sqlite3.Row]:
                     long_size AS size,
                     margin_usdt,
                     entry_trigger,
-                    id AS lot_id
+                    id AS lot_id,
+                    long_close_reason AS close_reason
                 FROM rsi_pair_lots
                 WHERE long_closed_at IS NOT NULL
                 UNION ALL
@@ -1276,13 +1299,105 @@ def get_closed_lot_side_events() -> list[sqlite3.Row]:
                     short_size AS size,
                     margin_usdt,
                     entry_trigger,
-                    id AS lot_id
+                    id AS lot_id,
+                    short_close_reason AS close_reason
                 FROM rsi_pair_lots
                 WHERE short_closed_at IS NOT NULL
             )
             ORDER BY closed_at DESC
             """
         ).fetchall()
+
+
+def _empty_close_report_day(day_iso: str) -> dict:
+    return {
+        "date": day_iso,
+        "tp_count": 0,
+        "tp_pnl": 0.0,
+        "orphan_be_count": 0,
+        "orphan_be_pnl": 0.0,
+        "age_count": 0,
+        "age_pnl": 0.0,
+        "total_count": 0,
+        "total_pnl": 0.0,
+    }
+
+
+def get_daily_close_report(days: int = 30, *, now_utc: datetime | None = None) -> dict:
+    """Daily close counts/PnL by VN date for TP, orphan-BE, and max-age."""
+    from src.close_reasons import REASON_AGE, REASON_ORPHAN_BE, REASON_TP, REPORT_REASONS
+    from src.pnl import leg_realized_pnl
+    from src.web.calendar_build import VN_TZ, utc_timestamp_to_vn_date
+
+    window = max(1, min(int(days), 365))
+    now = now_utc or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    today_vn = now.astimezone(VN_TZ).date()
+    start = today_vn - timedelta(days=window - 1)
+    buckets: dict[str, dict] = {}
+    cursor = start
+    while cursor <= today_vn:
+        buckets[cursor.isoformat()] = _empty_close_report_day(cursor.isoformat())
+        cursor += timedelta(days=1)
+
+    for row in get_closed_lot_side_events():
+        reason = None
+        if "close_reason" in row.keys():
+            reason = row["close_reason"]
+        if reason not in REPORT_REASONS:
+            continue
+        closed_at = row["closed_at"]
+        if not closed_at:
+            continue
+        try:
+            vn_date = utc_timestamp_to_vn_date(str(closed_at)).isoformat()
+        except (TypeError, ValueError):
+            continue
+        bucket = buckets.get(vn_date)
+        if bucket is None:
+            continue
+        pnl = leg_realized_pnl(
+            str(row["side"]),
+            float(row["entry"] or 0),
+            float(row["size"] or 0),
+            realized_pnl_usdt=row["realized_pnl_usdt"],
+            close_price=row["close_price"],
+        )
+        pnl_value = float(pnl) if pnl is not None else 0.0
+        if reason == REASON_TP:
+            bucket["tp_count"] += 1
+            bucket["tp_pnl"] += pnl_value
+        elif reason == REASON_ORPHAN_BE:
+            bucket["orphan_be_count"] += 1
+            bucket["orphan_be_pnl"] += pnl_value
+        elif reason == REASON_AGE:
+            bucket["age_count"] += 1
+            bucket["age_pnl"] += pnl_value
+        bucket["total_count"] += 1
+        bucket["total_pnl"] += pnl_value
+
+    day_rows = list(reversed(list(buckets.values())))
+    totals = _empty_close_report_day("total")
+    for row in day_rows:
+        for key in (
+            "tp_count",
+            "tp_pnl",
+            "orphan_be_count",
+            "orphan_be_pnl",
+            "age_count",
+            "age_pnl",
+            "total_count",
+            "total_pnl",
+        ):
+            totals[key] += row[key]
+    return {
+        "days": window,
+        "from_date": start.isoformat(),
+        "to_date": today_vn.isoformat(),
+        "rows": day_rows,
+        "totals": totals,
+    }
 
 
 def get_closed_realized_from_lots() -> tuple[float, int, int]:

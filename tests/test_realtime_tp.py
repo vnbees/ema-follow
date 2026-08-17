@@ -11,9 +11,9 @@ def _lot(**kwargs) -> dict:
         "long_status": "open",
         "long_entry": 100.0,
         "long_size": 1.0,
-        "short_status": "closed",
-        "short_entry": 0.0,
-        "short_size": 0.0,
+        "short_status": "open",
+        "short_entry": 100.0,
+        "short_size": 1.0,
     }
     base.update(kwargs)
     return base
@@ -37,10 +37,12 @@ class TestSideHasTpCandidate(unittest.TestCase):
 
 
 class TestRunOnce(unittest.TestCase):
+    @patch("src.rsi_trading.side_has_orphan_be_candidate", return_value=False)
     @patch("src.rsi_trading._scan_breakeven_closes", return_value=False)
     @patch("src.rsi_trading.arm_breakeven_lots_for_symbol", return_value=0)
     @patch("src.rsi_trading.side_has_breakeven_candidate", return_value=False)
     @patch("src.rsi_trading._scan_take_profits_locked", return_value=True)
+    @patch("src.margin_guard.should_block_new_entries", return_value=False)
     @patch("src.margin_guard.effective_tp_pct", return_value=1.0)
     @patch("src.exchange.binance_ws.get_mark_from_ws", return_value=101.5)
     @patch("src.exchange.binance.is_rate_limited", return_value=False)
@@ -57,10 +59,12 @@ class TestRunOnce(unittest.TestCase):
         _rate,
         _mark,
         _tp,
+        _block,
         scan_locked,
         _be_cand,
         _arm,
         _be_scan,
+        _orphan,
     ):
         all_lots.return_value = [_lot()]
         sym_lots.return_value = [_lot()]
@@ -68,15 +72,17 @@ class TestRunOnce(unittest.TestCase):
         scan_locked.assert_called_once()
         kwargs = scan_locked.call_args.kwargs
         self.assertEqual(kwargs["trigger"], "realtime")
-        self.assertFalse(kwargs["reopen_pair"])
+        self.assertTrue(kwargs["reopen_pair"])
         self.assertEqual(kwargs["tp_target_pct"], 1.0)
         self.assertGreaterEqual(get_realtime_tp_status()["closes"], 1)
         _be_scan.assert_called_once()
 
+    @patch("src.rsi_trading.side_has_orphan_be_candidate", return_value=False)
     @patch("src.rsi_trading._scan_breakeven_closes", return_value=False)
     @patch("src.rsi_trading.arm_breakeven_lots_for_symbol", return_value=0)
     @patch("src.rsi_trading.side_has_breakeven_candidate", return_value=False)
     @patch("src.rsi_trading._scan_take_profits_locked")
+    @patch("src.margin_guard.should_block_new_entries", return_value=False)
     @patch("src.margin_guard.effective_tp_pct", return_value=1.0)
     @patch("src.exchange.binance_ws.get_mark_from_ws", return_value=100.5)
     @patch("src.exchange.binance.is_rate_limited", return_value=False)
@@ -93,10 +99,12 @@ class TestRunOnce(unittest.TestCase):
         _rate,
         _mark,
         _tp,
+        _block,
         scan_locked,
         _be_cand,
         _arm,
         _be_scan,
+        _orphan,
     ):
         all_lots.return_value = [_lot()]
         sym_lots.return_value = [_lot()]
@@ -136,10 +144,12 @@ class TestRunOnce(unittest.TestCase):
         scan_locked.assert_not_called()
         self.assertEqual(get_realtime_tp_status()["paused_reason"], "trading disabled")
 
+    @patch("src.rsi_trading.side_has_orphan_be_candidate", return_value=False)
     @patch("src.rsi_trading._scan_breakeven_closes", return_value=True)
     @patch("src.rsi_trading.arm_breakeven_lots_for_symbol", return_value=1)
     @patch("src.rsi_trading.side_has_breakeven_candidate", return_value=True)
-    @patch("src.rsi_trading._scan_take_profits_locked")
+    @patch("src.rsi_trading._scan_take_profits_locked", return_value=False)
+    @patch("src.margin_guard.should_block_new_entries", return_value=False)
     @patch("src.margin_guard.effective_tp_pct", return_value=1.0)
     @patch("src.exchange.binance_ws.get_mark_from_ws", return_value=100.0)
     @patch("src.exchange.binance.is_rate_limited", return_value=False)
@@ -156,23 +166,27 @@ class TestRunOnce(unittest.TestCase):
         _rate,
         _mark,
         _tp,
+        _block,
         scan_locked,
         _be_cand,
         _arm,
         be_scan,
+        _orphan,
     ):
         all_lots.return_value = [_lot()]
         sym_lots.return_value = [_lot()]
         before = get_realtime_tp_status().get("be_closes", 0)
         _run_once()
-        scan_locked.assert_not_called()
+        # Inventory path may also run TP scan (orphan/BE check); sticky BE still closes.
         be_scan.assert_called_once()
         self.assertGreaterEqual(get_realtime_tp_status()["be_closes"], before + 1)
 
+    @patch("src.rsi_trading.side_has_orphan_be_candidate", return_value=False)
     @patch("src.rsi_trading._scan_breakeven_closes")
     @patch("src.rsi_trading.arm_breakeven_lots_for_symbol", return_value=0)
     @patch("src.rsi_trading.side_has_breakeven_candidate", return_value=False)
     @patch("src.rsi_trading._scan_take_profits_locked")
+    @patch("src.margin_guard.should_block_new_entries", return_value=False)
     @patch("src.margin_guard.effective_tp_pct", return_value=1.0)
     @patch("src.exchange.binance_ws.get_mark_from_ws", return_value=101.5)
     @patch("src.exchange.binance.is_rate_limited", return_value=False)
@@ -189,10 +203,12 @@ class TestRunOnce(unittest.TestCase):
         _rate,
         _mark,
         _tp,
+        _block,
         scan_locked,
         _be_cand,
         _arm,
         _be_scan,
+        _orphan,
     ):
         from src.rsi_trading import AlreadyFlatError
 

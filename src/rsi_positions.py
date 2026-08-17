@@ -36,11 +36,17 @@ def sync_exchange_positions() -> list[str]:
             live_exchange_symbols.add(symbol)
             continue
         # WS can retain ghost sides after a flat close; never invent lots from
-        # cache alone — confirm with REST before adopt.
+        # cache alone — confirm with REST before adopt (skip while REST cooldown).
         try:
-            from src.exchange.binance import fetch_symbol_positions_rest
+            from src.exchange.binance import (
+                fetch_symbol_positions_rest,
+                is_optional_rest_blocked,
+            )
 
-            positions = fetch_symbol_positions_rest(symbol)
+            if is_optional_rest_blocked():
+                logging.info("  Skip adopt %s — optional REST blocked", symbol)
+                continue
+            positions = fetch_symbol_positions_rest(symbol, priority="optional")
         except ExchangeClientError as exc:
             logging.warning(
                 "  Skip adopt %s — REST confirm failed: %s", symbol, exc,
@@ -73,9 +79,13 @@ def sync_exchange_positions() -> list[str]:
         )
         # insert_pair_lot always marks both sides open — close empty legs.
         if long_size <= 0:
-            db.close_lot_side(lot_id, "long", realized_pnl_usdt=0.0, close_price=None)
+            db.close_lot_side(
+                lot_id, "long", realized_pnl_usdt=0.0, close_price=None, close_reason="sync"
+            )
         if short_size <= 0:
-            db.close_lot_side(lot_id, "short", realized_pnl_usdt=0.0, close_price=None)
+            db.close_lot_side(
+                lot_id, "short", realized_pnl_usdt=0.0, close_price=None, close_reason="sync"
+            )
         logging.info("  Adopted exchange pair %s (no lot record)", symbol)
         live_exchange_symbols.add(symbol)
 

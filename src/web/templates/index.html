@@ -125,6 +125,56 @@
         </tbody>
       </table>
     </div>
+    </div>
+
+  <div class="pos-panel">
+    <h2 style="margin-top: 0;">Báo cáo đóng lệnh theo ngày</h2>
+    <p class="pos-summary">
+      {{ close_report.from_date }} → {{ close_report.to_date }} (giờ VN).
+      Chỉ tính lệnh đã ghi lý do: {{ close_report.labels.tp }},
+      {{ close_report.labels.orphan_be }},
+      {{ close_report.labels.age }}.
+      Lệnh cũ chưa có lý do không được đếm.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Ngày</th>
+            <th>{{ close_report.labels.tp }}</th>
+            <th>{{ close_report.labels.orphan_be }}</th>
+            <th>{{ close_report.labels.age }}</th>
+            <th>Tổng PnL</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in close_report.rows if row.total_count %}
+          <tr>
+            <td class="meta">{{ row.date }}</td>
+            <td>{{ row.tp_count }} / <span class="{% if row.tp_pnl >= 0 %}green{% else %}red{% endif %}">{{ row.tp_pnl | dash_pnl }}</span></td>
+            <td>{{ row.orphan_be_count }} / <span class="{% if row.orphan_be_pnl >= 0 %}green{% else %}red{% endif %}">{{ row.orphan_be_pnl | dash_pnl }}</span></td>
+            <td>{{ row.age_count }} / <span class="{% if row.age_pnl >= 0 %}green{% else %}red{% endif %}">{{ row.age_pnl | dash_pnl }}</span></td>
+            <td class="{% if row.total_pnl >= 0 %}green{% else %}red{% endif %}">{{ row.total_count }} / {{ row.total_pnl | dash_pnl }}</td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="5" class="empty">Chưa có lệnh đóng có lý do trong {{ close_report.days }} ngày.</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+        {% if close_report.totals.total_count %}
+        <tfoot>
+          <tr>
+            <td><strong>Tổng {{ close_report.days }} ngày</strong></td>
+            <td>{{ close_report.totals.tp_count }} / <span class="{% if close_report.totals.tp_pnl >= 0 %}green{% else %}red{% endif %}">{{ close_report.totals.tp_pnl | dash_pnl }}</span></td>
+            <td>{{ close_report.totals.orphan_be_count }} / <span class="{% if close_report.totals.orphan_be_pnl >= 0 %}green{% else %}red{% endif %}">{{ close_report.totals.orphan_be_pnl | dash_pnl }}</span></td>
+            <td>{{ close_report.totals.age_count }} / <span class="{% if close_report.totals.age_pnl >= 0 %}green{% else %}red{% endif %}">{{ close_report.totals.age_pnl | dash_pnl }}</span></td>
+            <td class="{% if close_report.totals.total_pnl >= 0 %}green{% else %}red{% endif %}"><strong>{{ close_report.totals.total_count }} / {{ close_report.totals.total_pnl | dash_pnl }}</strong></td>
+          </tr>
+        </tfoot>
+        {% endif %}
+      </table>
+    </div>
   </div>
 
   <div class="settings-panel">
@@ -266,6 +316,7 @@
           <th>Size</th>
           <th>Entry</th>
           <th>PnL</th>
+          <th>Lý do đóng</th>
           <th>Trigger</th>
         </tr>
       </thead>
@@ -281,11 +332,12 @@
           <td class="{% if row.pnl is not none %}{% if row.pnl >= 0 %}green{% else %}red{% endif %}{% endif %}">
             {% if row.pnl is not none %}{{ row.pnl | dash_pnl }}{% else %}—{% endif %}
           </td>
+          <td class="meta">{{ row.close_reason_label }}</td>
           <td class="meta">{{ row.trigger }}</td>
         </tr>
         {% else %}
         <tr>
-          <td colspan="8" class="empty">Chưa có lệnh nào.</td>
+          <td colspan="9" class="empty">Chưa có lệnh nào.</td>
         </tr>
         {% endfor %}
       </tbody>

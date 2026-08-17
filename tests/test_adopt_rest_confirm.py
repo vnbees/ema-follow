@@ -37,7 +37,7 @@ class TestAdoptRequiresRestConfirm(unittest.TestCase):
         ):
             managed = sync_exchange_positions()
 
-        rest.assert_called_once_with("NEARUSDT")
+        rest.assert_called_once_with("NEARUSDT", priority="optional")
         db.insert_pair_lot.assert_not_called()
         cache.apply_position_updates.assert_called_once()
         self.assertEqual(managed, [])
@@ -63,7 +63,7 @@ class TestAdoptRequiresRestConfirm(unittest.TestCase):
 
         db.insert_pair_lot.assert_called_once()
         db.close_lot_side.assert_called_once_with(
-            99, "short", realized_pnl_usdt=0.0, close_price=None,
+            99, "short", realized_pnl_usdt=0.0, close_price=None, close_reason="sync",
         )
         self.assertEqual(managed, ["NEARUSDT"])
 
@@ -80,6 +80,22 @@ class TestAdoptRequiresRestConfirm(unittest.TestCase):
         ):
             sync_exchange_positions()
         db.insert_pair_lot.assert_not_called()
+
+    @patch("src.rsi_positions.db")
+    @patch("src.rsi_positions.fetch_all_open_positions")
+    @patch("src.rsi_positions.has_credentials", return_value=True)
+    def test_skips_adopt_when_optional_rest_blocked(self, _creds, fetch_all, db):
+        db.get_all_open_pair_lots.return_value = []
+        db.symbol_has_open_lots.return_value = False
+        fetch_all.return_value = [_pos("NEARUSDT", "long", 43.0, 1.74)]
+        with (
+            patch("src.exchange.binance.is_optional_rest_blocked", return_value=True),
+            patch("src.exchange.binance.fetch_symbol_positions_rest") as rest,
+        ):
+            managed = sync_exchange_positions()
+        rest.assert_not_called()
+        db.insert_pair_lot.assert_not_called()
+        self.assertEqual(managed, [])
 
 
 if __name__ == "__main__":

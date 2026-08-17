@@ -23,6 +23,7 @@ from src.config import (
     AGGREGATE_TP_ENABLED,
     BREAKEVEN_AFTER_HOURS,
     BREAKEVEN_WHEN_LOSING_ENABLED,
+    INVENTORY_BOOTSTRAP_PER_CYCLE,
     LEVERAGE,
     MARGIN_MODE,
     MARGIN_PREFLIGHT_ENABLED,
@@ -30,6 +31,8 @@ from src.config import (
     MAX_LOT_AGE_DAYS,
     MAX_OPEN_SYMBOLS,
     PAIR_PROFIT_TARGET_PCT,
+    PAIR_REOPEN_ON_CLOSE,
+    RSI_ENTRY_ENABLED,
     TRADING_ENABLED,
 )
 from src.order_sizing import compute_entry_margin_usdt, margin_to_notional
@@ -40,6 +43,15 @@ from src.rsi_signals import (
     is_underwater,
     price_move_pct,
     should_take_profit,
+)
+from src.close_reasons import (
+    REASON_AGE,
+    REASON_BE_TIME,
+    REASON_FORCE,
+    REASON_MANUAL,
+    REASON_SYNC,
+    REASON_TP,
+    format_close_reasons_vi,
 )
 from src.exchange.symbols import is_tradeable_symbol
 from src.trading import (
@@ -201,12 +213,12 @@ def _force_close_blocked_symbol(symbol: str, mark: float) -> bool:
             size_str,
         )
         fill = _close_side_and_resolve_fill(symbol, side, pos.size, mark)
-        db.close_all_lot_sides(symbol, side, close_price=fill)
+        db.close_all_lot_sides(symbol, side, close_price=fill, close_reason=REASON_FORCE)
         closed_any = True
     if closed_any:
         from src.notify import notify_close
 
-        notify_close(symbol, "L+S")
+        notify_close(symbol, "L+S", reason=REASON_FORCE)
     return closed_any
 
 
@@ -228,12 +240,12 @@ def close_hedge_symbol(symbol: str, mark: float | None = None) -> bool:
             size_str,
         )
         fill = _close_side_and_resolve_fill(symbol, side, pos.size, mark)
-        db.close_all_lot_sides(symbol, side, close_price=fill)
+        db.close_all_lot_sides(symbol, side, close_price=fill, close_reason=REASON_FORCE)
         closed_any = True
     if closed_any:
         from src.notify import notify_close
 
-        notify_close(symbol, "L+S")
+        notify_close(symbol, "L+S", reason=REASON_FORCE)
     return closed_any
 
 
@@ -342,6 +354,198 @@ def can_open_new_position() -> bool:
     return can_open_new_symbol()
 
 
+def partner_side(side: str) -> str:
+    return "short" if side == "long" else "long"
+
+
+def partner_is_closed(lot, side: str) -> bool:
+    """True when the opposite leg of this lot is already closed (orphan → BE)."""
+    other = partner_side(side)
+    status_key = "long_status" if other == "long" else "short_status"
+    return str(lot[status_key] or "").lower() == "closed"
+
+
+def _tp_close_reason(lot, side: str) -> str:
+    from src.close_reasons import REASON_ORPHAN_BE, REASON_TP
+
+    return REASON_ORPHAN_BE if partner_is_closed(lot, side) else REASON_TP
+
+
+def _infer_close_reason(trigger: str, lot, side: str) -> str:
+    from src.close_reasons import (
+        REASON_AGE,
+        REASON_BE_TIME,
+        REASON_FORCE,
+        REASON_MANUAL,
+        REASON_ORPHAN_BE,
+        REASON_TP,
+    )
+
+    t = (trigger or "").lower()
+    if "manual" in t:
+        return REASON_MANUAL
+    if "max_age" in t:
+        return REASON_AGE
+    if "preflight" in t or "spot_transfer" in t or "force" in t:
+        return REASON_FORCE
+    if "breakeven" in t or t.startswith("be_") or "_be_" in t:
+        return REASON_BE_TIME
+    if partner_is_closed(lot, side):
+        return REASON_ORPHAN_BE
+    return REASON_TP
+
+
+def leg_tp_target_pct(lot, side: str, *, base_tp_pct: float | None = None) -> float:
+    """0% (BE) when partner closed; otherwise effective / provided pair TP %."""
+    if partner_is_closed(lot, side):
+        return 0.0
+    if base_tp_pct is not None:
+        return float(base_tp_pct)
+    try:
+        from src.margin_guard import effective_tp_pct
+
+        return float(effective_tp_pct())
+    except Exception:  # noqa: BLE001
+        return float(PAIR_PROFIT_TARGET_PCT)
+
+
+def _compute_pair_active_side_avg(symbol: str, side: str) -> tuple[float, float] | None:
+    """Weighted avg entry/size for open legs whose partner is still open."""
+    status_key = "long_status" if side == "long" else "short_status"
+    entry_key = "long_entry" if side == "long" else "short_entry"
+    size_key = "long_size" if side == "long" else "short_size"
+    total_size = 0.0
+    weighted = 0.0
+    for lot in db.get_open_pair_lots(symbol):
+        if lot[status_key] != "open":
+            continue
+        if partner_is_closed(lot, side):
+            continue
+        size = float(lot[size_key] or 0)
+        entry = float(lot[entry_key] or 0)
+        if size <= 0 or entry <= 0:
+            continue
+        total_size += size
+        weighted += entry * size
+    if total_size <= 0:
+        return None
+    return weighted / total_size, total_size
+
+
+def _should_reopen_after_close(symbol: str) -> bool:
+    if not PAIR_REOPEN_ON_CLOSE:
+        return False
+    if not is_tradeable_symbol(symbol):
+        return False
+    try:
+        from src.margin_guard import should_block_new_entries
+
+        if should_block_new_entries():
+            logging.info("  [%s] Skip reopen — margin guard blocks entries", symbol)
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from src.exchange import binance as binance_mod
+
+        if binance_mod.is_rate_limited():
+            logging.info(
+                "  [%s] Skip reopen — rate-limit cooldown %.0fs",
+                symbol,
+                binance_mod.rate_limit_remaining_sec(),
+            )
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
+def _maybe_reopen_pair(symbol: str, snap: RsiSnapshot, trigger: str) -> None:
+    if not _should_reopen_after_close(symbol):
+        return
+    _open_pair(symbol, snap, f"{trigger}_reopen")
+
+
+def _mark_snapshot(symbol: str, mark: float) -> RsiSnapshot:
+    del symbol
+    return RsiSnapshot(ready=False, rsi=0.0, close=mark if mark > 0 else 0.0)
+
+
+def ensure_one_inventory_symbol(
+    ranked: list[tuple[str, float]],
+    *,
+    exclude: set[str] | None = None,
+) -> str | None:
+    """Open at most one new L+S on the next free volume-ranked symbol (anti-418)."""
+    if INVENTORY_BOOTSTRAP_PER_CYCLE <= 0:
+        return None
+    if not can_open_new_symbol():
+        return None
+    try:
+        from src.margin_guard import should_block_new_entries
+
+        if should_block_new_entries():
+            return None
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from src.exchange import binance as binance_mod
+
+        if binance_mod.is_rate_limited():
+            logging.info("  Inventory bootstrap skipped — rate-limit cooldown")
+            return None
+    except Exception:  # noqa: BLE001
+        pass
+
+    skipped = {s.upper() for s in (exclude or set())}
+    for symbol, _volume in ranked:
+        symbol_u = symbol.upper()
+        if symbol_u in skipped:
+            continue
+        if db.symbol_has_open_lots(symbol_u):
+            continue
+        if not is_tradeable_symbol(symbol_u):
+            continue
+        mark = 0.0
+        try:
+            from src.exchange.binance_ws import get_mark_from_ws
+
+            ws_mark = get_mark_from_ws(symbol_u)
+            if ws_mark is not None and ws_mark > 0:
+                mark = float(ws_mark)
+        except Exception:  # noqa: BLE001
+            pass
+        if mark <= 0:
+            try:
+                mark = float(fetch_side_mark_price(symbol_u))
+            except ExchangeClientError as exc:
+                logging.warning(
+                    "  [%s] Inventory bootstrap skip — no mark: %s", symbol_u, exc
+                )
+                continue
+        snap = _mark_snapshot(symbol_u, mark)
+        try:
+            lot_id = _open_pair(symbol_u, snap, "inventory_bootstrap")
+        except ExchangeClientError as exc:
+            # e.g. TRADIFI_PERPETUAL / missing lot filters — try next symbol.
+            logging.warning(
+                "  [%s] Inventory bootstrap skip — open failed: %s",
+                symbol_u,
+                exc,
+            )
+            continue
+        if lot_id is not None:
+            logging.info(
+                "  Inventory bootstrap opened %s lot #%d (%d/%d symbols)",
+                symbol_u,
+                lot_id,
+                db.count_open_symbols(),
+                MAX_OPEN_SYMBOLS,
+            )
+            return symbol_u
+    return None
+
+
 def load_rsi_state_from_db(_row) -> None:
     return None
 
@@ -384,6 +588,19 @@ def _open_pair(symbol: str, snap: RsiSnapshot, trigger: str) -> int | None:
     if not is_tradeable_symbol(symbol):
         logging.info("  [%s] Blocked symbol — skip open pair", symbol)
         return None
+
+    try:
+        from src.exchange import binance as binance_mod
+
+        universe = binance_mod._perpetual_universe_from_disk()
+        if universe is not None and symbol.upper() not in universe:
+            logging.warning(
+                "  [%s] Skip open pair — not USDT-M PERPETUAL (e.g. TradFi/delivery)",
+                symbol,
+            )
+            return None
+    except Exception:  # noqa: BLE001
+        pass
 
     ensure_symbol_configured(symbol)
 
@@ -548,12 +765,13 @@ def _take_profit_aggregate_side(
         pos.avg_price,
     )
     fill = _close_side_and_resolve_fill(symbol, side, pos.size, mark)
-    db.close_all_lot_sides(symbol, side, close_price=fill)
+    close_reason = REASON_MANUAL if "manual" in trigger.lower() else REASON_TP
+    db.close_all_lot_sides(symbol, side, close_price=fill, close_reason=close_reason)
     from src.notify import notify_close
 
-    notify_close(symbol, side.upper())
-    if reopen_pair and is_tradeable_symbol(symbol):
-        _open_pair(symbol, snap, f"{trigger}_tp_agg_{side}")
+    notify_close(symbol, side.upper(), reason=close_reason)
+    if reopen_pair:
+        _maybe_reopen_pair(symbol, snap, f"{trigger}_tp_agg_{side}")
 
 
 def _estimate_leg_pnl(side: str, entry: float, mark: float, size: float) -> float:
@@ -568,6 +786,8 @@ def close_lot_leg(
     side: str,
     mark: float,
     trigger: str,
+    *,
+    close_reason: str | None = None,
 ) -> dict | None:
     """Close one open lot side. Returns {fill, pnl, size, entry} or None if skipped."""
     if side == "long":
@@ -607,15 +827,17 @@ def close_lot_leg(
         fill,
         pnl,
     )
+    resolved_reason = close_reason or _infer_close_reason(trigger, lot, side)
     db.close_lot_side(
         int(lot["id"]),
         side,
         realized_pnl_usdt=pnl,
         close_price=fill,
+        close_reason=resolved_reason,
     )
     from src.notify import notify_close
 
-    notify_close(symbol, side.upper())
+    notify_close(symbol, side.upper(), reason=resolved_reason)
     return {"fill": fill, "pnl": pnl, "size": size, "entry": entry, "move_pct": move}
 
 
@@ -644,9 +866,18 @@ def _take_profit_lot_side(
     if size <= 0 or not should_take_profit(side, entry, mark, target_pct=tp_target_pct):
         return
 
-    close_lot_leg(symbol, lot, side, mark, trigger)
-    if reopen_pair and is_tradeable_symbol(symbol):
-        _open_pair(symbol, snap, f"{trigger}_tp_lot{lot['id']}_{side}")
+    reason = _tp_close_reason(lot, side)
+    close_lot_leg(
+        symbol,
+        lot,
+        side,
+        mark,
+        trigger,
+        close_reason=reason,
+    )
+    # Reopen only after a real TP hit — not orphan BE (partner already closed).
+    if reopen_pair and reason == REASON_TP:
+        _maybe_reopen_pair(symbol, snap, f"{trigger}_tp_lot{lot['id']}_{side}")
 
 
 def _lot_side_fields(lot, side: str) -> tuple[float, float] | None:
@@ -696,7 +927,8 @@ def _take_profit_lots_side_batched(
         if fields is None:
             continue
         entry, size = fields
-        if should_take_profit(side, entry, mark, target_pct=tp_target_pct):
+        target = leg_tp_target_pct(lot, side, base_tp_pct=tp_target_pct)
+        if should_take_profit(side, entry, mark, target_pct=target):
             candidates.append((lot, entry, size))
 
     if not candidates:
@@ -735,28 +967,38 @@ def _take_profit_lots_side_batched(
         fill = _close_side_and_resolve_fill(symbol, side, selected_size, mark)
     except AlreadyFlatError:
         return False
+    reasons: list[str] = []
     for lot, entry, size in selected:
         pnl = _estimate_leg_pnl(side, entry, fill, size)
+        reason = _tp_close_reason(lot, side)
+        reasons.append(reason)
         logging.info(
-            "  [%s] Lot #%d batch-close %s fill=%.6f | pnl≈%+.2f",
+            "  [%s] Lot #%d batch-close %s fill=%.6f | pnl≈%+.2f | reason=%s",
             symbol,
             int(lot["id"]),  # type: ignore[index]
             side.upper(),
             fill,
             pnl,
+            reason,
         )
         db.close_lot_side(
             int(lot["id"]),  # type: ignore[index]
             side,
             realized_pnl_usdt=pnl,
             close_price=fill,
+            close_reason=reason,
         )
 
     from src.notify import notify_close
 
-    notify_close(symbol, f"{side.upper()}×{len(selected)}")
-    if reopen_pair and is_tradeable_symbol(symbol):
-        _open_pair(symbol, snap, f"{trigger}_tp_batch_{side}")
+    notify_close(
+        symbol,
+        f"{side.upper()}×{len(selected)}",
+        reason_text=format_close_reasons_vi(reasons),
+    )
+    # Reopen only when at least one leg closed on TP (not orphan-BE-only batch).
+    if reopen_pair and REASON_TP in reasons:
+        _maybe_reopen_pair(symbol, snap, f"{trigger}_tp_batch_{side}")
     return True
 
 
@@ -861,16 +1103,22 @@ def _close_expired_lots_side_batched(
             side,
             realized_pnl_usdt=pnl,
             close_price=fill,
+            close_reason=REASON_AGE,
         )
 
     from src.notify import notify_close
 
-    notify_close(symbol, f"{side.upper()}×{len(selected)} ({trigger})")
+    notify_close(
+        symbol,
+        f"{side.upper()}×{len(selected)}",
+        reason=REASON_AGE,
+    )
     return True
 
 
-def _scan_max_age_closes(symbol: str, mark: float) -> bool:
-    """Close lot legs older than MAX_LOT_AGE_DAYS (no reopen, budget per cycle)."""
+def _scan_max_age_closes(symbol: str, mark: float, *, reopen_pair: bool = False) -> bool:
+    """Close lot legs older than MAX_LOT_AGE_DAYS (budget per cycle; never reopen)."""
+    _ = reopen_pair  # call-site compat; age closes never reopen
     if MAX_LOT_AGE_DAYS <= 0 or mark <= 0:
         return False
     if _age_close_budget <= 0:
@@ -912,6 +1160,22 @@ def _lot_side_eligible_for_breakeven(
     if not should_take_profit(side, entry, mark, target_pct=0.0):
         return None
     return lot, entry, size
+
+
+def side_has_orphan_be_candidate(symbol: str, side: str, mark: float) -> bool:
+    """True when an open lot has partner closed and mark is at/above entry (BE)."""
+    if mark <= 0:
+        return False
+    for lot in db.get_open_pair_lots(symbol):
+        fields = _lot_side_fields(lot, side)
+        if fields is None:
+            continue
+        if not partner_is_closed(lot, side):
+            continue
+        entry, _size = fields
+        if should_take_profit(side, entry, mark, target_pct=0.0):
+            return True
+    return False
 
 
 def arm_breakeven_lots_for_symbol(symbol: str, mark: float) -> int:
@@ -1014,17 +1278,23 @@ def _close_breakeven_lots_side_batched(symbol: str, mark: float, side: str) -> b
             side,
             realized_pnl_usdt=pnl,
             close_price=fill,
+            close_reason=REASON_BE_TIME,
         )
         clear_breakeven_arm(lot_id, side)
 
     from src.notify import notify_close
 
-    notify_close(symbol, f"{side.upper()}×{len(selected)} ({trigger})")
+    notify_close(
+        symbol,
+        f"{side.upper()}×{len(selected)}",
+        reason=REASON_BE_TIME,
+    )
     return True
 
 
-def _scan_breakeven_closes(symbol: str, mark: float) -> bool:
+def _scan_breakeven_closes(symbol: str, mark: float, *, reopen_pair: bool = False) -> bool:
     """Arm old underwater lots, then close sticky-armed BE legs at/above entry (no reopen)."""
+    _ = reopen_pair  # call-site compat; sticky-BE closes never reopen
     if not BREAKEVEN_WHEN_LOSING_ENABLED or BREAKEVEN_AFTER_HOURS <= 0 or mark <= 0:
         return False
 
@@ -1050,6 +1320,15 @@ def _flush_post_order_reconcile() -> None:
         flush_pending_reconcile()
     except Exception as exc:  # noqa: BLE001
         logging.debug("Post-order reconcile flush skipped: %s", exc)
+
+
+def _side_has_orphan_open(symbol: str, side: str) -> bool:
+    for lot in db.get_open_pair_lots(symbol):
+        if _lot_side_fields(lot, side) is None:
+            continue
+        if partner_is_closed(lot, side):
+            return True
+    return False
 
 
 def _scan_take_profits(
@@ -1080,17 +1359,27 @@ def _scan_take_profits_locked(
     took_action = False
     long_agg_closed = False
     short_agg_closed = False
+    base_tp = tp_target_pct
+    if base_tp is None:
+        try:
+            from src.margin_guard import effective_tp_pct
+
+            base_tp = float(effective_tp_pct())
+        except Exception:  # noqa: BLE001
+            base_tp = float(PAIR_PROFIT_TARGET_PCT)
 
     positions = fetch_symbol_positions(symbol)
     long_agg = positions["long"]
-    long_db = db.compute_open_lot_side_avg(symbol, "long") if AGGREGATE_TP_ENABLED else None
+    # Aggregate only over pair-active lots so orphan BE legs are never force-closed early.
+    long_db = (
+        _compute_pair_active_side_avg(symbol, "long") if AGGREGATE_TP_ENABLED else None
+    )
     if (
         AGGREGATE_TP_ENABLED
         and long_db is not None
         and long_agg.size > 0
-        and should_take_profit(
-            "long", long_db[0], mark, target_pct=tp_target_pct,
-        )
+        and not _side_has_orphan_open(symbol, "long")
+        and should_take_profit("long", long_db[0], mark, target_pct=base_tp)
     ):
         try:
             _take_profit_aggregate_side(
@@ -1115,14 +1404,15 @@ def _scan_take_profits_locked(
                 raise
 
     short_agg = positions["short"]
-    short_db = db.compute_open_lot_side_avg(symbol, "short") if AGGREGATE_TP_ENABLED else None
+    short_db = (
+        _compute_pair_active_side_avg(symbol, "short") if AGGREGATE_TP_ENABLED else None
+    )
     if (
         AGGREGATE_TP_ENABLED
         and short_db is not None
         and short_agg.size > 0
-        and should_take_profit(
-            "short", short_db[0], mark, target_pct=tp_target_pct,
-        )
+        and not _side_has_orphan_open(symbol, "short")
+        and should_take_profit("short", short_db[0], mark, target_pct=base_tp)
     ):
         try:
             _take_profit_aggregate_side(
@@ -1182,7 +1472,9 @@ def _trim_lot_side_to_exchange(symbol: str, side: str, exchange_size: float) -> 
             side.upper(),
             lot_id,
         )
-        db.close_lot_side(lot_id, side, realized_pnl_usdt=0.0, close_price=None)
+        db.close_lot_side(
+            lot_id, side, realized_pnl_usdt=0.0, close_price=None, close_reason=REASON_SYNC
+        )
         closed_ids.add(lot_id)
         closed += 1
     while True:
@@ -1221,7 +1513,9 @@ def _trim_lot_side_to_exchange(symbol: str, side: str, exchange_size: float) -> 
             lot_total,
             exchange_size,
         )
-        db.close_lot_side(lot_id, side, realized_pnl_usdt=0.0, close_price=None)
+        db.close_lot_side(
+            lot_id, side, realized_pnl_usdt=0.0, close_price=None, close_reason=REASON_SYNC
+        )
         closed_ids.add(lot_id)
         closed += 1
     return closed
@@ -1314,57 +1608,81 @@ def _update_status(
 
 def evaluate_rsi_trade(
     symbol: str,
-    snap: RsiSnapshot,
+    snap: RsiSnapshot | None = None,
     signal: RsiSignal | None = None,
+    *,
+    mark: float | None = None,
 ) -> None:
+    """Manage open pair lots: TP (0.5% / orphan BE), age, optional RSI entry.
+
+    Inventory mode (RSI_ENTRY_ENABLED=false): no RSI cross/stack; reopen happens
+    only after a TP close when PAIR_REOPEN_ON_CLOSE is on (not orphan-BE / age).
+    """
     if not has_credentials():
-        logging.warning("  [%s] RSI trading skipped: missing API credentials", symbol)
+        logging.warning("  [%s] Pair trading skipped: missing API credentials", symbol)
         return
 
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    pair_event = signal if signal and signal.side == "pair" else detect_pair_event(snap)
+    if snap is None:
+        snap = _mark_snapshot(symbol, mark or 0.0)
+    pair_event = None
+    if RSI_ENTRY_ENABLED:
+        pair_event = signal if signal and signal.side == "pair" else detect_pair_event(snap)
+
+    resolved_mark = mark if mark is not None and mark > 0 else 0.0
+    if resolved_mark <= 0:
+        try:
+            resolved_mark = float(fetch_side_mark_price(symbol))
+        except ExchangeClientError:
+            resolved_mark = 0.0
+    if resolved_mark <= 0 and snap.close > 0:
+        resolved_mark = float(snap.close)
 
     if not _trading_enabled():
-        mark = fetch_side_mark_price(symbol) if has_credentials() else 0.0
         try:
             _sync_lots_with_exchange(symbol)
-            _update_status(symbol, snap, pair_event, mark, now_str)
+            _update_status(symbol, snap, pair_event, resolved_mark, now_str)
         except ExchangeClientError as exc:
             logging.warning("  [%s] Sync failed: %s", symbol, exc)
         logging.info("  [%s] Trading disabled — no orders", symbol)
         return
 
-    if not snap.ready:
+    if RSI_ENTRY_ENABLED and not snap.ready:
         logging.info("  [%s] RSI not ready — skip trading", symbol)
         return
 
     if not is_tradeable_symbol(symbol):
-        mark = fetch_side_mark_price(symbol)
-        if mark <= 0:
-            mark = snap.close
-        _force_close_blocked_symbol(symbol, mark)
+        if resolved_mark <= 0:
+            resolved_mark = snap.close
+        _force_close_blocked_symbol(symbol, resolved_mark)
         return
 
-    mark = fetch_side_mark_price(symbol)
-    if mark <= 0:
-        mark = snap.close
     _sync_lots_with_exchange(symbol)
-    _update_status(symbol, snap, pair_event, mark, now_str)
+    _update_status(symbol, snap, pair_event, resolved_mark, now_str)
 
     from src.margin_guard import effective_tp_pct, should_block_new_entries
 
     tp_pct = effective_tp_pct()
     block_entries = should_block_new_entries()
+    reopen = PAIR_REOPEN_ON_CLOSE and not block_entries
 
+    # Per-lot targets: pair-active → tp_pct; orphan (partner closed) → 0% BE.
     _scan_take_profits(
-        symbol, mark, snap, trigger="cycle",
-        reopen_pair=False, tp_target_pct=tp_pct,
+        symbol,
+        resolved_mark,
+        snap,
+        trigger="cycle",
+        reopen_pair=reopen,
+        tp_target_pct=tp_pct,
     )
 
-    # BE-when-losing after TP; hard-age still last so TP/BE win when eligible.
-    _scan_breakeven_closes(symbol, mark)
-    # Age rule runs after TP/BE so legs at TP/BE are always closed first.
-    _scan_max_age_closes(symbol, mark)
+    # Legacy sticky BE (off by default in inventory mode) — never reopen.
+    _scan_breakeven_closes(symbol, resolved_mark, reopen_pair=False)
+    # Age rule runs after TP/BE so legs at TP/BE are always closed first — never reopen.
+    _scan_max_age_closes(symbol, resolved_mark, reopen_pair=False)
+
+    if not RSI_ENTRY_ENABLED:
+        return
 
     if pair_event is None:
         return
@@ -1385,8 +1703,12 @@ def evaluate_rsi_trade(
 
     trigger = pair_event.entry_trigger or "rsi_cross"
     took_action = _scan_take_profits(
-        symbol, mark, snap, trigger=trigger,
-        reopen_pair=not block_entries, tp_target_pct=tp_pct,
+        symbol,
+        resolved_mark,
+        snap,
+        trigger=trigger,
+        reopen_pair=True,
+        tp_target_pct=tp_pct,
     )
     if took_action:
         return
@@ -1405,6 +1727,22 @@ def evaluate_rsi_trade(
         db.count_open_symbols(),
         MAX_OPEN_SYMBOLS,
     )
+
+
+def manage_pair_symbol(symbol: str, mark: float | None = None) -> None:
+    """WS-first management for an open symbol (no candle/RSI REST required)."""
+    resolved = mark if mark is not None and mark > 0 else 0.0
+    if resolved <= 0:
+        try:
+            from src.exchange.binance_ws import get_mark_from_ws
+
+            ws_mark = get_mark_from_ws(symbol)
+            if ws_mark is not None and ws_mark > 0:
+                resolved = float(ws_mark)
+        except Exception:  # noqa: BLE001
+            pass
+    snap = _mark_snapshot(symbol, resolved)
+    evaluate_rsi_trade(symbol, snap, mark=resolved)
 
 
 def manual_close_side(symbol: str, side: str) -> dict:
@@ -1497,7 +1835,14 @@ def manual_close_leg(lot_id: int, side: str) -> dict:
         lot = db.get_pair_lot_by_id(int(lot_id))
         if lot is None or lot[status_key] != "open":
             return {"ok": False, "message": f"lot #{lot_id} {side} already closed"}
-        result = close_lot_leg(symbol, lot, side, mark, "dashboard_manual_leg")
+        result = close_lot_leg(
+            symbol,
+            lot,
+            side,
+            mark,
+            "dashboard_manual_leg",
+            close_reason=REASON_MANUAL,
+        )
     if result is None:
         return {"ok": False, "message": f"could not close lot #{lot_id} {side}"}
     _flush_post_order_reconcile()

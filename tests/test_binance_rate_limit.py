@@ -230,6 +230,25 @@ class TestBinanceRateLimit(unittest.TestCase):
             self.assertEqual(mock_put.call_count, 1)
             mock_sleep.assert_not_called()
 
+    def test_fetch_positions_skips_rest_when_optional_blocked(self) -> None:
+        binance._rate_limited_until_ms = time.time() * 1000 + 60_000
+        binance._rate_limit_kind = "resume"
+        with (
+            patch("src.exchange.binance_ws.watch_symbols"),
+            patch(
+                "src.exchange.binance_ws.get_symbol_positions_from_ws",
+                return_value=None,
+            ),
+            patch(
+                "src.exchange.binance_ws.get_symbol_positions_lenient",
+                return_value=None,
+            ),
+            patch("src.exchange.binance.fetch_symbol_positions_rest") as rest,
+        ):
+            with self.assertRaises(binance.RateLimitError):
+                binance.fetch_symbol_positions("BTCUSDT")
+            rest.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -177,8 +177,8 @@ def _scenario_label(tier: str) -> str:
     labels = {
         "ok": "Bình thường",
         "watch": "Theo dõi margin",
-        "elevated": "Kịch bản 1: chặn mở mới, TP 2%",
-        "high": "Kịch bản 2–3: TP 1%, có thể đóng cặp L+S",
+        "elevated": "Kịch bản 1: chặn mở mới",
+        "high": "Kịch bản 2–3: TP thấp hơn, có thể đóng cặp L+S",
         "critical": "Kịch bản 5: đóng hết khẩn cấp",
     }
     return labels.get(tier, tier)
