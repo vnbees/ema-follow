@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
-from src.bitget_client import Candle
 from src.config import INTERVAL_MINUTES
+from src.exchange.types import Candle
 
 
 def _current_period_start_ms(interval_minutes: int = INTERVAL_MINUTES) -> int:
