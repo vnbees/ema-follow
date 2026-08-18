@@ -145,6 +145,10 @@ _RATE_LIMIT_KINDS = ("ban", "padded", "grace", "resume")
 _RATE_LIMIT_FILE = Path(DATABASE_PATH).expanduser().resolve().parent / "binance_rate_limit_until_ms"
 _rest_http_lock = threading.Lock()
 _last_rest_at = 0.0
+_boot_quiet_until_mono = 0.0
+_used_weight_1m = 0
+_used_weight_at_mono = 0.0
+_weight_block_log_at = 0.0
 
 
 def _now_ms() -> float:
@@ -274,6 +278,14 @@ def _check_rate_limit_pause(
     grace = _grace_ms()
     resume = _resume_ms()
 
+    if pri != "critical" and is_boot_rest_quiet():
+        remaining = boot_rest_quiet_remaining_sec()
+        raise RateLimitError(
+            f"Boot REST quiet — optional {method} {path or 'request'} skipped, "
+            f"{remaining:.0f}s remaining"
+        )
+    _check_weight_budget(method, path, pri)
+
     while True:
         until_ms, kind = _snapshot_rate_limit()
         now = _now_ms()
@@ -338,7 +350,8 @@ def rate_limit_remaining_sec() -> float:
 def optional_rest_blocked_sec() -> float:
     """Seconds until listenKey/income/account/klines REST is allowed (includes resume)."""
     until_ms, _kind = _snapshot_rate_limit()
-    return max(0.0, (until_ms - _now_ms()) / 1000)
+    ban = max(0.0, (until_ms - _now_ms()) / 1000)
+    return max(ban, _weight_block_remaining_sec(optional_only=True))
 
 
 def is_rate_limited() -> bool:
@@ -356,7 +369,37 @@ def clear_rate_limit_cooldown() -> bool:
     return had
 
 
+def mark_boot_rest_quiet(duration_sec: float | None = None) -> None:
+    """Pause optional REST after deploy/restart so WS/disk can warm up without IP 418."""
+    global _boot_quiet_until_mono
+    from src.config import REST_BOOT_QUIET_SEC
+
+    sec = REST_BOOT_QUIET_SEC if duration_sec is None else max(0.0, float(duration_sec))
+    if sec <= 0:
+        _boot_quiet_until_mono = 0.0
+        return
+    _boot_quiet_until_mono = time.monotonic() + sec
+    logging.warning(
+        "Binance REST boot quiet — optional REST paused %.0fs (deploy safety; WS/disk only)",
+        sec,
+    )
+
+
+def boot_rest_quiet_remaining_sec() -> float:
+    if _boot_quiet_until_mono <= 0:
+        return 0.0
+    return max(0.0, _boot_quiet_until_mono - time.monotonic())
+
+
+def is_boot_rest_quiet() -> bool:
+    return boot_rest_quiet_remaining_sec() > 0
+
+
 def is_optional_rest_blocked() -> bool:
+    if is_boot_rest_quiet():
+        return True
+    if used_weight_1m() >= _weight_safe_max():
+        return True
     return optional_rest_blocked_sec() > 0
 
 
@@ -391,6 +434,97 @@ def _rest_slot(
 _load_persisted_rate_limit()
 
 
+def used_weight_1m() -> int:
+    """Last Binance X-MBX-USED-WEIGHT-1M for this IP; 0 if older than 60s."""
+    if _used_weight_at_mono <= 0:
+        return 0
+    if time.monotonic() - _used_weight_at_mono >= 60.0:
+        return 0
+    return int(_used_weight_1m)
+
+
+def _weight_safe_max() -> int:
+    from src.config import REST_WEIGHT_SAFE_MAX
+
+    return max(1, int(REST_WEIGHT_SAFE_MAX))
+
+
+def _weight_hard_max() -> int:
+    from src.config import REST_WEIGHT_HARD_MAX, REST_WEIGHT_SAFE_MAX
+
+    hard = int(REST_WEIGHT_HARD_MAX)
+    return max(hard, int(REST_WEIGHT_SAFE_MAX))
+
+
+def _weight_block_remaining_sec(*, optional_only: bool) -> float:
+    used = used_weight_1m()
+    if used <= 0:
+        return 0.0
+    limit = _weight_safe_max() if optional_only else _weight_hard_max()
+    if used < limit:
+        return 0.0
+    return max(0.0, 60.0 - (time.monotonic() - _used_weight_at_mono))
+
+
+def _log_weight_block(used: int, limit: int, remaining: float) -> None:
+    global _weight_block_log_at
+    now = time.monotonic()
+    if now - _weight_block_log_at < 30.0:
+        return
+    _weight_block_log_at = now
+    logging.warning(
+        "Binance REST weight %d >= %d — skip REST %.0fs (X-MBX-USED-WEIGHT-1M)",
+        used,
+        limit,
+        remaining,
+    )
+
+
+def _check_weight_budget(method: str, path: str, pri: str) -> None:
+    used = used_weight_1m()
+    if used <= 0:
+        return
+    hard = _weight_hard_max()
+    remaining = _weight_block_remaining_sec(optional_only=False)
+    if used >= hard:
+        _log_weight_block(used, hard, remaining)
+        raise RateLimitError(
+            f"REST weight {used}/{hard} — skip {method} {path or 'request'}, "
+            f"{remaining:.0f}s until window"
+        )
+    safe = _weight_safe_max()
+    if pri != "critical" and used >= safe:
+        remain_opt = _weight_block_remaining_sec(optional_only=True)
+        _log_weight_block(used, safe, remain_opt)
+        raise RateLimitError(
+            f"REST weight {used}/{safe} — optional {method} {path or 'request'} skipped, "
+            f"{remain_opt:.0f}s until window"
+        )
+
+
+def _note_used_weight(response: requests.Response) -> None:
+    global _used_weight_1m, _used_weight_at_mono
+    headers = getattr(response, "headers", None) or {}
+    raw = None
+    for key in ("X-MBX-USED-WEIGHT-1M", "x-mbx-used-weight-1m", "X-MBX-USED-WEIGHT"):
+        raw = headers.get(key)
+        if raw not in (None, ""):
+            break
+    if raw in (None, ""):
+        return
+    try:
+        used = int(float(raw))
+    except (TypeError, ValueError):
+        return
+    _used_weight_1m = max(0, used)
+    _used_weight_at_mono = time.monotonic()
+
+
+def _observe_rest_response(response: requests.Response) -> None:
+    _note_used_weight(response)
+    _handle_rate_limit_response(response)
+
+
 def _handle_rate_limit_response(response: requests.Response) -> None:
     """Register cooldown for HTTP 429/418 and raise RateLimitError."""
     if response.status_code not in (429, 418):
@@ -423,7 +557,7 @@ def _public_get(path: str, params: dict[str, str], max_retries: int = 3) -> Any:
         try:
             with _rest_slot("GET", path):
                 response = requests.get(url, params=params, timeout=10)
-                _handle_rate_limit_response(response)
+                _observe_rest_response(response)
             if not response.ok:
                 detail = _parse_api_error(response)
                 if _is_non_retriable_client_error(response.status_code, detail):
@@ -464,7 +598,7 @@ def _private_request(
                     response = requests.delete(url, params=signed, headers=headers, timeout=10)
                 else:
                     response = requests.post(url, params=signed, headers=headers, timeout=10)
-                _handle_rate_limit_response(response)
+                _observe_rest_response(response)
             if not response.ok:
                 detail = _parse_api_error(response)
                 if _is_non_retriable_client_error(response.status_code, detail):
@@ -530,7 +664,7 @@ def _spot_private_request(
                     response = requests.get(url, params=signed, headers=headers, timeout=10)
                 else:
                     response = requests.post(url, params=signed, headers=headers, timeout=10)
-                _handle_rate_limit_response(response)
+                _observe_rest_response(response)
             if not response.ok:
                 detail = _parse_api_error(response)
                 if _is_non_retriable_client_error(response.status_code, detail):
@@ -1078,6 +1212,11 @@ def fetch_futures_balance(symbol: str = SYMBOL) -> FuturesAccountBalance:
             return cached
     except Exception:  # noqa: BLE001
         pass
+    if is_boot_rest_quiet():
+        raise RateLimitError(
+            f"Boot REST quiet — balance unavailable without WS cache "
+            f"({boot_rest_quiet_remaining_sec():.0f}s remaining)"
+        )
     return fetch_futures_balance_rest(symbol)
 
 
@@ -1230,6 +1369,8 @@ def fetch_all_open_positions() -> list[Position]:
             return cached
     except Exception:  # noqa: BLE001
         pass
+    if is_boot_rest_quiet():
+        return []
     return fetch_all_open_positions_rest()
 
 

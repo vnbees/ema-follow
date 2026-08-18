@@ -222,6 +222,14 @@ REST_BAN_RESUME_SEC = float(os.getenv("REST_BAN_RESUME_SEC", "900"))
 REST_BAN_RESUME_GAP_SEC = float(os.getenv("REST_BAN_RESUME_GAP_SEC", "5"))
 # Always serialize REST so TP + listenKey + spot cannot hit Binance in the same instant.
 REST_SERIAL_GAP_SEC = float(os.getenv("REST_SERIAL_GAP_SEC", "0.25"))
+# After deploy/restart: block optional REST this long (WS/disk only). Critical orders still allowed.
+REST_BOOT_QUIET_SEC = float(os.getenv("REST_BOOT_QUIET_SEC", "600"))
+# USDT-M futures IP weight / minute (Binance). Header X-MBX-USED-WEIGHT-1M.
+REST_WEIGHT_LIMIT_1M = int(os.getenv("REST_WEIGHT_LIMIT_1M", "2400"))
+# Skip optional REST at this used weight (leave headroom for shared Railway IPs).
+REST_WEIGHT_SAFE_MAX = int(os.getenv("REST_WEIGHT_SAFE_MAX", "800"))
+# Skip ALL REST including orders at this used weight.
+REST_WEIGHT_HARD_MAX = int(os.getenv("REST_WEIGHT_HARD_MAX", "1800"))
 
 SPOT_TRANSFER_ENABLED = os.getenv("SPOT_TRANSFER_ENABLED", "true").lower() in ("1", "true", "yes")
 SPOT_TRANSFER_PCT = float(os.getenv("SPOT_TRANSFER_PCT", "1"))

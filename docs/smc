@@ -1,0 +1,59 @@
+import numpy as np
+import pandas as pd
+
+
+def smc_range_strategy(df: pd.DataFrame, range_period=50, max_range_pct=0.03):
+    """Chiến lược giao dịch SMC Sideway (Range Trading + Liquidity Sweep)
+
+    Parameters:
+    - df: DataFrame chứa 'open', 'high', 'low', 'close'
+    - range_period: Chu kỳ xác định hộp tích lũy (ví dụ 50 nến)
+    - max_range_pct: Biên độ tối đa của hộp so với giá
+    """
+    # 1. Xác định biên độ hộp (Trading Range)
+    # Dùng shift(1) để lấy biên của giai đoạn trước đó, tránh "nhìn tương lai" (look-ahead bias)
+    df['box_high'] = df['high'].rolling(window=range_period).max().shift(1)
+    df['box_low'] = df['low'].rolling(window=range_period).min().shift(1)
+    df['box_mid'] = (df['box_high'] + df['box_low']) / 2
+    df['box_range_pct'] = (df['box_high'] - df['box_low']) / df['close']
+
+    # Kiểm tra xem có đang trong vùng Sideway hẹp không
+    df['is_tight_range'] = df['box_range_pct'] < max_range_pct
+
+    # 2. Phát hiện Liquidity Sweep (Quét thanh khoản)
+    # - Sweep High (Quét đỉnh): Giá vượt qua box_high nhưng đóng cửa chui ngược xuống dưới -> Bẫy mua (Bull Trap / Smart Money Short)
+    df['sweep_high'] = (df['high'] > df['box_high']) & (
+        df['close'] < df['box_high']
+    )
+
+    # - Sweep Low (Quét đáy): Giá thủng box_low nhưng đóng cửa chui ngược lên trên -> Bẫy bán (Bear Trap / Smart Money Long)
+    df['sweep_low'] = (df['low'] < df['box_low']) & (df['close'] > df['box_low'])
+
+    # 3. Tạo tín hiệu vào lệnh (Signal)
+    # - Signal = 1 (BUY / LONG): Khi có cú quét đáy (Sweep Low) và nằm trong vùng Sideway
+    # - Signal = -1 (SELL / SHORT): Khi có cú quét đỉnh (Sweep High) và nằm trong vùng Sideway
+    df['signal'] = 0
+
+    # Điều kiện Long: Quét đáy + Nằm trong vùng Sideway
+    condition_long = df['is_tight_range'] & df['sweep_low']
+    df.loc[condition_long, 'signal'] = 1
+
+    # Điều kiện Short: Quét đỉnh + Nằm trong vùng Sideway
+    condition_short = df['is_tight_range'] & df['sweep_high']
+    df.loc[condition_short, 'signal'] = -1
+
+    # 4. Xác định Take Profit (TP) và Stop Loss (SL) theo chuẩn SMC
+    # - Long SL: Đặt dưới cái râu nến quét đáy vừa rồi một chút (ví dụ thấp hơn low 0.2%)
+    # - Long TP: Mục tiêu về vùng giữa hộp (box_mid) hoặc biên đối diện (box_high)
+    df['sl'] = np.where(
+        df['signal'] == 1,
+        df['low'] * 0.998,
+        np.where(df['signal'] == -1, df['high'] * 1.002, np.nan),
+    )
+    df['tp'] = np.where(
+        df['signal'] == 1,
+        df['box_mid'],
+        np.where(df['signal'] == -1, df['box_mid'], np.nan),
+    )
+
+    return df

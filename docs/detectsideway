@@ -1,0 +1,41 @@
+import numpy as np
+import pandas as pd
+
+
+def detect_sideway(df: pd.DataFrame, window_fast=20, window_slow=50, threshold_pct=0.003, slope_threshold=0.0005, lookback=10):
+    """
+    Phát hiện thị trường sideway dựa trên EMA.
+    
+    Parameters:
+    - df: DataFrame chứa cột 'close'
+    - window_fast: Chu kỳ EMA ngắn (vd: 20)
+    - window_slow: Chu kỳ EMA dài (vd: 50)
+    - threshold_pct: Biên độ khoảng cách tối đa giữa 2 EMA (%) để coi là quấn lấy nhau
+    - slope_threshold: Ngưỡng độ dốc tuyệt đối để coi EMA là đi ngang
+    - lookback: Số nến kiểm tra sự co cụm liên tục
+    """
+    # 1. Tính toán EMA
+    df['ema_fast'] = df['close'].ewm(span=window_fast, adjust=False).mean()
+    df['ema_slow'] = df['close'].ewm(span=window_slow, adjust=False).mean()
+    df['ema_mid'] = df['close'].ewm(span=int((window_fast + window_slow) / 2), adjust=False).mean()
+    
+    # 2. Điều kiện 1: Độ co cụm của EMA (Khoảng cách giữa EMA ngắn và dài rất hẹp)
+    # Khoảng cách phần trăm giữa ema_fast và ema_slow
+    df['ema_spread'] = abs(df['ema_fast'] - df['ema_slow']) / df['close']
+    df['is_converged'] = df['ema_spread'] < threshold_pct
+    
+    # 3. Điều kiện 2: Độ dốc của EMA trung tâm xấp xỉ bằng 0 (Tính bằng độ thay đổi tỷ lệ trong N nến)
+    df['ema_slope'] = (df['ema_mid'] - df['ema_mid'].shift(lookback)) / df['ema_mid'].shift(lookback)
+    df['is_flat'] = abs(df['ema_slope']) < slope_threshold
+    
+    # 4. Điều kiện 3: Giá bám quanh EMA (Giá không tạo xu hướng rõ rệt, dao động trong biên độ hẹp)
+    # Kiểm tra xem trong 'lookback' nến gần nhất, giá có liên tục nằm gần EMA không
+    df['price_near_ema'] = abs(df['close'] - df['ema_mid']) / df['ema_mid'] < (threshold_pct * 1.5)
+    
+    # Gom các điều kiện lại (Có thể yêu cầu duy trì trong vài nến liên tiếp để chống nhiễu)
+    df['is_sideway'] = (
+        df['is_converged'].rolling(window=lookback).mean() >= 0.8) & \
+        df['is_flat'] & \
+        (df['price_near_ema'].rolling(window=lookback).mean() >= 0.7)
+        
+    return df

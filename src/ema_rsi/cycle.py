@@ -84,8 +84,21 @@ def _sync_watched(open_symbols: list[str], ranked: list[tuple[str, float]]) -> N
         logging.debug("EMA-RSI WS watch sync skipped: %s", exc)
 
 
+def _boot_quiet_active() -> bool:
+    try:
+        from src.config import EXCHANGE
+        from src.exchange import binance as binance_mod
+
+        return EXCHANGE == "binance" and binance_mod.is_boot_rest_quiet()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _log_balance() -> None:
     if not has_credentials():
+        return
+    if _boot_quiet_active():
+        logging.debug("EMA-RSI balance log skipped — boot REST quiet")
         return
     try:
         bal = fetch_futures_balance(DEFAULT_SYMBOL)
@@ -187,7 +200,9 @@ def run_cycle() -> None:
     else:
         reconcile_orphan_positions()
         reconcile_protective_orders()
-    reconcile_open_trades()
+    # Watcher uses WS for flat checks during boot quiet; skip DB sweep cycle 1.
+    if not _boot_quiet_active():
+        reconcile_open_trades()
 
     occupied = occupied_symbols()
     opened = 0
@@ -260,6 +275,15 @@ def main() -> None:
     setup_logging()
     init_db()
     store.ensure_schema()
+
+    try:
+        from src.config import EXCHANGE
+        from src.exchange import binance as binance_mod
+
+        if EXCHANGE == "binance":
+            binance_mod.mark_boot_rest_quiet()
+    except Exception:  # noqa: BLE001
+        pass
 
     web_thread = threading.Thread(target=start_web_server, daemon=True)
     web_thread.start()

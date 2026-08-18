@@ -392,7 +392,7 @@ def position_confirmed_flat(symbol: str, side: str) -> bool:
 
     from src.exchange import binance as binance_mod
 
-    if not binance_mod.is_optional_rest_blocked():
+    if not binance_mod.is_boot_rest_quiet() and not binance_mod.is_optional_rest_blocked():
         try:
             positions = binance_mod.fetch_symbol_positions_rest(symbol, priority="critical")
             pos = positions.get(side.lower())

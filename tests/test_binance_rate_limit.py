@@ -21,6 +21,9 @@ class TestBinanceRateLimit(unittest.TestCase):
         binance._rate_limited_until_ms = 0.0
         binance._rate_limit_kind = "ban"
         binance._last_rest_at = 0.0
+        binance._boot_quiet_until_mono = 0.0
+        binance._used_weight_1m = 0
+        binance._used_weight_at_mono = 0.0
         self._notify_patch = patch("src.notify.notify_error")
         self._notify_mock = self._notify_patch.start()
 
@@ -29,6 +32,9 @@ class TestBinanceRateLimit(unittest.TestCase):
         binance._rate_limited_until_ms = 0.0
         binance._rate_limit_kind = "ban"
         binance._last_rest_at = 0.0
+        binance._boot_quiet_until_mono = 0.0
+        binance._used_weight_1m = 0
+        binance._used_weight_at_mono = 0.0
 
     def test_418_ban_no_retry_and_cooldown(self) -> None:
         banned_until = int((time.time() + 300) * 1000)
@@ -99,6 +105,40 @@ class TestBinanceRateLimit(unittest.TestCase):
         self.assertTrue(binance.clear_rate_limit_cooldown())
         self.assertEqual(binance.rate_limit_remaining_sec(), 0.0)
         self.assertFalse(binance._RATE_LIMIT_FILE.is_file())
+
+    def test_used_weight_header_blocks_optional_rest(self) -> None:
+        resp = _response(
+            200,
+            {},
+            headers={"X-MBX-USED-WEIGHT-1M": "900"},
+        )
+        with patch("src.exchange.binance.requests.get", return_value=resp):
+            binance._public_get("/fapi/v1/ping", {})
+        self.assertEqual(binance.used_weight_1m(), 900)
+        self.assertTrue(binance.is_optional_rest_blocked())
+        with patch("src.exchange.binance.requests.get") as mock_get:
+            with self.assertRaises(binance.RateLimitError):
+                binance._public_get("/fapi/v1/ticker/24hr", {})
+            mock_get.assert_not_called()
+
+    def test_used_weight_hard_max_blocks_critical(self) -> None:
+        binance._used_weight_1m = 1900
+        binance._used_weight_at_mono = time.monotonic()
+        with patch("src.exchange.binance.requests.post") as mock_post:
+            with self.assertRaises(binance.RateLimitError):
+                with binance._rest_slot("POST", "/fapi/v1/order", priority="critical"):
+                    pass
+            mock_post.assert_not_called()
+
+    def test_boot_rest_quiet_blocks_optional_rest(self) -> None:
+        binance.mark_boot_rest_quiet(60.0)
+        self.assertTrue(binance.is_boot_rest_quiet())
+        self.assertTrue(binance.is_optional_rest_blocked())
+        with patch("src.exchange.binance.requests.get") as mock_get:
+            with self.assertRaises(binance.RateLimitError):
+                binance._public_get("/fapi/v1/ticker/24hr", {})
+            mock_get.assert_not_called()
+        binance._boot_quiet_until_mono = 0.0
 
     def test_normal_error_still_retries(self) -> None:
         resp = _response(500, {"code": -1000, "msg": "Internal error"})
