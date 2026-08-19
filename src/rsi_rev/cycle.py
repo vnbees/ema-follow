@@ -270,7 +270,7 @@ def _process_symbol(symbol: str, *, opened: int) -> int:
             opened += 1
         elif status == "skipped":
             store.delete_pending(int(pending["id"]))
-        # cap_skip / error / disabled: keep pending for the next candle
+        # cap_skip / room_skip / error / disabled: keep pending for a later bar
     return opened
 
 

@@ -15,7 +15,7 @@ from src.exchange import (
     notional_to_size,
     place_market_order,
 )
-from src.exchange.fills import resolve_order_fill
+from src.exchange.fills import resolve_order_commission, resolve_order_fill
 from src.exchange.sizing import format_size
 from src.notify import notify_error, notify_rsi_rev_close, notify_rsi_rev_open
 from src.rsi_rev import store
@@ -25,8 +25,14 @@ from src.rsi_rev.config import (
     MARGIN_MIN_USDT,
     MARGIN_PCT,
     MAX_OPEN,
+    MIN_TP_ROOM_PCT,
 )
-from src.rsi_rev.signals import EntryTrigger, ZONE_LABELS
+from src.rsi_rev.signals import (
+    ZONE_LABELS,
+    EntryTrigger,
+    entry_has_tp_room,
+    tp_remaining_pct,
+)
 
 _open_lock = threading.Lock()
 _close_lock = threading.Lock()
@@ -40,6 +46,14 @@ def realized_pnl(side: str, entry: float, close_price: float, size: float) -> fl
     if side == "long":
         return (close_price - entry) * size
     return (entry - close_price) * size
+
+
+def net_realized_pnl(
+    gross: float,
+    fee_open_usdt: float = 0.0,
+    fee_close_usdt: float = 0.0,
+) -> float:
+    return float(gross) - abs(float(fee_open_usdt or 0)) - abs(float(fee_close_usdt or 0))
 
 
 def live_account_balance(symbol: str):
@@ -117,7 +131,7 @@ def _real_order_id(result) -> str:
 
 
 def try_open(symbol: str, trigger: EntryTrigger) -> str:
-    """Open a lot. Returns opened | cap_skip | skipped | error | disabled."""
+    """Open a lot. Returns opened | cap_skip | room_skip | skipped | error | disabled."""
     if not is_trading_enabled() or not has_credentials():
         return "disabled"
 
@@ -132,6 +146,20 @@ def try_open(symbol: str, trigger: EntryTrigger) -> str:
             return "cap_skip"
         if store.has_open_lot(symbol, trigger.anchor_ts, trigger.side):
             return "skipped"
+        if not entry_has_tp_room(trigger.side, trigger.entry, trigger.tp):
+            remain = tp_remaining_pct(trigger.side, trigger.entry, trigger.tp)
+            logging.info(
+                "  [%s] Skip RSI-rev %s — TP room %.3f%% < min %.3f%% "
+                "(entry=%.6f tp=%.6f)",
+                symbol,
+                trigger.side.upper(),
+                remain * 100,
+                MIN_TP_ROOM_PCT * 100,
+                trigger.entry,
+                trigger.tp,
+            )
+            store.record_skip(symbol, "tp_room")
+            return "room_skip"
 
         try:
             configure_symbol_trading(symbol)
@@ -194,6 +222,7 @@ def try_open(symbol: str, trigger: EntryTrigger) -> str:
             if fill <= 0:
                 logging.warning("  [%s] RSI-rev open skipped persist — fill=%.6f", symbol, fill)
                 return "error"
+            fee_open = resolve_order_commission(order_id)
             lot_id = store.insert_lot(
                 symbol=symbol,
                 side=trigger.side,
@@ -209,6 +238,7 @@ def try_open(symbol: str, trigger: EntryTrigger) -> str:
                 entry_order_id=order_id,
                 client_oid=str(result.get("clientOid") or result.get("client_oid") or ""),
                 signal_ts=trigger.signal_ts,
+                fee_open_usdt=fee_open,
             )
             zone_label = ZONE_LABELS.get(trigger.zone, trigger.zone)
             notify_rsi_rev_open(
@@ -263,6 +293,8 @@ def close_lot(lot, *, reason: str, close_price: float) -> bool:
             size_str = format_size(size, spec)
             result = close_position_side(symbol, side, size_str)
             fill = resolve_order_fill(symbol, result, fallback_price=close_price)
+            close_oid = _real_order_id(result)
+            fee_close = resolve_order_commission(close_oid) if close_oid else 0.0
         except ExchangeClientError as exc:
             logging.warning(
                 "  [%s] RSI-rev close lot %s failed: %s",
@@ -273,9 +305,20 @@ def close_lot(lot, *, reason: str, close_price: float) -> bool:
             notify_error(f"RSI-rev close {symbol}", str(exc))
             return False
 
-        pnl = realized_pnl(side, entry, fill, size)
+        try:
+            fee_open = float(current["fee_open_usdt"] or 0)
+        except (KeyError, TypeError):
+            fee_open = 0.0
+        gross = realized_pnl(side, entry, fill, size)
+        pnl = net_realized_pnl(gross, fee_open, fee_close)
         if not store.close_lot(
-            lot_id, close_price=fill, close_reason=reason, pnl_usdt=pnl
+            lot_id,
+            close_price=fill,
+            close_reason=reason,
+            pnl_usdt=pnl,
+            pnl_gross_usdt=gross,
+            fee_close_usdt=fee_close,
+            close_order_id=close_oid,
         ):
             return False
         zone_label = ZONE_LABELS.get(zone, zone)
@@ -293,12 +336,14 @@ def close_lot(lot, *, reason: str, close_price: float) -> bool:
             opened_at=opened_at,
         )
         logging.info(
-            "  [%s] RSI-rev %s lot %s closed %s @ %.6f pnl=%.4f",
+            "  [%s] RSI-rev %s lot %s closed %s @ %.6f pnl=%.4f (gross=%.4f fee=%.4f)",
             symbol,
             side.upper(),
             lot_id,
             reason,
             fill,
             pnl,
+            gross,
+            fee_open + fee_close,
         )
         return True

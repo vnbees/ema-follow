@@ -75,6 +75,10 @@ def parse_order_trade_update(payload: dict[str, Any]) -> tuple[dict | None, Pend
     order_id = str(o.get("i") or "")
     status = str(o.get("X") or "").lower()
     avg = o.get("ap")
+    exec_type = str(o.get("x") or "")
+    trade_id = str(o.get("t") or "")
+    if trade_id in {"0", "None"}:
+        trade_id = ""
     detail = {
         "orderId": order_id,
         "status": status,
@@ -87,6 +91,10 @@ def parse_order_trade_update(payload: dict[str, Any]) -> tuple[dict | None, Pend
         "clientOid": str(o.get("c") or ""),
         "stopPrice": o.get("sp"),
         "realizedPnl": o.get("rp"),
+        "executionType": exec_type,
+        "tradeId": trade_id,
+        "commission": o.get("n"),
+        "commissionAsset": o.get("N"),
     }
     order_type = str(o.get("o") or "").upper()
     symbol = str(o.get("s") or "").upper()

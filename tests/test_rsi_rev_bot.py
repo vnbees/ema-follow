@@ -14,6 +14,17 @@ class TestRsiRevSizing(unittest.TestCase):
         self.assertEqual(realized_pnl("long", 100, 110, 2), 20)
         self.assertEqual(realized_pnl("short", 100, 90, 2), 20)
 
+    def test_net_pnl_subtracts_open_and_close_fees(self) -> None:
+        from src.rsi_rev.trading import net_realized_pnl
+
+        self.assertAlmostEqual(net_realized_pnl(0.13, 0.025, 0.025), 0.08)
+
+    def test_duration_matches_binance_label(self) -> None:
+        from src.web.app import _duration_vi
+
+        self.assertEqual(_duration_vi(94 * 60), "1g 34ph")
+        self.assertEqual(_duration_vi(10 * 3600 + 35 * 60), "10g 35ph")
+
     def test_real_order_id_rejects_mock(self) -> None:
         self.assertEqual(_real_order_id(MagicMock()), "")
         self.assertEqual(_real_order_id({"orderId": MagicMock()}), "")
@@ -61,8 +72,8 @@ class TestOpenSkip(unittest.TestCase):
 
         trigger = EntryTrigger(
             side="long",
-            entry=10.0,
-            tp=9.975,
+            entry=9.96,
+            tp=10.025,
             anchor_ts=1,
             anchor_price=10.05,
             anchor_rsi=71.0,
@@ -91,6 +102,35 @@ class TestOpenSkip(unittest.TestCase):
             status = try_open("LINKUSDT", trigger)
             self.assertEqual(status, "cap_skip")
             skip.assert_called_once()
+            place.assert_not_called()
+            insert_lot.assert_not_called()
+
+    def test_open_skips_when_tp_room_too_small(self) -> None:
+        from src.rsi_rev.signals import EntryTrigger, ZONE_RSI70
+
+        trigger = EntryTrigger(
+            side="long",
+            entry=9.640,
+            tp=9.629865,
+            anchor_ts=1,
+            anchor_price=9.654,
+            anchor_rsi=79.0,
+            zone=ZONE_RSI70,
+            signal_ts=2,
+        )
+        with (
+            patch("src.rsi_rev.trading.is_trading_enabled", return_value=True),
+            patch("src.rsi_rev.trading.has_credentials", return_value=True),
+            patch("src.rsi_rev.trading.MAX_OPEN", 0),
+            patch("src.rsi_rev.store.count_open", return_value=0),
+            patch("src.rsi_rev.store.has_open_lot", return_value=False),
+            patch("src.rsi_rev.store.record_skip") as skip,
+            patch("src.rsi_rev.store.insert_lot") as insert_lot,
+            patch("src.rsi_rev.trading.place_market_order") as place,
+        ):
+            status = try_open("LINKUSDT", trigger)
+            self.assertEqual(status, "room_skip")
+            skip.assert_called_once_with("LINKUSDT", "tp_room")
             place.assert_not_called()
             insert_lot.assert_not_called()
 

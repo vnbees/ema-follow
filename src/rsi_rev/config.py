@@ -13,6 +13,8 @@ MID_LOW = float(os.getenv("RSI_REV_MID_LOW", "48"))
 MID_HIGH = float(os.getenv("RSI_REV_MID_HIGH", "52"))
 MOVE_AWAY_PCT = float(os.getenv("RSI_REV_MOVE_AWAY_PCT", "0.005"))
 ZONE_PCT = float(os.getenv("RSI_REV_ZONE_PCT", "0.0025"))
+# Skip open when remaining entry→TP is below this (covers ~0.10% RT taker + buffer).
+MIN_TP_ROOM_PCT = float(os.getenv("RSI_REV_MIN_TP_ROOM_PCT", "0.0012"))
 BE_AFTER_HOURS = float(os.getenv("RSI_REV_BE_AFTER_HOURS", "168"))
 MAX_AGE_DAYS = float(os.getenv("RSI_REV_MAX_AGE_DAYS", "30"))
 MARGIN_PCT = float(os.getenv("RSI_REV_MARGIN_PCT", "0.5"))

@@ -346,8 +346,31 @@ class BinanceWsCache:
             return list(self.pending_by_symbol[symbol.upper()])
 
     def upsert_order_detail(self, order_id: str, detail: dict) -> None:
+        """Merge fill events. Sum USDT commission per tradeId (ORDER_TRADE_UPDATE n/N)."""
         with self.lock:
-            self.order_details[str(order_id)] = detail
+            oid = str(order_id)
+            prev = self.order_details.get(oid) or {}
+            merged = dict(prev)
+            skip = {"commission", "fees_by_trade", "tradeId"}
+            for key, value in detail.items():
+                if key not in skip:
+                    merged[key] = value
+            fees = dict(prev.get("fees_by_trade") or {})
+            incoming = detail.get("fees_by_trade")
+            if isinstance(incoming, dict):
+                fees.update({str(k): float(v) for k, v in incoming.items()})
+            trade_id = str(detail.get("tradeId") or "")
+            asset = str(detail.get("commissionAsset") or "USDT").upper()
+            raw_fee = detail.get("commission")
+            if trade_id and trade_id not in {"0", "None"} and raw_fee not in (None, ""):
+                if asset in {"USDT", "USD", ""}:
+                    try:
+                        fees[trade_id] = abs(float(raw_fee))
+                    except (TypeError, ValueError):
+                        pass
+            merged["fees_by_trade"] = fees
+            merged["commission"] = round(sum(float(v) for v in fees.values()), 8)
+            self.order_details[oid] = merged
 
     def get_order_detail(self, order_id: str) -> dict | None:
         with self.lock:

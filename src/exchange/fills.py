@@ -28,6 +28,37 @@ def parse_fill_price(detail: dict) -> float | None:
     return price if price > 0 else None
 
 
+def commission_usdt_from_detail(detail: dict | None) -> float:
+    if not detail:
+        return 0.0
+    try:
+        fee = float(detail.get("commission") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return abs(fee) if fee else 0.0
+
+
+def resolve_order_commission(order_id: str) -> float:
+    """USDT commission accumulated on UDS ORDER_TRADE_UPDATE for this order."""
+    oid = str(order_id or "")
+    if not oid:
+        return 0.0
+    last = 0.0
+    for attempt in range(_FILL_WS_ATTEMPTS):
+        try:
+            from src.exchange.binance_ws import get_order_detail_from_ws
+
+            cached = get_order_detail_from_ws(oid)
+        except Exception:  # noqa: BLE001
+            cached = None
+        last = commission_usdt_from_detail(cached)
+        if last > 0:
+            return last
+        if attempt < _FILL_WS_ATTEMPTS - 1:
+            time.sleep(_FILL_WS_DELAY_SEC)
+    return last
+
+
 def _fill_from_ws(order_id: str) -> float | None:
     try:
         from src.exchange.binance_ws import get_order_detail_from_ws

@@ -420,6 +420,46 @@ class TestUserDataParsers(unittest.TestCase):
         self.assertIsNone(pending)
         self.assertFalse(remove)
 
+    def test_order_trade_accumulates_usdt_commission(self) -> None:
+        CACHE.order_details.clear()
+        apply_user_payload(
+            {
+                "e": "ORDER_TRADE_UPDATE",
+                "o": {
+                    "i": 77,
+                    "X": "PARTIALLY_FILLED",
+                    "x": "TRADE",
+                    "t": 11,
+                    "ap": "1.0",
+                    "s": "SUIUSDT",
+                    "o": "MARKET",
+                    "n": "0.02",
+                    "N": "USDT",
+                },
+            }
+        )
+        apply_user_payload(
+            {
+                "e": "ORDER_TRADE_UPDATE",
+                "o": {
+                    "i": 77,
+                    "X": "FILLED",
+                    "x": "TRADE",
+                    "t": 12,
+                    "ap": "1.0",
+                    "s": "SUIUSDT",
+                    "o": "MARKET",
+                    "n": "0.03",
+                    "N": "USDT",
+                },
+            }
+        )
+        detail = CACHE.get_order_detail("77")
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        self.assertAlmostEqual(float(detail["commission"]), 0.05)
+        self.assertEqual(detail["status"], "filled")
+
     def test_apply_account_update_to_cache(self) -> None:
         CACHE.set_positions([], {})
         CACHE.set_balance(

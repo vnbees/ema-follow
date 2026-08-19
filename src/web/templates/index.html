@@ -37,6 +37,25 @@
     .summary-card .label { color: #8b949e; font-size: 12px; }
     .summary-card .value { font-size: 18px; margin-top: 4px; }
     .pager { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; color: #8b949e; }
+    .pos-updated { color: #8b949e; font-size: 12px; margin: 0 0 8px; }
+    .pos-list { display: flex; flex-direction: column; }
+    .pos-card { border-bottom: 1px solid #30363d; padding: 16px 2px 18px; }
+    .pos-card:last-child { border-bottom: none; }
+    .pos-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .pos-head-left { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .side-badge { font-size: 12px; font-weight: 700; padding: 3px 8px; border-radius: 4px; color: #fff; }
+    .side-badge.buy { background: #3fb950; }
+    .side-badge.sell { background: #f85149; }
+    .pos-symbol { font-weight: 600; }
+    .pill { background: #21262d; color: #8b949e; border-radius: 999px; padding: 2px 8px; font-size: 11px; }
+    .pos-status { color: #8b949e; font-size: 13px; white-space: nowrap; }
+    .pos-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 16px; margin-top: 14px; }
+    .pos-metric .k { color: #8b949e; font-size: 12px; }
+    .pos-metric .v { margin-top: 4px; font-size: 15px; }
+    .pos-foot { margin-top: 12px; color: #8b949e; font-size: 12px; line-height: 1.7; }
+    @media (max-width: 640px) {
+      .pos-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
   </style>
 </head>
 <body>
@@ -131,90 +150,109 @@
 
   <div class="panel">
     <h2 style="margin-top: 0;">Lệnh đang mở</h2>
-    <div class="table-wrap">
-      <table id="openTable">
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Side</th>
-            <th>Vùng RSI</th>
-            <th>Anchor</th>
-            <th>Entry</th>
-            <th>Target TP</th>
-            <th>Mark</th>
-            <th>PnL</th>
-            <th>Tuổi</th>
-            <th>Thoát</th>
-            <th>Mở</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for t in rsi_rev.open_trades %}
-          <tr>
-            <td>{{ t.symbol }}</td>
-            <td class="{% if t.side == 'long' %}green{% else %}red{% endif %}">{{ t.side.upper() }}</td>
-            <td>{{ t.zone_label }}</td>
-            <td>{{ t.anchor | dash_price }}</td>
-            <td>{{ t.entry | dash_price }}</td>
-            <td>{{ t.tp | dash_price }}</td>
-            <td>{{ t.mark | dash_price }}</td>
-            <td class="{% if (t.unrealized_pnl or 0) >= 0 %}green{% else %}red{% endif %}">
-              {{ t.unrealized_pnl | dash_pnl }}{% if t.pnl_pct is not none %} ({{ "%.2f"|format(t.pnl_pct) }}%){% endif %}
-            </td>
-            <td>{{ t.age_label }}</td>
-            <td>{{ t.exit_status }}</td>
-            <td class="meta">{{ t.opened_at }}</td>
-          </tr>
-          {% else %}
-          <tr><td colspan="11" class="empty">Không có lệnh mở.</td></tr>
-          {% endfor %}
-        </tbody>
-      </table>
+    <p class="pos-updated" id="openUpdated"></p>
+    <div class="pos-list" id="openList">
+      {% for t in rsi_rev.open_trades %}
+      <article class="pos-card">
+        <div class="pos-head">
+          <div class="pos-head-left">
+            <span class="side-badge {% if t.side == 'long' %}buy{% else %}sell{% endif %}">{{ t.side_label }}</span>
+            <span class="pos-symbol">{{ t.symbol }}</span>
+            <span class="pill">Vĩnh cửu</span>
+            <span class="pill">{{ t.margin_mode }}</span>
+            <span class="pill">{{ t.zone_label }}</span>
+          </div>
+          <span class="pos-status">{{ t.status_label }}</span>
+        </div>
+        <div class="pos-grid">
+          <div class="pos-metric">
+            <div class="k">PNL chưa ghi nhận (USDT)</div>
+            <div class="v {% if (t.unrealized_pnl or 0) >= 0 %}green{% else %}red{% endif %}">{{ t.unrealized_pnl | dash_pnl }}</div>
+          </div>
+          <div class="pos-metric">
+            <div class="k">ROI</div>
+            <div class="v {% if (t.pnl_pct or 0) >= 0 %}green{% else %}red{% endif %}">{% if t.pnl_pct is not none %}{{ "%.2f"|format(t.pnl_pct) }}%{% else %}—{% endif %}</div>
+          </div>
+          <div class="pos-metric">
+            <div class="k">Khối lượng</div>
+            <div class="v">{{ t.size }}</div>
+          </div>
+          <div class="pos-metric">
+            <div class="k">Giá vào lệnh trung bình</div>
+            <div class="v">{{ t.entry | dash_price }}</div>
+          </div>
+          <div class="pos-metric">
+            <div class="k">Mark</div>
+            <div class="v">{{ t.mark | dash_price }}</div>
+          </div>
+          <div class="pos-metric">
+            <div class="k">OI tối đa</div>
+            <div class="v">{{ t.size }}</div>
+          </div>
+        </div>
+        <div class="pos-foot">
+          Đã mở: {{ t.opened_at or "—" }}{% if t.duration_label %} (Kéo dài {{ t.duration_label }}){% endif %}<br>
+          {{ t.exit_status }}{% if t.fee_open_usdt %} · phí mở {{ "%.4f"|format(t.fee_open_usdt) }} USDT{% endif %}
+        </div>
+      </article>
+      {% else %}
+      <p class="empty">Không có lệnh mở.</p>
+      {% endfor %}
     </div>
     <div class="pager" id="openPager"></div>
   </div>
 
   <div class="panel">
-    <h2 style="margin-top: 0;">Lệnh đã đóng</h2>
-    <div class="table-wrap">
-      <table id="closedTable">
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Side</th>
-            <th>Vùng RSI</th>
-            <th>Anchor</th>
-            <th>Entry</th>
-            <th>Target TP</th>
-            <th>Đóng</th>
-            <th>PnL</th>
-            <th>Lý do</th>
-            <th>Mở</th>
-            <th>Đóng lúc</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for t in rsi_rev.closed_trades %}
-          <tr>
-            <td>{{ t.symbol }}</td>
-            <td class="{% if t.side == 'long' %}green{% else %}red{% endif %}">{{ t.side.upper() }}</td>
-            <td>{{ t.zone_label }}</td>
-            <td>{{ t.anchor | dash_price }}</td>
-            <td>{{ t.entry | dash_price }}</td>
-            <td>{{ t.tp | dash_price }}</td>
-            <td>{{ t.close_price | dash_price }}</td>
-            <td class="{% if (t.pnl_usdt or 0) >= 0 %}green{% else %}red{% endif %}">
-              {{ t.pnl_usdt | dash_pnl }}{% if t.pnl_pct is not none %} ({{ "%.2f"|format(t.pnl_pct) }}%){% endif %}
-            </td>
-            <td>{{ t.close_reason_label or "—" }}</td>
-            <td class="meta">{{ t.opened_at }}</td>
-            <td class="meta">{{ t.closed_at or "—" }}</td>
-          </tr>
-          {% else %}
-          <tr><td colspan="11" class="empty">Chưa có lệnh đóng.</td></tr>
-          {% endfor %}
-        </tbody>
-      </table>
+    <h2 style="margin-top: 0;">Lịch sử vị thế</h2>
+    <p class="pos-updated" id="closedUpdated"></p>
+    <div class="pos-list" id="closedList">
+      {% for t in rsi_rev.closed_trades %}
+      <article class="pos-card">
+        <div class="pos-head">
+          <div class="pos-head-left">
+            <span class="side-badge {% if t.side == 'long' %}buy{% else %}sell{% endif %}">{{ t.side_label }}</span>
+            <span class="pos-symbol">{{ t.symbol }}</span>
+            <span class="pill">Vĩnh cửu</span>
+            <span class="pill">{{ t.margin_mode }}</span>
+            <span class="pill">{{ t.zone_label }}</span>
+          </div>
+          <span class="pos-status">{{ t.status_label }}</span>
+        </div>
+        <div class="pos-grid">
+          <div class="pos-metric">
+            <div class="k">PnL đã ghi nhận</div>
+            <div class="v {% if (t.pnl_usdt or 0) >= 0 %}green{% else %}red{% endif %}">{{ t.pnl_usdt | dash_pnl }}</div>
+          </div>
+          <div class="pos-metric">
+            <div class="k">ROI</div>
+            <div class="v {% if (t.pnl_pct or 0) >= 0 %}green{% else %}red{% endif %}">{% if t.pnl_pct is not none %}{{ "%.2f"|format(t.pnl_pct) }}%{% else %}—{% endif %}</div>
+          </div>
+          <div class="pos-metric">
+            <div class="k">Khối lượng đóng</div>
+            <div class="v">{{ t.size }}</div>
+          </div>
+          <div class="pos-metric">
+            <div class="k">Giá vào lệnh trung bình</div>
+            <div class="v">{{ t.entry | dash_price }}</div>
+          </div>
+          <div class="pos-metric">
+            <div class="k">Giá đóng cửa trung bình</div>
+            <div class="v">{{ t.close_price | dash_price }}</div>
+          </div>
+          <div class="pos-metric">
+            <div class="k">OI tối đa</div>
+            <div class="v">{{ t.size }}</div>
+          </div>
+        </div>
+        <div class="pos-foot">
+          Đã mở: {{ t.opened_at or "—" }}<br>
+          Đã đóng: {{ t.closed_at or "—" }}{% if t.duration_label %} (Kéo dài {{ t.duration_label }}){% endif %}
+          · {{ t.close_reason_label or "—" }}{% if t.fee_usdt %} · phí {{ "%.4f"|format(t.fee_usdt) }} USDT{% endif %}
+        </div>
+      </article>
+      {% else %}
+      <p class="empty">Chưa có lệnh đóng.</p>
+      {% endfor %}
     </div>
     <div class="pager" id="closedPager"></div>
   </div>
@@ -265,6 +303,76 @@
       return n.toFixed(8);
     }
 
+    function fmtPnl2(v) {
+      if (v === null || v === undefined) return '—';
+      const n = Number(v);
+      const sign = n > 0 ? '+' : '';
+      return sign + n.toFixed(2);
+    }
+
+    function fmtRoi(v) {
+      if (v === null || v === undefined) return '—';
+      return Number(v).toFixed(2) + '%';
+    }
+
+    function fmtSize(v) {
+      if (v === null || v === undefined) return '—';
+      const n = Number(v);
+      if (n >= 100) return n.toFixed(2);
+      if (n >= 1) return n.toFixed(4);
+      return String(n);
+    }
+
+    function nowStamp() {
+      const d = new Date();
+      const pad = n => String(n).padStart(2, '0');
+      return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate())
+        + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+    }
+
+    function tradeCard(t, kind) {
+      const buy = t.side === 'long';
+      const pnl = kind === 'open' ? t.unrealized_pnl : t.pnl_usdt;
+      const fee = kind === 'open' ? t.fee_open_usdt : t.fee_usdt;
+      const feeBit = fee ? ' · phí ' + Number(fee).toFixed(4) + ' USDT' : '';
+      const foot = kind === 'open'
+        ? `Đã mở: ${t.opened_at || '—'}${t.duration_label ? ' (Kéo dài ' + t.duration_label + ')' : ''}<br>${t.exit_status || ''}${feeBit}`
+        : `Đã mở: ${t.opened_at || '—'}<br>Đã đóng: ${t.closed_at || '—'}${t.duration_label ? ' (Kéo dài ' + t.duration_label + ')' : ''} · ${t.close_reason_label || t.close_reason || '—'}${feeBit}`;
+      const mid = kind === 'open'
+        ? [['PNL chưa ghi nhận (USDT)', fmtPnl2(t.unrealized_pnl), pnlClass(t.unrealized_pnl)],
+           ['ROI', fmtRoi(t.pnl_pct), pnlClass(t.pnl_pct)],
+           ['Khối lượng', fmtSize(t.size), ''],
+           ['Giá vào lệnh trung bình', fmtPrice(t.entry), ''],
+           ['Mark', fmtPrice(t.mark), ''],
+           ['OI tối đa', fmtSize(t.size), '']]
+        : [['PnL đã ghi nhận', fmtPnl2(t.pnl_usdt), pnlClass(t.pnl_usdt)],
+           ['ROI', fmtRoi(t.pnl_pct), pnlClass(t.pnl_pct)],
+           ['Khối lượng đóng', fmtSize(t.size), ''],
+           ['Giá vào lệnh trung bình', fmtPrice(t.entry), ''],
+           ['Giá đóng cửa trung bình', fmtPrice(t.close_price), ''],
+           ['OI tối đa', fmtSize(t.size), '']];
+      const metrics = mid.map(([k, v, cls]) => `
+        <div class="pos-metric">
+          <div class="k">${k}</div>
+          <div class="v ${cls}">${v}</div>
+        </div>`).join('');
+      return `
+        <article class="pos-card">
+          <div class="pos-head">
+            <div class="pos-head-left">
+              <span class="side-badge ${buy ? 'buy' : 'sell'}">${t.side_label || (buy ? 'Mua' : 'Bán')}</span>
+              <span class="pos-symbol">${t.symbol}</span>
+              <span class="pill">Vĩnh cửu</span>
+              <span class="pill">${t.margin_mode || ''}</span>
+              <span class="pill">${t.zone_label || t.zone || ''}</span>
+            </div>
+            <span class="pos-status">${t.status_label || (kind === 'open' ? 'Đang mở' : 'Đã đóng')}</span>
+          </div>
+          <div class="pos-grid">${metrics}</div>
+          <div class="pos-foot">${foot}</div>
+        </article>`;
+    }
+
     function renderPager(el, page, pages, total, onPrev, onNext) {
       if (!el) return;
       el.innerHTML = `
@@ -278,49 +386,25 @@
     }
 
     function renderOpen(trades) {
-      const tbody = document.querySelector('#openTable tbody');
+      const list = document.getElementById('openList');
+      const stamp = document.getElementById('openUpdated');
+      if (stamp) stamp.textContent = 'Lần cập nhật gần nhất: ' + nowStamp();
       if (!trades.length) {
-        tbody.innerHTML = '<tr><td colspan="11" class="empty">Không có lệnh mở.</td></tr>';
+        list.innerHTML = '<p class="empty">Không có lệnh mở.</p>';
         return;
       }
-      tbody.innerHTML = trades.map(t => `
-        <tr>
-          <td>${t.symbol}</td>
-          <td class="${t.side === 'long' ? 'green' : 'red'}">${t.side.toUpperCase()}</td>
-          <td>${t.zone_label || t.zone || '—'}</td>
-          <td>${fmtPrice(t.anchor)}</td>
-          <td>${fmtPrice(t.entry)}</td>
-          <td>${fmtPrice(t.tp)}</td>
-          <td>${fmtPrice(t.mark)}</td>
-          <td class="${pnlClass(t.unrealized_pnl)}">${fmtPnl(t.unrealized_pnl)}${fmtPct(t.pnl_pct)}</td>
-          <td>${t.age_label || '—'}</td>
-          <td>${t.exit_status || '—'}</td>
-          <td class="meta">${t.opened_at || '—'}</td>
-        </tr>
-      `).join('');
+      list.innerHTML = trades.map(t => tradeCard(t, 'open')).join('');
     }
 
     function renderClosed(trades) {
-      const tbody = document.querySelector('#closedTable tbody');
+      const list = document.getElementById('closedList');
+      const stamp = document.getElementById('closedUpdated');
+      if (stamp) stamp.textContent = 'Lần cập nhật gần nhất: ' + nowStamp();
       if (!trades.length) {
-        tbody.innerHTML = '<tr><td colspan="11" class="empty">Chưa có lệnh đóng.</td></tr>';
+        list.innerHTML = '<p class="empty">Chưa có lệnh đóng.</p>';
         return;
       }
-      tbody.innerHTML = trades.map(t => `
-        <tr>
-          <td>${t.symbol}</td>
-          <td class="${t.side === 'long' ? 'green' : 'red'}">${t.side.toUpperCase()}</td>
-          <td>${t.zone_label || t.zone || '—'}</td>
-          <td>${fmtPrice(t.anchor)}</td>
-          <td>${fmtPrice(t.entry)}</td>
-          <td>${fmtPrice(t.tp)}</td>
-          <td>${fmtPrice(t.close_price)}</td>
-          <td class="${pnlClass(t.pnl_usdt)}">${fmtPnl(t.pnl_usdt)}${fmtPct(t.pnl_pct)}</td>
-          <td>${t.close_reason_label || t.close_reason || '—'}</td>
-          <td class="meta">${t.opened_at || '—'}</td>
-          <td class="meta">${t.closed_at || '—'}</td>
-        </tr>
-      `).join('');
+      list.innerHTML = trades.map(t => tradeCard(t, 'closed')).join('');
     }
 
     function renderDaily(rows) {

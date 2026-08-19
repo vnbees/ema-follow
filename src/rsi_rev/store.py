@@ -63,6 +63,10 @@ def ensure_schema(conn: sqlite3.Connection | None = None) -> None:
                 close_price REAL,
                 close_reason TEXT,
                 pnl_usdt REAL,
+                pnl_gross_usdt REAL,
+                fee_open_usdt REAL,
+                fee_close_usdt REAL,
+                close_order_id TEXT,
                 opened_at TEXT NOT NULL,
                 closed_at TEXT,
                 updated_at TEXT NOT NULL
@@ -86,9 +90,23 @@ def ensure_schema(conn: sqlite3.Connection | None = None) -> None:
             """
     if conn is not None:
         conn.executescript(ddl)
+        _migrate_lot_fee_columns(conn)
         return
     with get_connection() as owned:
         owned.executescript(ddl)
+        _migrate_lot_fee_columns(owned)
+
+
+def _migrate_lot_fee_columns(conn: sqlite3.Connection) -> None:
+    cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(rsi_rev_lots)")}
+    for name, spec in (
+        ("pnl_gross_usdt", "REAL"),
+        ("fee_open_usdt", "REAL"),
+        ("fee_close_usdt", "REAL"),
+        ("close_order_id", "TEXT"),
+    ):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE rsi_rev_lots ADD COLUMN {name} {spec}")
 
 
 def insert_pending(
@@ -158,6 +176,7 @@ def insert_lot(
     entry_order_id: str,
     client_oid: str,
     signal_ts: int,
+    fee_open_usdt: float = 0.0,
 ) -> int:
     now = _utc_now()
     with _lock, get_connection() as conn:
@@ -167,8 +186,8 @@ def insert_lot(
             INSERT INTO rsi_rev_lots (
                 symbol, side, zone, status, anchor_ts, anchor_price, anchor_rsi,
                 entry, tp, size, margin_usdt, notional_usdt, entry_order_id, client_oid,
-                signal_ts, opened_at, updated_at
-            ) VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                signal_ts, fee_open_usdt, opened_at, updated_at
+            ) VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 symbol.upper(),
@@ -185,6 +204,7 @@ def insert_lot(
                 entry_order_id,
                 client_oid,
                 signal_ts,
+                float(fee_open_usdt or 0),
                 now,
                 now,
             ),
@@ -198,18 +218,33 @@ def close_lot(
     close_price: float,
     close_reason: str,
     pnl_usdt: float,
+    pnl_gross_usdt: float | None = None,
+    fee_close_usdt: float = 0.0,
+    close_order_id: str = "",
 ) -> bool:
     now = _utc_now()
+    gross = float(pnl_usdt if pnl_gross_usdt is None else pnl_gross_usdt)
     with _lock, get_connection() as conn:
         ensure_schema(conn)
         cur = conn.execute(
             """
             UPDATE rsi_rev_lots
             SET status = 'closed', close_price = ?, close_reason = ?, pnl_usdt = ?,
+                pnl_gross_usdt = ?, fee_close_usdt = ?, close_order_id = ?,
                 closed_at = ?, updated_at = ?
             WHERE id = ? AND status = 'open'
             """,
-            (close_price, close_reason, pnl_usdt, now, now, lot_id),
+            (
+                close_price,
+                close_reason,
+                pnl_usdt,
+                gross,
+                float(fee_close_usdt or 0),
+                close_order_id or "",
+                now,
+                now,
+                lot_id,
+            ),
         )
         return cur.rowcount > 0
 

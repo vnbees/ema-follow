@@ -14,6 +14,8 @@ from src.config import (
     DASHBOARD_SESSION_SECRET,
     DASHBOARD_USERNAME,
     EXCHANGE_DISPLAY_NAME,
+    LEVERAGE,
+    MARGIN_MODE,
 )
 from src.bot_state import (
     get_account_balance,
@@ -184,6 +186,39 @@ def _lot_age_label(hours: float) -> str:
     return f"{hours / 24:.1f}d"
 
 
+def _row_float(row, key: str, default: float = 0.0) -> float:
+    try:
+        raw = row[key]
+    except (KeyError, IndexError):
+        return default
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _duration_vi(seconds: float) -> str:
+    total_m = max(0, int(seconds // 60))
+    days, rem = divmod(total_m, 60 * 24)
+    hours, minutes = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}n")
+    if hours:
+        parts.append(f"{hours}g")
+    if minutes or not parts:
+        parts.append(f"{minutes}ph")
+    return " ".join(parts)
+
+
+def _margin_mode_label() -> str:
+    mode = (MARGIN_MODE or "crossed").lower()
+    tag = "Cross" if mode in {"crossed", "cross"} else "Isolated"
+    return f"{tag} {LEVERAGE}x"
+
+
 def _serialize_lot(row, marks: dict[str, float], *, now_ts: float) -> dict:
     from src.rsi_rev import store
     from src.rsi_rev.config import BE_AFTER_HOURS, MAX_AGE_DAYS
@@ -195,44 +230,67 @@ def _serialize_lot(row, marks: dict[str, float], *, now_ts: float) -> dict:
     entry = float(row["entry"] or 0)
     size = float(row["size"] or 0)
     status = str(row["status"])
+    margin = _row_float(row, "margin_usdt")
+    fee_open = _row_float(row, "fee_open_usdt")
+    fee_close = _row_float(row, "fee_close_usdt")
+    fee_total = fee_open + fee_close
     mark = marks.get(symbol, 0.0)
     opened_raw = str(row["opened_at"] or "")
-    age_h = lot_age_hours(_lot_opened_epoch(opened_raw), now_ts) if opened_raw else 0.0
+    closed_raw = str(row["closed_at"] or "") if status == "closed" else ""
+    opened_epoch = _lot_opened_epoch(opened_raw) if opened_raw else 0.0
+    closed_epoch = _lot_opened_epoch(closed_raw) if closed_raw else 0.0
+    age_h = lot_age_hours(opened_epoch, now_ts) if opened_raw else 0.0
+    hold_end = closed_epoch if closed_epoch > 0 else now_ts
+    duration_sec = max(0.0, hold_end - opened_epoch) if opened_epoch > 0 else 0.0
     unreal = None
-    pnl_pct = None
+    roi_pct = None
     if status == "open" and mark > 0 and size > 0 and entry > 0:
         unreal = realized_pnl(side, entry, mark, size)
-        pnl_pct = unreal / (entry * size) * 100
+        if margin > 0:
+            roi_pct = unreal / margin * 100
+        elif entry * size > 0:
+            roi_pct = unreal / (entry * size) * 100
     closed_pnl = row["pnl_usdt"]
-    if status == "closed" and closed_pnl is not None and entry > 0 and size > 0:
-        pnl_pct = float(closed_pnl) / (entry * size) * 100
+    pnl_gross = row["pnl_gross_usdt"] if "pnl_gross_usdt" in row.keys() else None
+    if status == "closed" and closed_pnl is not None and margin > 0:
+        roi_pct = float(closed_pnl) / margin * 100
+    elif status == "closed" and closed_pnl is not None and entry > 0 and size > 0:
+        roi_pct = float(closed_pnl) / (entry * size) * 100
     reason = str(row["close_reason"] or "")
     return {
         "id": int(row["id"]),
         "symbol": symbol,
         "side": side,
+        "side_label": "Mua" if side == "long" else "Bán",
         "zone": str(row["zone"] or ""),
         "zone_label": ZONE_LABELS.get(str(row["zone"] or ""), str(row["zone"] or "")),
         "status": status,
+        "status_label": "Đã đóng" if status == "closed" else "Đang mở",
+        "margin_mode": _margin_mode_label(),
         "anchor": float(row["anchor_price"] or 0),
         "entry": entry,
         "tp": float(row["tp"] or 0),
         "size": size,
-        "margin_usdt": float(row["margin_usdt"] or 0),
+        "margin_usdt": margin,
         "close_price": row["close_price"],
         "close_reason": reason,
         "close_reason_label": store.REASON_LABELS.get(reason, reason),
         "pnl_usdt": closed_pnl,
-        "pnl_pct": pnl_pct,
+        "pnl_gross_usdt": pnl_gross,
+        "pnl_pct": roi_pct,
+        "fee_open_usdt": fee_open,
+        "fee_close_usdt": fee_close,
+        "fee_usdt": fee_total,
         "unrealized_pnl": unreal,
         "mark": mark,
         "age_hours": age_h,
         "age_label": _lot_age_label(age_h),
+        "duration_label": _duration_vi(duration_sec),
         "exit_status": exit_status_label(age_h, BE_AFTER_HOURS, MAX_AGE_DAYS)
         if status == "open"
         else "",
         "opened_at": format_vn_time(opened_raw) if opened_raw else "",
-        "closed_at": format_vn_time(str(row["closed_at"])) if row["closed_at"] else "",
+        "closed_at": format_vn_time(closed_raw) if closed_raw else "",
     }
 
 

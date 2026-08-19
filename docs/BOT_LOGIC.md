@@ -72,8 +72,9 @@ flowchart TD
 
 Quy tắc:
 
-- Cả **3 vùng RSI** cùng chạy; long và short **song song**; mỗi tín hiệu rời 0.5% đều vào lệnh (stack lot).
+- Cả **3 vùng RSI** cùng chạy; long và short **song song**; stack lot khi rời 0.5% **và** còn đủ room tới TP.
 - Event chỉ trên **nến đóng vừa rồi** (không lookahead).
+- Entry = **close** nến rời 0.5%. Nếu close đã **vượt TP** hoặc còn **< 0.12%** tới TP (`RSI_REV_MIN_TP_ROOM_PCT`) thì **không mở** — pending giữ, chờ nến sau (tránh đóng ngay, lãi bị phí ăn hết).
 - Cùng nến: **TP > BE**; BE chỉ sau 7 ngày; timeout 30 ngày đóng theo giá hiện tại.
 - **Không** đặt SL cứng / algo SL-TP trên net position (sẽ cắt nhầm lot khác).
 
@@ -111,8 +112,9 @@ Ví dụ equity 1000 USDT: 1 lệnh khóa **5 USDT** margin, notional **50 USDT*
 
 Dashboard ([`src/web/app.py`](../src/web/app.py)):
 
-- Số lệnh mở / đóng, pending anchors, unrealized (mark WS), realized.
-- Bảng lệnh mở: symbol, side, vùng RSI, anchor, entry, target TP, mark, PnL, tuổi, trạng thái thoát (`chờ TP` / `sau 7 ngày: chờ BE về entry` / `gần 30 ngày`).
+- Số lệnh mở / đóng, pending anchors, unrealized (mark WS), realized **đã trừ phí** (USDT commission từ user-stream `n`/`N`).
+- Lịch sử vị thế dạng thẻ giống Binance: Mua/Bán, Vĩnh cửu, Cross 10x, PnL đã ghi nhận, ROI (PnL / ký quỹ), khối lượng, giá vào/đóng TB, thời gian giữ. Lệnh mở hiện PnL chưa ghi nhận + mark.
+- Lot cũ (trước khi lưu phí) giữ PnL giá; lệnh mới trừ phí mở + phí đóng.
 - Thống kê theo **ngày VN**, ngày mới nhất trên cùng.
 - Phân trang riêng open/closed; trang 1 = mới nhất. `GET /api/rsi-rev/trades?status=open|closed&page=&page_size=` và `GET /api/rsi-rev/daily?days=30`.
 
@@ -125,8 +127,8 @@ Discord: mỗi lot **mở** (anchor + target + size) và **đóng** với lý do
 | Bảng | Việc |
 |------|------|
 | `rsi_rev_pending` | Setup chờ rời 0.5%; unique `(symbol, anchor_ts, zone)` |
-| `rsi_rev_lots` | Lot mở/đóng (anchor, zone, entry, tp, side, size) |
-| `rsi_rev_skips` | Skip hết số dư / max open |
+| `rsi_rev_lots` | Lot mở/đóng; `pnl_usdt` net sau phí; `fee_open_usdt` / `fee_close_usdt` |
+| `rsi_rev_skips` | Skip hết số dư / max open / TP room quá hẹp |
 | `equity_snapshots` | Chart equity dashboard |
 
 `clear_dashboard_history()` — xóa lịch sử RSI-rev + equity chart (không đóng vị thế sàn).
@@ -145,6 +147,7 @@ RSI_REV_MAX_OPEN=0
 RSI_REV_ENTRIES_PER_CYCLE=0
 RSI_REV_MOVE_AWAY_PCT=0.005
 RSI_REV_ZONE_PCT=0.0025
+RSI_REV_MIN_TP_ROOM_PCT=0.0012
 RSI_REV_BE_AFTER_HOURS=168
 RSI_REV_MAX_AGE_DAYS=30
 GRANULARITY=5m

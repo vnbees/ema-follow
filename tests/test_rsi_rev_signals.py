@@ -110,6 +110,15 @@ class TestRsiRevSignals(unittest.TestCase):
         )
         self.assertIsNone(trig)
 
+    def test_tp_room_rejects_entry_past_or_too_close(self) -> None:
+        from src.rsi_rev.signals import entry_has_tp_room, tp_remaining_pct
+
+        self.assertFalse(entry_has_tp_room("long", 9.640, 9.629865))
+        self.assertLess(tp_remaining_pct("long", 0.3153, 0.315609), 0.0012)
+        self.assertFalse(entry_has_tp_room("long", 0.3153, 0.315609))
+        self.assertTrue(entry_has_tp_room("long", 0.3145, 0.315210))
+        self.assertTrue(entry_has_tp_room("short", 9.575, 9.530767))
+
 
 if __name__ == "__main__":
     unittest.main()

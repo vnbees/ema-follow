@@ -4,7 +4,14 @@ from dataclasses import dataclass
 
 from src.exchange.types import Candle
 from src.rsi import compute_rsi_series
-from src.rsi_rev.config import MID_HIGH, MID_LOW, MOVE_AWAY_PCT, RSI_PERIOD, ZONE_PCT
+from src.rsi_rev.config import (
+    MID_HIGH,
+    MID_LOW,
+    MIN_TP_ROOM_PCT,
+    MOVE_AWAY_PCT,
+    RSI_PERIOD,
+    ZONE_PCT,
+)
 
 ZONE_RSI70 = "rsi70"
 ZONE_RSI30 = "rsi30"
@@ -41,6 +48,25 @@ def tp_price(side: str, anchor: float, zone_pct: float = ZONE_PCT) -> float:
     if side == "short":
         return anchor * (1 + zone_pct)
     return anchor * (1 - zone_pct)
+
+
+def tp_remaining_pct(side: str, entry: float, tp: float) -> float:
+    """Signed remaining move from entry to TP, as a fraction of entry."""
+    if entry <= 0:
+        return 0.0
+    if side == "long":
+        return (tp - entry) / entry
+    return (entry - tp) / entry
+
+
+def entry_has_tp_room(
+    side: str,
+    entry: float,
+    tp: float,
+    min_room_pct: float = MIN_TP_ROOM_PCT,
+) -> bool:
+    """True when TP is still far enough to cover round-trip fees."""
+    return tp_remaining_pct(side, entry, tp) >= min_room_pct
 
 
 def detect_anchor_events(

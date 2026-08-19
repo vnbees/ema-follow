@@ -128,14 +128,11 @@ def notify_rsi_rev_close(
             logging.debug("Discord notify skipped: DISCORD_WEBHOOK_URL not set")
             return
         title = f"{symbol.upper()} {side.upper()} đóng — {reason}"
-        pnl_pct = ((close_price - entry) / entry * 100) if entry else 0.0
-        if side.lower() == "short":
-            pnl_pct = -pnl_pct
         body = (
             f"vùng RSI: {zone}\n"
             f"anchor={_fmt_px(anchor)}  entry={_fmt_px(entry)}  target TP={_fmt_px(tp)}\n"
             f"đóng={_fmt_px(close_price)}\n"
-            f"pnl={pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}%)\n"
+            f"pnl={pnl_usdt:+.2f} USDT (đã trừ phí)\n"
             f"giữ {_hold_label(opened_at)}"
         )
         _send_discord(title, body)

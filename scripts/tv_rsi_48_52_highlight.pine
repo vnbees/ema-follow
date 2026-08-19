@@ -1,0 +1,40 @@
+//@version=6
+indicator("RSI 40-60 breakout labels", overlay=true, max_labels_count=500)
+
+// Track high/low while RSI14 is in 40-60.
+// When RSI leaves 40-60:
+//   close > zone high  → BUY label
+//   close < zone low   → SELL label
+// No boxes/lines. Candles stay default. Apply on 5m.
+
+rsiLen   = input.int(14, "RSI period", minval=2)
+zoneLow  = input.float(40.0, "RSI zone low", minval=0, maxval=100, step=0.5)
+zoneHigh = input.float(60.0, "RSI zone high", minval=0, maxval=100, step=0.5)
+buyColor  = input.color(color.new(#26a69a, 0), "BUY label")
+sellColor = input.color(color.new(#ef5350, 0), "SELL label")
+
+rsi = ta.rsi(close, rsiLen)
+inZone = not na(rsi) and rsi >= zoneLow and rsi <= zoneHigh
+
+var int zoneLen = 0
+
+entered = inZone and not inZone[1]
+continued = inZone and inZone[1]
+exited = not inZone and inZone[1]
+
+if entered
+    zoneLen := 1
+else if continued
+    zoneLen += 1
+
+if exited and zoneLen > 0
+    zoneTop = ta.highest(high, zoneLen)[1]
+    zoneBottom = ta.lowest(low, zoneLen)[1]
+    if close > zoneTop
+        label.new(bar_index, low, "BUY", style=label.style_label_up, color=buyColor, textcolor=color.white, size=size.small)
+    else if close < zoneBottom
+        label.new(bar_index, high, "SELL", style=label.style_label_down, color=sellColor, textcolor=color.white, size=size.small)
+    zoneLen := 0
+
+plot(rsi, "RSI14", display=display.data_window)
+plot(inZone ? 1 : 0, "In RSI 40-60", display=display.data_window)
