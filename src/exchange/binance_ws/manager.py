@@ -127,13 +127,14 @@ def _create_listen_key() -> str:
             logging.info("Binance listenKey reused from disk (no REST validate)")
         return existing
 
-    remaining = binance_mod.optional_rest_blocked_sec()
-    if remaining > 0:
+    wait = binance_mod.boot_optional_rest_wait_sec()
+    if wait > 0:
         raise binance_mod.RateLimitError(
-            f"Rate-limit cooldown active — {remaining:.0f}s remaining, request skipped"
+            f"Boot REST not ready — {wait:.0f}s remaining, request skipped"
         )
-    CACHE.bump_rest("listenKey_create")
-    data = binance_mod._private_post("/fapi/v1/listenKey", {})
+    with binance_mod.boot_optional_rest_slot():
+        CACHE.bump_rest("listenKey_create")
+        data = binance_mod._private_post("/fapi/v1/listenKey", {})
     key = str(data.get("listenKey") or "")
     if not key:
         raise RuntimeError("Empty listenKey from Binance")
@@ -355,7 +356,7 @@ async def _async_main() -> None:
         from src.exchange import binance as binance_mod
 
         while not _stop_event.is_set():
-            wait = binance_mod.optional_rest_blocked_sec()
+            wait = binance_mod.boot_optional_rest_wait_sec()
             if wait > 0:
                 await asyncio.sleep(min(wait + 2.0, 60.0))
                 continue
@@ -367,7 +368,12 @@ async def _async_main() -> None:
                     logging.info(
                         "Binance WS cold start — deferred REST reconcile (no disk account)"
                     )
-                    await asyncio.to_thread(lambda: reconcile_account_state(force=True))
+
+                    def _boot_reconcile() -> None:
+                        with binance_mod.boot_optional_rest_slot():
+                            reconcile_account_state(force=True)
+
+                    await asyncio.to_thread(_boot_reconcile)
                 if not CACHE.mini_ticker_seeded:
                     await asyncio.to_thread(seed_volume_rank_from_rest)
             except Exception as exc:  # noqa: BLE001
@@ -414,13 +420,16 @@ def start_binance_ws() -> None:
         )
 
     try:
-        from src.ema_rsi import store
+        from src.rsi_rev.config import SYMBOLS
+        from src.rsi_rev import store
 
-        open_rows = store.get_open_trades()
-        managed = [str(row["symbol"]) for row in open_rows]
+        open_rows = store.get_open_lots()
+        managed = list(dict.fromkeys(
+            [*(SYMBOLS or ()), *[str(row["symbol"]) for row in open_rows]]
+        ))
         if managed:
             set_watched_symbols(managed)
-            logging.info("Binance WS pre-subscribe klines for %d open symbols", len(managed))
+            logging.info("Binance WS pre-subscribe klines for %s", ",".join(managed))
     except Exception as exc:  # noqa: BLE001
         logging.debug("Binance WS open-symbol preload skipped: %s", exc)
 

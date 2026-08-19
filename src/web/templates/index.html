@@ -32,10 +32,11 @@
     .chart-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
     .chart-wrap { position: relative; height: 280px; }
     .chart-empty { color: #8b949e; font-size: 13px; padding: 48px 0; text-align: center; }
-    .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 12px 0; }
+    .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 12px 0; }
     .summary-card { background: #0f1117; border: 1px solid #30363d; border-radius: 8px; padding: 12px; }
     .summary-card .label { color: #8b949e; font-size: 12px; }
     .summary-card .value { font-size: 18px; margin-top: 4px; }
+    .pager { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; color: #8b949e; }
   </style>
 </head>
 <body>
@@ -69,79 +70,153 @@
 
   <div class="summary-grid">
     <div class="summary-card">
-      <div class="label">Lệnh mở</div>
-      <div class="value">{{ ema_rsi.open_count }}/{{ ema_rsi_max_open }}</div>
+      <div class="label">Lệnh đang mở</div>
+      <div class="value" id="openCount">{{ rsi_rev.open_count }}</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">Lệnh đã đóng</div>
+      <div class="value" id="closedCount">{{ rsi_rev.closed_count }}</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">Pending anchors</div>
+      <div class="value" id="pendingCount">{{ rsi_rev.pending_count }}</div>
     </div>
     <div class="summary-card">
       <div class="label">Unrealized PnL</div>
-      <div class="value {% if ema_rsi.summary.open_unrealized >= 0 %}green{% else %}red{% endif %}">
-        {{ ema_rsi.summary.open_unrealized | dash_pnl }}
+      <div id="unrealPnl" class="value {% if rsi_rev.summary.open_unrealized >= 0 %}green{% else %}red{% endif %}">
+        {{ rsi_rev.summary.open_unrealized | dash_pnl }}
       </div>
     </div>
     <div class="summary-card">
-      <div class="label">Realized PnL (lịch sử)</div>
-      <div class="value {% if ema_rsi.summary.closed_realized >= 0 %}green{% else %}red{% endif %}">
-        {{ ema_rsi.summary.closed_realized | dash_pnl }}
-      </div>
-    </div>
-    <div class="summary-card">
-      <div class="label">Tổng PnL</div>
-      <div class="value {% if ema_rsi.summary.total_pnl >= 0 %}green{% else %}red{% endif %}">
-        {{ ema_rsi.summary.total_pnl | dash_pnl }}
+      <div class="label">Realized PnL</div>
+      <div id="realPnl" class="value {% if rsi_rev.summary.closed_realized >= 0 %}green{% else %}red{% endif %}">
+        {{ rsi_rev.summary.closed_realized | dash_pnl }}
       </div>
     </div>
   </div>
 
   <div class="panel">
-    <h2 style="margin-top: 0;">Lệnh EMA RSI</h2>
+    <h2 style="margin-top: 0;">Thống kê theo ngày (VN)</h2>
     <div class="table-wrap">
-      <table id="tradesTable">
+      <table id="dailyTable">
         <thead>
           <tr>
-            <th>Symbol</th>
-            <th>Side</th>
-            <th>Status</th>
-            <th>Entry</th>
-            <th>SL</th>
-            <th>TP</th>
-            <th>R</th>
-            <th>Size</th>
-            <th>PnL</th>
-            <th>Lý do</th>
-            <th>Mở</th>
-            <th>Đóng</th>
+            <th>Ngày</th>
+            <th>Vào</th>
+            <th>Đóng TP</th>
+            <th>BE 7 ngày</th>
+            <th>Timeout 30 ngày</th>
+            <th>Skip hết số dư</th>
+            <th>PnL ngày</th>
           </tr>
         </thead>
         <tbody>
-          {% for t in ema_rsi.trades %}
+          {% for d in rsi_rev.daily %}
           <tr>
-            <td>{{ t.symbol }}</td>
-            <td class="{% if t.side == 'long' %}green{% else %}red{% endif %}">{{ t.side.upper() }}</td>
-            <td>{{ t.status }}</td>
-            <td>{{ t.entry | dash_price }}</td>
-            <td>{{ t.sl | dash_price }}</td>
-            <td>{{ t.tp | dash_price }}</td>
-            <td>{{ t.r | dash_price }}</td>
-            <td>{{ t.size | dash_price }}</td>
-            <td class="{% if (t.pnl_usdt if t.pnl_usdt is not none else t.unrealized_pnl or 0) >= 0 %}green{% else %}red{% endif %}">
-              {% if t.status == 'open' %}
-                {{ t.unrealized_pnl | dash_pnl }}
-              {% else %}
-                {{ t.pnl_usdt | dash_pnl }}
-              {% endif %}
-            </td>
-            <td>{{ t.close_reason or "—" }}</td>
-            <td class="meta">{{ t.opened_at }}</td>
-            <td class="meta">{{ t.closed_at or "—" }}</td>
+            <td>{{ d.day }}</td>
+            <td>{{ d.opened }}</td>
+            <td>{{ d.tp }}</td>
+            <td>{{ d.be }}</td>
+            <td>{{ d.timeout }}</td>
+            <td>{{ d.skips }}</td>
+            <td class="{% if d.pnl >= 0 %}green{% else %}red{% endif %}">{{ d.pnl | dash_pnl }}</td>
           </tr>
           {% else %}
-          <tr>
-            <td colspan="12" class="empty">Chưa có lệnh.</td>
-          </tr>
+          <tr><td colspan="7" class="empty">Chưa có thống kê.</td></tr>
           {% endfor %}
         </tbody>
       </table>
     </div>
+  </div>
+
+  <div class="panel">
+    <h2 style="margin-top: 0;">Lệnh đang mở</h2>
+    <div class="table-wrap">
+      <table id="openTable">
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Side</th>
+            <th>Vùng RSI</th>
+            <th>Anchor</th>
+            <th>Entry</th>
+            <th>Target TP</th>
+            <th>Mark</th>
+            <th>PnL</th>
+            <th>Tuổi</th>
+            <th>Thoát</th>
+            <th>Mở</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for t in rsi_rev.open_trades %}
+          <tr>
+            <td>{{ t.symbol }}</td>
+            <td class="{% if t.side == 'long' %}green{% else %}red{% endif %}">{{ t.side.upper() }}</td>
+            <td>{{ t.zone_label }}</td>
+            <td>{{ t.anchor | dash_price }}</td>
+            <td>{{ t.entry | dash_price }}</td>
+            <td>{{ t.tp | dash_price }}</td>
+            <td>{{ t.mark | dash_price }}</td>
+            <td class="{% if (t.unrealized_pnl or 0) >= 0 %}green{% else %}red{% endif %}">
+              {{ t.unrealized_pnl | dash_pnl }}{% if t.pnl_pct is not none %} ({{ "%.2f"|format(t.pnl_pct) }}%){% endif %}
+            </td>
+            <td>{{ t.age_label }}</td>
+            <td>{{ t.exit_status }}</td>
+            <td class="meta">{{ t.opened_at }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="11" class="empty">Không có lệnh mở.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="pager" id="openPager"></div>
+  </div>
+
+  <div class="panel">
+    <h2 style="margin-top: 0;">Lệnh đã đóng</h2>
+    <div class="table-wrap">
+      <table id="closedTable">
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Side</th>
+            <th>Vùng RSI</th>
+            <th>Anchor</th>
+            <th>Entry</th>
+            <th>Target TP</th>
+            <th>Đóng</th>
+            <th>PnL</th>
+            <th>Lý do</th>
+            <th>Mở</th>
+            <th>Đóng lúc</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for t in rsi_rev.closed_trades %}
+          <tr>
+            <td>{{ t.symbol }}</td>
+            <td class="{% if t.side == 'long' %}green{% else %}red{% endif %}">{{ t.side.upper() }}</td>
+            <td>{{ t.zone_label }}</td>
+            <td>{{ t.anchor | dash_price }}</td>
+            <td>{{ t.entry | dash_price }}</td>
+            <td>{{ t.tp | dash_price }}</td>
+            <td>{{ t.close_price | dash_price }}</td>
+            <td class="{% if (t.pnl_usdt or 0) >= 0 %}green{% else %}red{% endif %}">
+              {{ t.pnl_usdt | dash_pnl }}{% if t.pnl_pct is not none %} ({{ "%.2f"|format(t.pnl_pct) }}%){% endif %}
+            </td>
+            <td>{{ t.close_reason_label or "—" }}</td>
+            <td class="meta">{{ t.opened_at }}</td>
+            <td class="meta">{{ t.closed_at or "—" }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="11" class="empty">Chưa có lệnh đóng.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="pager" id="closedPager"></div>
   </div>
 
   <div class="panel">
@@ -162,6 +237,9 @@
   <script>
     let equityChart = null;
     let equityRange = '7d';
+    let openPage = 1;
+    let closedPage = 1;
+    const pageSize = 50;
 
     function pnlClass(v) {
       return (v || 0) >= 0 ? 'green' : 'red';
@@ -174,37 +252,136 @@
       return sign + n.toFixed(4);
     }
 
+    function fmtPct(v) {
+      if (v === null || v === undefined) return '';
+      return ' (' + Number(v).toFixed(2) + '%)';
+    }
+
     function fmtPrice(v) {
-      if (v === null || v === undefined) return '—';
+      if (v === null || v === undefined || Number(v) === 0) return '—';
       const n = Number(v);
       if (n >= 1) return n.toFixed(4);
       if (n >= 0.01) return n.toFixed(6);
       return n.toFixed(8);
     }
 
-    function renderTrades(trades) {
-      const tbody = document.querySelector('#tradesTable tbody');
+    function renderPager(el, page, pages, total, onPrev, onNext) {
+      if (!el) return;
+      el.innerHTML = `
+        <button type="button" ${page <= 1 ? 'disabled' : ''}>Prev</button>
+        <span>Trang ${page} / ${pages} · ${total} lệnh</span>
+        <button type="button" ${page >= pages ? 'disabled' : ''}>Next</button>
+      `;
+      const buttons = el.querySelectorAll('button');
+      buttons[0].addEventListener('click', onPrev);
+      buttons[1].addEventListener('click', onNext);
+    }
+
+    function renderOpen(trades) {
+      const tbody = document.querySelector('#openTable tbody');
       if (!trades.length) {
-        tbody.innerHTML = '<tr><td colspan="12" class="empty">Chưa có lệnh.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="11" class="empty">Không có lệnh mở.</td></tr>';
         return;
       }
-      tbody.innerHTML = trades.map(t => {
-        const pnl = t.status === 'open' ? t.unrealized_pnl : t.pnl_usdt;
-        return `<tr>
+      tbody.innerHTML = trades.map(t => `
+        <tr>
           <td>${t.symbol}</td>
           <td class="${t.side === 'long' ? 'green' : 'red'}">${t.side.toUpperCase()}</td>
-          <td>${t.status}</td>
+          <td>${t.zone_label || t.zone || '—'}</td>
+          <td>${fmtPrice(t.anchor)}</td>
           <td>${fmtPrice(t.entry)}</td>
-          <td>${fmtPrice(t.sl)}</td>
           <td>${fmtPrice(t.tp)}</td>
-          <td>${fmtPrice(t.r)}</td>
-          <td>${fmtPrice(t.size)}</td>
-          <td class="${pnlClass(pnl)}">${fmtPnl(pnl)}</td>
-          <td>${t.close_reason || '—'}</td>
+          <td>${fmtPrice(t.mark)}</td>
+          <td class="${pnlClass(t.unrealized_pnl)}">${fmtPnl(t.unrealized_pnl)}${fmtPct(t.pnl_pct)}</td>
+          <td>${t.age_label || '—'}</td>
+          <td>${t.exit_status || '—'}</td>
+          <td class="meta">${t.opened_at || '—'}</td>
+        </tr>
+      `).join('');
+    }
+
+    function renderClosed(trades) {
+      const tbody = document.querySelector('#closedTable tbody');
+      if (!trades.length) {
+        tbody.innerHTML = '<tr><td colspan="11" class="empty">Chưa có lệnh đóng.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = trades.map(t => `
+        <tr>
+          <td>${t.symbol}</td>
+          <td class="${t.side === 'long' ? 'green' : 'red'}">${t.side.toUpperCase()}</td>
+          <td>${t.zone_label || t.zone || '—'}</td>
+          <td>${fmtPrice(t.anchor)}</td>
+          <td>${fmtPrice(t.entry)}</td>
+          <td>${fmtPrice(t.tp)}</td>
+          <td>${fmtPrice(t.close_price)}</td>
+          <td class="${pnlClass(t.pnl_usdt)}">${fmtPnl(t.pnl_usdt)}${fmtPct(t.pnl_pct)}</td>
+          <td>${t.close_reason_label || t.close_reason || '—'}</td>
           <td class="meta">${t.opened_at || '—'}</td>
           <td class="meta">${t.closed_at || '—'}</td>
-        </tr>`;
-      }).join('');
+        </tr>
+      `).join('');
+    }
+
+    function renderDaily(rows) {
+      const tbody = document.querySelector('#dailyTable tbody');
+      if (!rows.length) {
+        tbody.innerHTML = '<tr><td colspan="7" class="empty">Chưa có thống kê.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = rows.map(d => `
+        <tr>
+          <td>${d.day}</td>
+          <td>${d.opened}</td>
+          <td>${d.tp}</td>
+          <td>${d.be}</td>
+          <td>${d.timeout}</td>
+          <td>${d.skips}</td>
+          <td class="${pnlClass(d.pnl)}">${fmtPnl(d.pnl)}</td>
+        </tr>
+      `).join('');
+    }
+
+    async function loadTrades(status, page) {
+      const res = await fetch('/api/rsi-rev/trades?status=' + status + '&page=' + page + '&page_size=' + pageSize);
+      if (!res.ok) return null;
+      return await res.json();
+    }
+
+    async function refreshTables() {
+      const [openData, closedData, dailyData] = await Promise.all([
+        loadTrades('open', openPage),
+        loadTrades('closed', closedPage),
+        fetch('/api/rsi-rev/daily?days=30').then(r => r.ok ? r.json() : null),
+      ]);
+      if (openData) {
+        renderOpen(openData.trades || []);
+        renderPager(
+          document.getElementById('openPager'),
+          openData.page, openData.pages, openData.total,
+          () => { if (openPage > 1) { openPage -= 1; refreshTables(); } },
+          () => { if (openPage < openData.pages) { openPage += 1; refreshTables(); } },
+        );
+        document.getElementById('openCount').textContent = openData.open_count;
+        document.getElementById('closedCount').textContent = openData.closed_count;
+        document.getElementById('pendingCount').textContent = openData.pending_count;
+        const u = document.getElementById('unrealPnl');
+        u.textContent = fmtPnl(openData.summary.open_unrealized);
+        u.className = 'value ' + pnlClass(openData.summary.open_unrealized);
+        const r = document.getElementById('realPnl');
+        r.textContent = fmtPnl(openData.summary.closed_realized);
+        r.className = 'value ' + pnlClass(openData.summary.closed_realized);
+      }
+      if (closedData) {
+        renderClosed(closedData.trades || []);
+        renderPager(
+          document.getElementById('closedPager'),
+          closedData.page, closedData.pages, closedData.total,
+          () => { if (closedPage > 1) { closedPage -= 1; refreshTables(); } },
+          () => { if (closedPage < closedData.pages) { closedPage += 1; refreshTables(); } },
+        );
+      }
+      if (dailyData && dailyData.rows) renderDaily(dailyData.rows);
     }
 
     async function refreshStatus() {
@@ -221,9 +398,6 @@
           rl.textContent = 'Rate-limit ' + Math.ceil(data.rate_limit_remaining_sec) + 's';
         } else {
           rl.hidden = true;
-        }
-        if (data.ema_rsi && data.ema_rsi.trades) {
-          renderTrades(data.ema_rsi.trades);
         }
       } catch (_) {}
     }
@@ -288,7 +462,9 @@
 
     loadEquityChart('7d');
     refreshStatus();
+    refreshTables();
     setInterval(refreshStatus, 15000);
+    setInterval(refreshTables, 15000);
     setInterval(() => loadEquityChart(equityRange), 60000);
   </script>
 </body>

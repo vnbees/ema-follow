@@ -21,7 +21,6 @@ from src.bot_state import (
     is_trading_enabled,
     set_trading_enabled,
 )
-from src.ema_rsi.config import MAX_OPEN
 from src.web.number_format import format_dashboard_pnl, format_dashboard_price
 from src.web.time_format import format_vn_time
 
@@ -31,7 +30,7 @@ templates.env.filters["vn_time"] = format_vn_time
 templates.env.filters["dash_price"] = format_dashboard_price
 templates.env.filters["dash_pnl"] = format_dashboard_pnl
 
-app = FastAPI(title=f"{EXCHANGE_DISPLAY_NAME} EMA RSI Bot Dashboard")
+app = FastAPI(title=f"{EXCHANGE_DISPLAY_NAME} RSI Reversion Bot Dashboard")
 
 _PUBLIC_PATHS = frozenset({"/login"})
 _SESSION_SECRET = DASHBOARD_SESSION_SECRET or secrets.token_urlsafe(48)
@@ -166,72 +165,162 @@ def _fetch_symbol_marks(symbols: list[str]) -> dict[str, float]:
     return result
 
 
-def _ema_rsi_trade_payload(limit: int = 50) -> dict:
-    from src.ema_rsi import store
-    from src.ema_rsi.trading import realized_pnl
+def _lot_opened_epoch(opened_at: str) -> float:
+    raw = (opened_at or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return 0.0
 
-    rows = store.list_trades(limit=limit)
-    symbols = sorted({str(row["symbol"]) for row in rows if row["status"] == "open"})
-    marks = _fetch_symbol_marks(symbols)
-    trades = []
-    for row in rows:
-        symbol = str(row["symbol"])
-        side = str(row["side"])
-        entry = float(row["entry"] or 0)
-        size = float(row["size"] or 0)
-        status = str(row["status"])
-        mark = marks.get(symbol, 0.0)
-        unreal = None
-        if status == "open" and mark > 0 and size > 0:
-            unreal = realized_pnl(side, entry, mark, size)
-        trades.append(
-            {
-                "id": int(row["id"]),
-                "symbol": symbol,
-                "side": side,
-                "status": status,
-                "entry": entry,
-                "sl": float(row["sl"] or 0),
-                "tp": float(row["tp"] or 0),
-                "r": float(row["r"] or 0),
-                "size": size,
-                "margin_usdt": float(row["margin_usdt"] or 0),
-                "close_price": row["close_price"],
-                "close_reason": row["close_reason"] or "",
-                "pnl_usdt": row["pnl_usdt"],
-                "unrealized_pnl": unreal,
-                "mark": mark,
-                "opened_at": format_vn_time(str(row["opened_at"])) if row["opened_at"] else "",
-                "closed_at": format_vn_time(str(row["closed_at"])) if row["closed_at"] else "",
-            }
-        )
-    open_count = sum(1 for t in trades if t["status"] == "open")
-    closed_realized = sum(
-        float(t["pnl_usdt"] or 0) for t in trades if t["status"] == "closed" and t["pnl_usdt"] is not None
-    )
-    open_unrealized = sum(float(t["unrealized_pnl"] or 0) for t in trades if t["status"] == "open")
+
+def _lot_age_label(hours: float) -> str:
+    if hours < 24:
+        return f"{hours:.1f}h"
+    return f"{hours / 24:.1f}d"
+
+
+def _serialize_lot(row, marks: dict[str, float], *, now_ts: float) -> dict:
+    from src.rsi_rev import store
+    from src.rsi_rev.config import BE_AFTER_HOURS, MAX_AGE_DAYS
+    from src.rsi_rev.signals import ZONE_LABELS, exit_status_label, lot_age_hours
+    from src.rsi_rev.trading import realized_pnl
+
+    symbol = str(row["symbol"])
+    side = str(row["side"])
+    entry = float(row["entry"] or 0)
+    size = float(row["size"] or 0)
+    status = str(row["status"])
+    mark = marks.get(symbol, 0.0)
+    opened_raw = str(row["opened_at"] or "")
+    age_h = lot_age_hours(_lot_opened_epoch(opened_raw), now_ts) if opened_raw else 0.0
+    unreal = None
+    pnl_pct = None
+    if status == "open" and mark > 0 and size > 0 and entry > 0:
+        unreal = realized_pnl(side, entry, mark, size)
+        pnl_pct = unreal / (entry * size) * 100
+    closed_pnl = row["pnl_usdt"]
+    if status == "closed" and closed_pnl is not None and entry > 0 and size > 0:
+        pnl_pct = float(closed_pnl) / (entry * size) * 100
+    reason = str(row["close_reason"] or "")
     return {
-        "trades": trades,
-        "open_count": open_count,
+        "id": int(row["id"]),
+        "symbol": symbol,
+        "side": side,
+        "zone": str(row["zone"] or ""),
+        "zone_label": ZONE_LABELS.get(str(row["zone"] or ""), str(row["zone"] or "")),
+        "status": status,
+        "anchor": float(row["anchor_price"] or 0),
+        "entry": entry,
+        "tp": float(row["tp"] or 0),
+        "size": size,
+        "margin_usdt": float(row["margin_usdt"] or 0),
+        "close_price": row["close_price"],
+        "close_reason": reason,
+        "close_reason_label": store.REASON_LABELS.get(reason, reason),
+        "pnl_usdt": closed_pnl,
+        "pnl_pct": pnl_pct,
+        "unrealized_pnl": unreal,
+        "mark": mark,
+        "age_hours": age_h,
+        "age_label": _lot_age_label(age_h),
+        "exit_status": exit_status_label(age_h, BE_AFTER_HOURS, MAX_AGE_DAYS)
+        if status == "open"
+        else "",
+        "opened_at": format_vn_time(opened_raw) if opened_raw else "",
+        "closed_at": format_vn_time(str(row["closed_at"])) if row["closed_at"] else "",
+    }
+
+
+def _rsi_rev_summary() -> dict:
+    from src.rsi_rev import store
+    from src.rsi_rev.trading import realized_pnl
+
+    open_rows = store.get_open_lots()
+    symbols = sorted({str(row["symbol"]) for row in open_rows})
+    marks = _fetch_symbol_marks(symbols)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    open_unrealized = 0.0
+    for row in open_rows:
+        mark = marks.get(str(row["symbol"]), 0.0)
+        if mark <= 0:
+            continue
+        open_unrealized += realized_pnl(
+            str(row["side"]),
+            float(row["entry"] or 0),
+            mark,
+            float(row["size"] or 0),
+        )
+    closed_realized = store.sum_closed_pnl()
+    return {
+        "open_count": store.count_open(),
+        "closed_count": store.count_closed(),
+        "pending_count": store.count_pending(),
         "summary": {
             "open_unrealized": open_unrealized,
             "closed_realized": closed_realized,
             "total_pnl": open_unrealized + closed_realized,
         },
+        "marks": marks,
+        "now_ts": now_ts,
+    }
+
+
+def _rsi_rev_trades_payload(*, status: str, page: int, page_size: int) -> dict:
+    from src.rsi_rev import store
+
+    rows, total = store.list_lots_paged(status=status, page=page, page_size=page_size)
+    summary = _rsi_rev_summary()
+    marks = summary["marks"]
+    now_ts = summary["now_ts"]
+    if status == "open":
+        extra = {str(row["symbol"]) for row in rows}
+        missing = [s for s in extra if s not in marks]
+        if missing:
+            marks.update(_fetch_symbol_marks(missing))
+    pages = max(1, (total + page_size - 1) // page_size) if total else 1
+    return {
+        "status": status,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "pages": pages,
+        "trades": [_serialize_lot(row, marks, now_ts=now_ts) for row in rows],
+        "open_count": summary["open_count"],
+        "closed_count": summary["closed_count"],
+        "pending_count": summary["pending_count"],
+        "summary": summary["summary"],
     }
 
 
 def _dashboard_context() -> dict:
     account = get_account_balance()
-    ema_rsi = _ema_rsi_trade_payload(50)
+    open_payload = _rsi_rev_trades_payload(status="open", page=1, page_size=50)
+    closed_payload = _rsi_rev_trades_payload(status="closed", page=1, page_size=50)
+    from src.rsi_rev import store
+
+    daily = store.daily_stats(30)
     return {
         "exchange_name": EXCHANGE_DISPLAY_NAME,
-        "bot_title": "EMA RSI",
+        "bot_title": "RSI Reversion",
         "account": account,
         "last_cycle_at": get_last_cycle_at(),
         "trading_enabled": is_trading_enabled(),
-        "ema_rsi": ema_rsi,
-        "ema_rsi_max_open": MAX_OPEN,
+        "rsi_rev": {
+            "open_count": open_payload["open_count"],
+            "closed_count": open_payload["closed_count"],
+            "pending_count": open_payload["pending_count"],
+            "summary": open_payload["summary"],
+            "open_trades": open_payload["trades"],
+            "closed_trades": closed_payload["trades"],
+            "open_page": open_payload,
+            "closed_page": closed_payload,
+            "daily": daily,
+        },
     }
 
 
@@ -243,7 +332,7 @@ def dashboard(request: Request) -> HTMLResponse:
 @app.get("/api/status")
 def api_status() -> dict:
     account = get_account_balance()
-    ema_rsi = _ema_rsi_trade_payload(50)
+    rsi_rev = _rsi_rev_summary()
     rate_limited = False
     rate_limit_remaining_sec = 0.0
     try:
@@ -264,15 +353,29 @@ def api_status() -> dict:
         },
         "trading_enabled": is_trading_enabled(),
         "last_cycle_at": format_vn_time(get_last_cycle_at()),
-        "ema_rsi": ema_rsi,
+        "rsi_rev": rsi_rev,
         "rate_limited": rate_limited,
         "rate_limit_remaining_sec": rate_limit_remaining_sec,
     }
 
 
-@app.get("/api/ema-rsi/trades")
-def api_ema_rsi_trades(limit: int = Query(default=50, ge=1, le=200)) -> dict:
-    return _ema_rsi_trade_payload(limit)
+@app.get("/api/rsi-rev/trades")
+def api_rsi_rev_trades(
+    status: str = Query(default="open"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=20, le=100),
+) -> dict:
+    kind = status.strip().lower()
+    if kind not in {"open", "closed"}:
+        kind = "open"
+    return _rsi_rev_trades_payload(status=kind, page=page, page_size=page_size)
+
+
+@app.get("/api/rsi-rev/daily")
+def api_rsi_rev_daily(days: int = Query(default=30, ge=1, le=90)) -> dict:
+    from src.rsi_rev import store
+
+    return {"days": days, "rows": store.daily_stats(days)}
 
 
 @app.get("/api/equity-history")

@@ -1,7 +1,7 @@
 def main() -> None:
-    from src.ema_rsi.cycle import main as ema_rsi_main
+    from src.rsi_rev.cycle import main as rsi_rev_main
 
-    ema_rsi_main()
+    rsi_rev_main()
 
 
 if __name__ == "__main__":

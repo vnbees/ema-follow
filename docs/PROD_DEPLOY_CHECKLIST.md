@@ -48,7 +48,8 @@ Mục tiêu: **không bị Binance 418/429 (ban IP)**, không chạy 2 bot cùng
 | `DATABASE_PATH` | `/data/bot.db` |
 | `BINANCE_WS_REST_TICKER_SEED` | `false` (mặc định — **không** seed ticker/24hr bằng REST) |
 | `BINANCE_CLEAR_RATE_LIMIT` | `false` (chỉ bật **một lần** khi đổi egress IP và chắc chắn Binance đã hết ban) |
-| `REST_BOOT_QUIET_SEC` | `600` (mặc định — **không cần set** trên Railway trừ khi muốn đổi) |
+| `REST_BOOT_QUIET_SEC` | `0` (mặc định — **không** chặn REST 10 phút) |
+| `REST_BOOT_GAP_SEC` | `60` (mặc định — optional REST lúc boot cách nhau 1 phút) |
 
 **Không bật** `BINANCE_CLEAR_RATE_LIMIT=true` nếu IP mới vẫn có thể bị ban — clear local không xóa ban phía Binance.
 
@@ -87,18 +88,18 @@ railway up -d -y
 ### Log phải có
 
 - [ ] `bot-ema-follow-trend: starting (PORT=... DATABASE_PATH=/data/bot.db)`
-- [ ] `Binance REST boot quiet — optional REST paused 600s (deploy safety; WS/disk only)`
+- [ ] `Boot REST warmup started (quiet=0s gap=60s)`
 - [ ] `Binance WS starting without REST seed` (hoặc REST-pause nếu cooldown còn hợp lệ)
 - [ ] `Binance kline WS connected`
-- [ ] `Binance EMA-RSI bot started` + `Trading: LIVE`
-- [ ] `First cycle — skip REST orphan/protective reconcile (WS-only boot)` (cycle đầu)
-- [ ] `Volume rank cache hit` hoặc `Volume rank loaded` từ **WS** (không thấy `Volume rank REST fallback` ngay lúc boot)
+- [ ] `Binance RSI-rev bot started` + `Trading: LIVE`
+- [ ] `First cycle — skip REST position reconcile (WS-only boot)` (cycle đầu)
+- [ ] Coin thiếu nến: `REST kline warmup seeded` **cách nhau ~60s**, không burst 4 symbol cùng lúc
+- [ ] Coin đã đủ cache: `kline cache ready — skip REST warmup`
 
 ### Log **không** nên thấy ngay sau boot
 
 - [ ] `Binance rate limited — pausing REST calls for XXXXs`
-- [ ] Hàng loạt `Restore SL/TP failed` ngay cycle 1
-- [ ] `Volume rank REST fallback — WS miniTicker empty` (WS chưa kịp seed → REST burst)
+- [ ] `Volume rank REST fallback` (bot RSI-rev không scan volume rank)
 
 ### HTTP
 
@@ -118,34 +119,30 @@ Bot phân loại mọi REST call Binance thành 2 nhóm (`src/exchange/binance.p
 
 | Loại | Ví dụ | Khi nào chạy |
 |------|--------|--------------|
-| **Critical** | POST market order, POST algo SL/TP, cancel order | Mở/đóng lệnh thật — **luôn được phép**, kể cả boot quiet |
-| **Optional** | GET balance, GET positionRisk (full book), GET ticker/24hr, GET order detail (fill poll), restore SL/TP verify | Chỉ để sync/monitor — **có thể dùng WS/disk thay** |
+| **Critical** | POST market order, cancel / reduce-only close | Mở/đóng lệnh thật — **luôn được phép**, không chờ boot gap |
+| **Optional** | GET kline warmup, listenKey create, GET account, GET ticker/24hr, GET order detail (fill poll) | Chỉ khi cache thiếu — **cách 60s + weight gate** |
 
-### Boot quiet 600s (`REST_BOOT_QUIET_SEC`) — ảnh hưởng gì?
+### Boot REST (`REST_BOOT_GAP_SEC=60`, quiet mặc định 0)
 
-**10 phút đầu sau mỗi lần start**, bot **chặn toàn bộ optional REST**; dùng WebSocket + file trên disk thay.
+**Không** đợi 10 phút. Lúc start, REST optional **chỉ khi cần** (không có listenKey trên disk, nến WS < ~20, không có account snapshot). Mỗi lần gọi xong chờ **60 giây** rồi mới gọi optional tiếp theo. Weight `X-MBX-USED-WEIGHT-1M` ≥ 800 thì skip optional đến hết cửa sổ ~60s.
 
-| Chức năng | Boot quiet (0–10 phút) | Sau boot quiet |
-|-----------|------------------------|----------------|
-| Scan tín hiệu 5m | ✅ WS kline | ✅ WS kline |
-| Volume rank top 50 | ✅ WS miniTicker | ✅ WS (cache 300s) |
-| Watcher đóng lệnh (SL/TP hit) | ✅ User Data Stream | ✅ UDS + REST verify nếu cần |
-| Mở lệnh mới (signal + entry) | ✅ REST critical (market + SL/TP) | ✅ |
-| Dashboard equity | WS/disk cache (có thể hơi cũ) | REST balance định kỳ |
-| Restore SL/TP nếu DB thiếu id | ⏸ Defer (cycle 2+) | ✅ |
-| Orphan reconcile | ⏸ Defer (cycle 2+) | ✅ |
+| Chức năng | Ngay sau start |
+|-----------|----------------|
+| Scan tín hiệu 5m | WS kline; REST warmup 1 coin / 60s nếu cache ngắn |
+| Watcher đóng lot (TP / BE / timeout) | Mark WS + REST critical khi đóng |
+| Mở lệnh mới | REST critical (market); config hedge optional không qua boot gap |
+| Dashboard equity | WS/disk; không REST chỉ để log |
+| Position size reconcile | Cycle 1 skip; cycle 2+ WS trước |
 
-**Logic trading core không đổi** — EMA200 cross, RSI swing, RR 1:2, max 20 positions, watcher vẫn như cũ. Chỉ **hoãn** các bước “kiểm tra/sync phụ” qua REST trong 10 phút đầu để tránh ban IP lúc deploy.
+**Logic trading core không đổi.** Quiet 10 phút vẫn bật được bằng `REST_BOOT_QUIET_SEC=600` nếu IP đang 418.
 
 ### Lưu ý khi deploy PROD
 
-- [ ] DB phải có **đủ `sl_order_id` + `tp_order_id`** trước deploy — boot quiet sẽ không verify lại ngay bằng REST
-- [ ] Upload **WS persist files** (`binance_ws_account.json`, `binance_ws_candles.json`, …) để boot không cần REST seed
-- [ ] Sau deploy, **đợi ≥ 10 phút** rồi check log: balance reconcile, protective restore (nếu cần) chạy bình thường
+- [ ] Upload **WS persist files** (`binance_ws_account.json`, `binance_ws_candles.json`, `binance_listen_key`, …) để bớt REST seed
 - [ ] **Không** bật `BINANCE_CLEAR_RATE_LIMIT` khi deploy — trừ khi đổi IP và chắc chắn Binance đã hết ban
-- [ ] **Không** redeploy liên tiếp — mỗi restart reset boot quiet 600s và tăng rủi ro nếu optional REST bị gọi sớm
-- [ ] Env tùy chọn: `REST_BOOT_QUIET_SEC=600` (mặc định); có thể tăng `900` nếu IP Railway hay bị 418
-- [ ] Weight budget (mặc định, không cần set trừ khi đổi): `REST_WEIGHT_SAFE_MAX=800`, `REST_WEIGHT_HARD_MAX=1800` trên trần futures `2400`/phút. Bot đọc `X-MBX-USED-WEIGHT-1M` từ mỗi REST — **không** gọi thêm API chỉ để check weight.
+- [ ] **Không** redeploy liên tiếp trong vài phút (mỗi restart có thể REST listenKey + kline warmup)
+- [ ] Chỉ set `REST_BOOT_QUIET_SEC=600` khi IP Railway đang hot 418
+- [ ] Weight budget (mặc định): `REST_WEIGHT_SAFE_MAX=800`, `REST_WEIGHT_HARD_MAX=1800`. Bot đọc `X-MBX-USED-WEIGHT-1M` từ mỗi REST — **không** gọi thêm API chỉ để check weight.
 
 ### Weight 1 phút — có đảm bảo 100% không?
 
@@ -160,7 +157,7 @@ Không ping Binance để “hỏi còn ban không”.
 
 ### Local vs PROD
 
-Boot quiet áp dụng **cả local lẫn PROD** mỗi khi restart — hành vi giống nhau, local cũng an toàn khi khởi động lại.
+Gap 60s + weight áp dụng **cả local lẫn PROD**. Quiet 10 phút chỉ khi set `REST_BOOT_QUIET_SEC`.
 
 ---
 
@@ -168,14 +165,14 @@ Boot quiet áp dụng **cả local lẫn PROD** mỗi khi restart — hành vi g
 
 | Cơ chế | File |
 |--------|------|
-| **Boot quiet 600s** — chặn mọi optional REST sau deploy | `src/exchange/binance.py` (`REST_BOOT_QUIET_SEC`) |
+| **Boot gap 60s** — optional REST lúc start (listenKey / kline / cold account) cách nhau 1 phút | `src/exchange/binance.py` (`REST_BOOT_GAP_SEC`) |
+| **Boot quiet (tắt mặc định)** — chỉ bật `REST_BOOT_QUIET_SEC=600` khi IP đang 418 | `src/exchange/binance.py` |
 | **Weight budget** — skip REST khi `X-MBX-USED-WEIGHT-1M` ≥ 800 / 1800 | `src/exchange/binance.py` (`REST_WEIGHT_SAFE_MAX` / `HARD_MAX`) |
-| Scan WS-only (`ws_only=True`) | `src/ema_rsi/candles.py` |
-| Entry confirm REST tối đa ~3/cycle | `src/ema_rsi/candles.py` |
-| Chờ miniTicker seed trước volume rank | `src/ema_rsi/cycle.py` |
-| Cache volume rank 300s (`max_age_sec`) | `src/market_universe.py`, `cycle.py` |
-| Cycle 1 skip orphan/protective REST | `src/ema_rsi/cycle.py` |
-| Skip restore SL/TP nếu DB đã có cả 2 order id | `src/ema_rsi/trading.py` |
+| Scan WS-only (`ws_only=True`) | `src/rsi_rev/candles.py` |
+| REST kline warmup nếu cache < ~20 nến, 1 symbol / gap | `src/rsi_rev/candles.py` |
+| Watched symbols = `RSI_REV_SYMBOLS` (LINK, SUI, WLD, HYPE) | `src/rsi_rev/cycle.py` |
+| Cycle 1 skip REST position reconcile | `src/rsi_rev/cycle.py` |
+| Equity: WS cache rồi REST fallback | `src/rsi_rev/trading.py` |
 | Cooldown persist `/data/binance_rate_limit_until_ms` | `src/exchange/binance.py` |
 | Không REST ticker/24hr khi WS bật (default) | `src/exchange/binance.py` |
 
@@ -184,9 +181,9 @@ Boot quiet áp dụng **cả local lẫn PROD** mỗi khi restart — hành vi g
 ## Nếu bị cooldown / 418
 
 1. **Không** xóa file cooldown và **không** bật `BINANCE_CLEAR_RATE_LIMIT` cho đến khi Binance hết ban thật (~ vài phút đến vài giờ).
-2. Bot vẫn chạy được qua **WS** (watcher, scan, đóng lệnh qua UDS).
-3. REST (restore SL/TP, balance fresh, entry confirm) tự retry sau khi cooldown hết.
-4. Kiểm tra SL/TP trên Binance app — nếu đã có trên exchange thì an toàn dù restore REST fail.
+2. Bot vẫn chạy được qua **WS** (watcher mark, scan kline, đóng lệnh reduce-only).
+3. REST (balance fresh nếu cache stale) tự retry sau khi cooldown hết.
+4. RSI-rev **không** đặt algo SL/TP trên sàn — thoát lot do watcher mark.
 5. Chỉ khi **đổi region / egress IP mới** và chắc chắn Binance không còn ban IP cũ:
    ```bash
    railway variables set BINANCE_CLEAR_RATE_LIMIT=true

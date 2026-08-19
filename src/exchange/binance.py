@@ -146,6 +146,8 @@ _RATE_LIMIT_FILE = Path(DATABASE_PATH).expanduser().resolve().parent / "binance_
 _rest_http_lock = threading.Lock()
 _last_rest_at = 0.0
 _boot_quiet_until_mono = 0.0
+_last_boot_rest_mono = 0.0
+_boot_rest_slot_lock = threading.Lock()
 _used_weight_1m = 0
 _used_weight_at_mono = 0.0
 _weight_block_log_at = 0.0
@@ -393,6 +395,51 @@ def boot_rest_quiet_remaining_sec() -> float:
 
 def is_boot_rest_quiet() -> bool:
     return boot_rest_quiet_remaining_sec() > 0
+
+
+def boot_rest_gap_remaining_sec() -> float:
+    """Seconds until the next optional boot REST is allowed (REST_BOOT_GAP_SEC)."""
+    from src.config import REST_BOOT_GAP_SEC
+
+    gap = max(0.0, float(REST_BOOT_GAP_SEC))
+    if gap <= 0 or _last_boot_rest_mono <= 0:
+        return 0.0
+    return max(0.0, gap - (time.monotonic() - _last_boot_rest_mono))
+
+
+def boot_optional_rest_wait_sec() -> float:
+    """Max of boot quiet, weight/ban, and boot gap."""
+    return max(
+        boot_rest_quiet_remaining_sec(),
+        optional_rest_blocked_sec(),
+        boot_rest_gap_remaining_sec(),
+    )
+
+
+@contextmanager
+def boot_optional_rest_slot(*, timeout_sec: float = 180.0) -> Iterator[None]:
+    """Serialize optional boot REST: one call, then REST_BOOT_GAP_SEC before the next.
+
+    Also waits out boot quiet, 418 cooldown, and used-weight >= REST_WEIGHT_SAFE_MAX.
+    Critical order REST must not use this slot.
+    """
+    global _last_boot_rest_mono
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while True:
+        with _boot_rest_slot_lock:
+            wait = boot_optional_rest_wait_sec()
+            if wait <= 0:
+                try:
+                    yield
+                finally:
+                    _last_boot_rest_mono = time.monotonic()
+                return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RateLimitError(
+                f"Boot REST slot timeout — {boot_optional_rest_wait_sec():.0f}s still blocked"
+            )
+        time.sleep(min(wait, remaining, 1.0))
 
 
 def is_optional_rest_blocked() -> bool:
@@ -1305,7 +1352,7 @@ def fetch_symbol_positions(symbol: str) -> dict[str, Position]:
         )
 
         watch_symbols([symbol])
-        # Never auto-flush here. Explicit post-order flush lives in ema_rsi trading paths only.
+        # Never auto-flush here. Explicit post-order flush lives in trading paths only.
         cached = get_symbol_positions_from_ws(symbol)
         if cached is not None:
             return cached

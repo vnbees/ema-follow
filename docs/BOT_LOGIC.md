@@ -1,10 +1,13 @@
-# Bot EMA200 + RSI swing (USDT-M)
+ 
+# Bot RSI-anchor mean reversion (USDT-M)
 
-Bot chạy vòng **5 phút**, chiến lược **một chiều** (long hoặc short), tín hiệu **EMA200 + RSI swing** trên nến **5m**, thoát bằng **SL/TP algo** (RR 1:2).
+Bot chạy vòng **5 phút**, chiến lược **RSI reversion** trên nến **5m**: khi RSI14 **vừa vào** vùng 70 / 30 / 48–52, lưu **anchor = close** nến đó; khi giá **rời 0.5%** thì vào **LONG hoặc SHORT** (song song, stack lot). Thoát: **TP về anchor ± 0.25%**, **BE sau 7 ngày**, **timeout 30 ngày**.
 
-Hỗ trợ **Bitget** hoặc **Binance** USDT-M qua `EXCHANGE=bitget|binance`.
+Version hiện tại trade **LINKUSDT, SUIUSDT, WLDUSDT, HYPEUSDT**. Env `RSI_REV_SYMBOLS` (comma-separated).
 
-**Entry point:** `python -m src.main` → `src/ema_rsi/cycle.py`
+Hỗ trợ **Bitget** hoặc **Binance** USDT-M qua `EXCHANGE=bitget|binance`. Binance ưu tiên **WebSocket** (kline 5m, mark price, user-data); REST chỉ khi cache thiếu (listenKey / warmup nến / equity fallback) hoặc đặt lệnh.
+
+**Entry point:** `python -m src.main` → `src/rsi_rev/cycle.py`
 
 ---
 
@@ -25,206 +28,140 @@ Code: [`src/exchange/`](src/exchange/) — facade; Bitget bọc [`src/bitget_cli
 
 ```mermaid
 flowchart TB
-    main["main.py → ema_rsi/cycle.py"]
-    main --> ws["Binance WS (optional)"]
-    main --> scan["Volume rank scan"]
-    main --> entry["open_signal — market + SL/TP algo"]
-    main --> watcher["watcher.py — đóng lệnh"]
-    entry --> db["ema_rsi_trades SQLite"]
+    main["main.py → rsi_rev/cycle.py"]
+    main --> ws["Binance WS kline + mark + user"]
+    main --> entry["try_open — market hedge"]
+    main --> watcher["watcher.py — TP / BE 7d / timeout 30d"]
+    entry --> db["rsi_rev_lots + rsi_rev_pending"]
     main --> web["Dashboard :8080"]
     watcher --> db
 ```
 
 | Module | Vai trò |
 |--------|---------|
-| `src/ema_rsi/cycle.py` | Vòng 5m: scan, mở lệnh, log balance/equity |
-| `src/ema_rsi/signals.py` | EMA cross + RSI zone, tính SL/TP |
-| `src/ema_rsi/trading.py` | Mở/đóng, sizing, algo SL/TP, orphan reconcile |
-| `src/ema_rsi/watcher.py` | Theo dõi fill SL/TP qua WS + REST confirm |
-| `src/ema_rsi/store.py` | SQLite `ema_rsi_trades`, dedupe signal |
-| `src/exchange/` | REST + WS, hedge orders, algo orders |
-| `src/web/app.py` | Dashboard EMA-RSI |
+| `src/rsi_rev/cycle.py` | Vòng 5m: WS kline LINK, pending, mở hết tín hiệu nến, log equity |
+| `src/rsi_rev/signals.py` | RSI14 event 70/30/50, trigger rời 0.5%, thứ tự thoát |
+| `src/rsi_rev/trading.py` | Market open hedge; size 0.5% equity × 10x; skip nếu thiếu số dư; reduce-only đóng lot |
+| `src/rsi_rev/watcher.py` | Mark WS mỗi 2s: TP / BE sau 7 ngày / timeout 30 ngày |
+| `src/rsi_rev/store.py` | SQLite `rsi_rev_pending` + `rsi_rev_lots` |
+| `src/rsi_rev/candles.py` | WS kline 5m; REST warmup nền nếu cache < ~20 nến, cách nhau `REST_BOOT_GAP_SEC` |
+| `src/exchange/` | REST + WS, hedge orders |
+| `src/web/app.py` | Dashboard RSI-rev |
 
 ---
 
 ## 2. Tín hiệu vào lệnh
 
-**Khung:** nến 5m đã đóng.
+Nguồn sự thật: backtest [`scripts/backtest_link_rsi_reversion_parallel.py`](../scripts/backtest_link_rsi_reversion_parallel.py).
 
-**Long:**
-1. Trong cùng swing trước đó, RSI(14) đã **< 25**
-2. Nến hiện tại **đóng cửa cắt lên** EMA200 (cross up)
-3. SL = **đáy thấp nhất** trong vùng RSI < 25
-4. TP = entry + 2×R (RR 1:2)
+```mermaid
+flowchart TD
+    kline["Nến 5m đóng WS"] --> rsi["RSI14 cross vào 70 / 30 / 48-52"]
+    rsi --> anchor["Pending: close = anchor"]
+    anchor --> leave{"Giá rời xa 0.5%"}
+    leave -->|"high >= anchor * 1.005"| short["Market SHORT"]
+    leave -->|"low <= anchor * 0.995"| long["Market LONG"]
+    short --> hold["Lot độc lập trong DB"]
+    long --> hold
+    hold --> tp{"Mark chạm TP = anchor ± 0.25%"}
+    tp -->|có| closeTp["Reduce-only đóng lot"]
+    tp -->|"sau 7 ngày chưa TP"| be{"Mark về entry"}
+    be -->|có| closeBe["Đóng BE trừ phí"]
+    be -->|"sau 30 ngày"| closeAge["Đóng market"]
+```
 
-**Short:** đối xứng — RSI **> 75**, cross **xuống** EMA200, SL = **đỉnh cao nhất** vùng RSI > 75.
+Quy tắc:
 
-**Bỏ qua nếu:**
-- SL sai phía (long: SL ≥ entry; short: SL ≤ entry)
-- Symbol đã có position (DB hoặc sàn)
-- Đạt `EMA_RSI_MAX_OPEN` (mặc định 20)
-- Signal candle đã xử lý (`ema_rsi_seen_signals`)
-- **Entry confirm fail:** WS kline chưa fresh → bắt buộc REST klines; signal không khớp sau confirm → skip (`signal_mismatch`, `candles_unconfirmed`, …)
-
----
-
-## 3. Sizing
-
-| Bước | Công thức |
-|------|-----------|
-| Equity | REST `/fapi/v2/account` mỗi lần vào lệnh (không dùng cache WS) |
-| Margin | `max(MIN, equity × EMA_RSI_MARGIN_PCT / 100)` — mặc định **1%** |
-| Notional | `margin × LEVERAGE` |
-| Size | `notional / entry` (làm tròn theo contract spec) |
-
-Mặc định: `LEVERAGE=10`, `EMA_RSI_MARGIN_PCT=1` → equity 1000 USDT → margin 10 USDT → notional 100 USDT.
+- Cả **3 vùng RSI** cùng chạy; long và short **song song**; mỗi tín hiệu rời 0.5% đều vào lệnh (stack lot).
+- Event chỉ trên **nến đóng vừa rồi** (không lookahead).
+- Cùng nến: **TP > BE**; BE chỉ sau 7 ngày; timeout 30 ngày đóng theo giá hiện tại.
+- **Không** đặt SL cứng / algo SL-TP trên net position (sẽ cắt nhầm lot khác).
 
 ---
 
-## 4. Thực thi lệnh
+## 3. Sizing và giới hạn
 
-1. `configure_symbol_trading` — cross margin + leverage
-2. Market open (long hoặc short, hedge mode)
-3. Đặt **STOP_MARKET** (SL) và **TAKE_PROFIT_MARKET** (TP) qua `/fapi/v1/algoOrder`
-4. Ghi DB + Discord notify mở lệnh
+| | Live (khớp backtest) |
+|---|----------------------|
+| Margin / lệnh | `0.5% equity hiện tại` (`RSI_REV_MARGIN_PCT`) |
+| Leverage | 10x |
+| Max lot đang mở | `RSI_REV_MAX_OPEN=0` = không cap |
+| Lệnh mới / nến 5m | `RSI_REV_ENTRIES_PER_CYCLE=0` = hết tín hiệu trong nến |
+| Thiếu số dư | **bỏ qua** lệnh (`cap_skip`), **không** giảm size; pending giữ lại |
 
-**Một symbol = một vị thế** — không stack, không flip.
+Binance USDT-M hedge: 1 net LONG + 1 net SHORT / symbol. Nhiều lot = cộng dồn position. Đóng từng lot bằng **reduce-only** đúng `size` của lot.
 
----
-
-## 5. Đóng lệnh (watcher)
-
-Thread riêng (`EMA_RSI_WATCHER_INTERVAL_SEC`, mặc định 2s):
-
-- Chỉ đóng DB khi **REST xác nhận position flat** (tránh false close từ WS stale)
-- SL/TP algo phải **filled** (không coi `triggered` là đóng xong)
-- Hủy lệnh còn lại (TP khi hit SL, SL khi hit TP) sau khi position thật sự flat
-- **Orphan reconcile:** nếu DB closed nhưng sàn còn position → reopen + đặt lại SL/TP thiếu
-
-Discord notify khi hit SL / TP / invalid SL.
-
-**Discord lỗi** (`notify_error`, cooldown 180s / context; REST ban 900s):
-- Cycle 5m crash, watcher crash
-- Mở lệnh fail, equity REST = 0, SL/TP algo fail, flatten fail
-- Restore SL/TP fail, re-adopt orphan
-- Volume rank fail / empty, WS start fail, kline WS không connect
-- REST 418/429 ban, fill order không resolve được
-- Binance WS disconnect lâu
+Ví dụ equity 1000 USDT: 1 lệnh khóa **5 USDT** margin, notional **50 USDT**.
 
 ---
 
-## 6. Cycle 5 phút
+## 4. WS-first / rate limit
 
-1. Refresh volume rank (top USDT perpetuals)
-2. Sync WS klines cho symbol đang mở + top scan
-3. `reconcile_orphan_positions()` + `reconcile_open_trades()`
-4. Scan top-N coin (mặc định 50) **chỉ qua WS** — bỏ qua symbol chưa `kline_fresh`; không REST klines khi scan
-5. Trước mở lệnh: **REST confirm nến** chỉ khi có signal và WS kline chưa fresh (tối đa 3 REST/cycle)
-6. Log balance + ghi `equity_snapshots`
-
-**Startup:** chờ miniTicker + kline WS connect, pre-subscribe top scan symbols (~2s) trước cycle đầu.
-
-Sleep đến mốc 5 phút tiếp theo.
+- Subscribe `{symbol}@kline_5m` cho từng coin trong `RSI_REV_SYMBOLS` + `!markPrice@arr@1s` + user data.
+- **Không** scan top 50, **không** `refresh_volume_rank` mỗi cycle.
+- Cycle đầu: skip REST reconcile.
+- Boot: **không** chặn REST 10 phút. Optional REST (listenKey nếu chưa có file, kline warmup nếu thiếu nến, account nếu chưa có disk) **cách nhau 60s** (`REST_BOOT_GAP_SEC`) và **skip khi weight ≥ 800**. Critical order không chờ gap.
+- Equity: cache user-stream nếu fresh; REST `/fapi/v2/account` chỉ khi cache stale **và** không `is_optional_rest_blocked`.
+- Watcher **không** poll REST klines; dùng mark WS. REST position chỉ khi lệch size DB vs sàn.
+- `set_watched_symbols(RSI_REV_SYMBOLS)` — hiện LINK, SUI, WLD, HYPE.
 
 ---
 
-## 7. Binance WebSocket
+## 5. Dashboard / Discord
 
-`BINANCE_WS_ENABLED=true` (mặc định):
+Dashboard ([`src/web/app.py`](../src/web/app.py)):
 
-| Stream | Dùng cho |
-|--------|----------|
-| `!miniTicker@arr` | Volume rank |
-| `!markPrice@arr@1s` | Mark price dashboard + unrealized PnL |
-| `{symbol}@kline_5m` | Tín hiệu (ưu tiên WS, fallback REST) |
-| User data stream | Position/order updates, fill detection |
+- Số lệnh mở / đóng, pending anchors, unrealized (mark WS), realized.
+- Bảng lệnh mở: symbol, side, vùng RSI, anchor, entry, target TP, mark, PnL, tuổi, trạng thái thoát (`chờ TP` / `sau 7 ngày: chờ BE về entry` / `gần 30 ngày`).
+- Thống kê theo **ngày VN**, ngày mới nhất trên cùng.
+- Phân trang riêng open/closed; trang 1 = mới nhất. `GET /api/rsi-rev/trades?status=open|closed&page=&page_size=` và `GET /api/rsi-rev/daily?days=30`.
 
-REST vẫn dùng cho: đặt lệnh, algo SL/TP, equity sizing, confirm position flat.
+Discord: mỗi lot **mở** (anchor + target + size) và **đóng** với lý do `TP về vùng RSI` | `Break-even sau 7 ngày` | `Timeout 30 ngày`. Fail-soft. Không REST fetch balance trong notify nếu cache WS fresh. **Lỗi runtime** (cycle, watcher, uncaught exception, ERROR log) cũng notify Discord (`Bot lỗi: …`).
 
 ---
 
-## 8. Dashboard (`WEB_PORT=8080`)
+## 6. SQLite
 
-- Bảng lệnh EMA-RSI (open + closed)
-- Summary PnL (unrealized / realized)
-- Biểu đồ equity (24h / 7d / 30d)
-- Start/Stop trading
-- Đăng nhập bắt buộc (`DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD`)
+| Bảng | Việc |
+|------|------|
+| `rsi_rev_pending` | Setup chờ rời 0.5%; unique `(symbol, anchor_ts, zone)` |
+| `rsi_rev_lots` | Lot mở/đóng (anchor, zone, entry, tp, side, size) |
+| `rsi_rev_skips` | Skip hết số dư / max open |
+| `equity_snapshots` | Chart equity dashboard |
 
-API:
-- `GET /api/status` — account + trades
-- `GET /api/ema-rsi/trades`
-- `GET /api/equity-history?range=24h|7d|30d`
+`clear_dashboard_history()` — xóa lịch sử RSI-rev + equity chart (không đóng vị thế sàn).
 
 ---
 
-## 9. Database
+## 7. Env chính
 
-| Bảng | Mục đích |
-|------|----------|
-| `ema_rsi_trades` | Lệnh bot (entry, sl, tp, status, pnl, order ids) |
-| `ema_rsi_seen_signals` | Dedupe signal theo (symbol, signal_ts) |
-| `equity_snapshots` | Chart equity mỗi cycle |
-| `settings` | `trading_enabled`, baseline equity |
-
-`clear_dashboard_history()` — xóa lịch sử EMA-RSI + equity chart (không đóng vị thế sàn).
-
----
-
-## 10. Config `.env`
-
-```env
+```
 EXCHANGE=binance
-BINANCE_API_KEY=
-BINANCE_SECRET_KEY=
-BINANCE_WS_ENABLED=true
-
-TRADING_ENABLED=true
+SYMBOL=LINKUSDT
+RSI_REV_SYMBOLS=LINKUSDT,SUIUSDT,WLDUSDT,HYPEUSDT
+RSI_REV_MARGIN_PCT=0.5
 LEVERAGE=10
-
-# EMA-RSI strategy
-EMA_RSI_EMA_PERIOD=200
-EMA_RSI_RSI_PERIOD=14
-EMA_RSI_RSI_LOW=25
-EMA_RSI_RSI_HIGH=75
-EMA_RSI_RR=2
-EMA_RSI_MARGIN_PCT=1
-EMA_RSI_MAX_OPEN=20
-EMA_RSI_SCAN_LIMIT=50
-EMA_RSI_ENTRIES_PER_CYCLE=3
-EMA_RSI_WATCHER_INTERVAL_SEC=2
-
+RSI_REV_MAX_OPEN=0
+RSI_REV_ENTRIES_PER_CYCLE=0
+RSI_REV_MOVE_AWAY_PCT=0.005
+RSI_REV_ZONE_PCT=0.0025
+RSI_REV_BE_AFTER_HOURS=168
+RSI_REV_MAX_AGE_DAYS=30
 GRANULARITY=5m
 INTERVAL_MINUTES=5
-MIN_LISTING_AGE_DAYS=30
-
-# Dashboard
-WEB_PORT=8080
-DASHBOARD_USERNAME=
-DASHBOARD_PASSWORD=
-DASHBOARD_SESSION_SECRET=
-DASHBOARD_COOKIE_SECURE=true
-
-# Discord
-DISCORD_WEBHOOK_URL=
-
-DATABASE_PATH=data/bot.db
+TRADING_ENABLED=true
 ```
 
 ---
 
-## 11. File tham chiếu
+## 8. File map
 
-| File | Nội dung |
-|------|----------|
-| `src/main.py` | Entry → `ema_rsi.cycle.main()` |
-| `src/ema_rsi/cycle.py` | Vòng lặp 5m |
-| `src/ema_rsi/signals.py` | Logic EMA + RSI zone |
-| `src/ema_rsi/trading.py` | Open/close, sizing, protective orders |
-| `src/ema_rsi/watcher.py` | SL/TP fill detection |
-| `src/ema_rsi/store.py` | SQLite schema + CRUD |
-| `src/exchange/binance.py` | Algo orders, REST |
-| `src/exchange/binance_ws/` | WS cache |
-| `src/exchange/fills.py` | `resolve_order_fill` |
-| `src/database.py` | Settings + equity snapshots |
-| `src/web/app.py` | Dashboard |
+| File | Việc |
+|------|------|
+| `src/main.py` | Entry → `rsi_rev.cycle.main()` |
+| `src/rsi_rev/cycle.py` | Vòng lặp 5m |
+| `src/rsi_rev/signals.py` | RSI event + trigger + thứ tự thoát |
+| `src/rsi_rev/trading.py` | Open/close, sizing, skip hết số dư |
+| `src/rsi_rev/watcher.py` | Mark WS TP/BE/timeout |
+| `src/rsi_rev/store.py` | SQLite schema + CRUD |
+| `src/web/app.py` | Dashboard + API |

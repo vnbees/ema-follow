@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
 import requests
@@ -62,61 +63,104 @@ def _fmt_px(value: float) -> str:
     return f"{value:.6f}".rstrip("0").rstrip(".")
 
 
-def notify_ema_rsi_open(
+def _hold_label(opened_at: str) -> str:
+    raw = (opened_at or "").strip()
+    if not raw:
+        return "—"
+    try:
+        from datetime import datetime, timezone
+
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        hours = max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0)
+    except ValueError:
+        return "—"
+    if hours < 24:
+        return f"{hours:.1f}h"
+    return f"{hours / 24:.1f}d"
+
+
+def notify_rsi_rev_open(
     symbol: str,
     side: str,
     *,
+    zone: str,
+    anchor: float,
     entry: float,
-    sl: float,
     tp: float,
-    r: float,
-    rr: float,
+    size: float,
     margin_usdt: float,
 ) -> None:
-    """Discord when EMA-RSI trade is opened. Fail-soft."""
+    """Discord when an RSI-rev lot is opened. Fail-soft. No REST balance fetch."""
     try:
         if not discord_configured():
             logging.debug("Discord notify skipped: DISCORD_WEBHOOK_URL not set")
             return
-        title = f"{symbol.upper()} {side.upper()} mở"
+        title = f"{symbol.upper()} {side.upper()} mở — {zone}"
         body = (
+            f"anchor={_fmt_px(anchor)}\n"
             f"entry={_fmt_px(entry)}\n"
-            f"SL={_fmt_px(sl)}\n"
-            f"TP={_fmt_px(tp)}\n"
-            f"R={_fmt_px(r)}  RR=1:{rr:g}\n"
-            f"margin={margin_usdt:.2f} USDT"
+            f"target TP={_fmt_px(tp)}\n"
+            f"size={size:g}  margin={margin_usdt:.2f} USDT"
         )
         _send_discord(title, body)
     except Exception as exc:  # noqa: BLE001
-        logging.warning("Discord notify_ema_rsi_open failed: %s", exc)
+        logging.warning("Discord notify_rsi_rev_open failed: %s", exc)
 
 
-def notify_ema_rsi_close(
+def notify_rsi_rev_close(
     symbol: str,
     side: str,
     *,
     reason: str,
+    zone: str,
+    anchor: float,
     entry: float,
-    sl: float,
     tp: float,
     close_price: float,
     pnl_usdt: float,
+    opened_at: str = "",
 ) -> None:
-    """Discord when EMA-RSI SL/TP (or invalid-SL flatten) hits. Fail-soft."""
+    """Discord when an RSI-rev lot is closed. Fail-soft. No REST balance fetch."""
     try:
         if not discord_configured():
             logging.debug("Discord notify skipped: DISCORD_WEBHOOK_URL not set")
             return
-        label = reason.replace("_", " ").strip()
-        title = f"{symbol.upper()} {side.upper()} đóng — {label}"
-        pnl_s = f"{pnl_usdt:+.2f}"
+        title = f"{symbol.upper()} {side.upper()} đóng — {reason}"
+        pnl_pct = ((close_price - entry) / entry * 100) if entry else 0.0
+        if side.lower() == "short":
+            pnl_pct = -pnl_pct
         body = (
-            f"entry={_fmt_px(entry)}  SL={_fmt_px(sl)}  TP={_fmt_px(tp)}\n"
-            f"close={_fmt_px(close_price)}  pnl={pnl_s} USDT"
+            f"vùng RSI: {zone}\n"
+            f"anchor={_fmt_px(anchor)}  entry={_fmt_px(entry)}  target TP={_fmt_px(tp)}\n"
+            f"đóng={_fmt_px(close_price)}\n"
+            f"pnl={pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}%)\n"
+            f"giữ {_hold_label(opened_at)}"
         )
         _send_discord(title, body)
     except Exception as exc:  # noqa: BLE001
-        logging.warning("Discord notify_ema_rsi_close failed: %s", exc)
+        logging.warning("Discord notify_rsi_rev_close failed: %s", exc)
+
+
+_NOISY_LOGGERS = frozenset({"uvicorn", "uvicorn.error", "asyncio", "httpx", "urllib3", "websockets"})
+
+
+class DiscordErrorLogHandler(logging.Handler):
+    """Forward ERROR+ logs to Discord. Fail-soft; cooldown per logger name."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.levelno < logging.ERROR:
+            return
+        root = (record.name or "root").split(".", 1)[0]
+        if record.name in _NOISY_LOGGERS or root in _NOISY_LOGGERS:
+            return
+        if getattr(record, "skip_discord", False):
+            return
+        try:
+            notify_error(record.name or "error", self.format(record))
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def notify_error(context: str, detail: str, *, cooldown_sec: float | None = None) -> None:
@@ -140,6 +184,42 @@ def notify_error(context: str, detail: str, *, cooldown_sec: float | None = None
         try:
             _send_discord(title, body)
         except Exception as exc:  # noqa: BLE001 — fail-soft
-            logging.warning("Discord notify send failed: %s", exc)
-    except Exception as exc:  # noqa: BLE001 — never break trading
-        logging.warning("Discord notify_error failed: %s", exc)
+            logging.warning("Discord notify send failed: %s", exc, extra={"skip_discord": True})
+    except Exception as extra_exc:  # noqa: BLE001 — never break trading
+        logging.warning("Discord notify_error failed: %s", extra_exc, extra={"skip_discord": True})
+
+
+def install_error_hooks() -> None:
+    """Discord on uncaught exceptions (main + threads) and ERROR logs."""
+    import sys
+    import traceback
+
+    root = logging.getLogger()
+    if not any(isinstance(h, DiscordErrorLogHandler) for h in root.handlers):
+        handler = DiscordErrorLogHandler(level=logging.ERROR)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        root.addHandler(handler)
+
+    def _hook(exc_type, exc, tb) -> None:
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        detail = "".join(traceback.format_exception(exc_type, exc, tb))[-1500:]
+        notify_error("uncaught", f"{exc_type.__name__}: {exc}\n{detail}", cooldown_sec=30)
+        sys.__excepthook__(exc_type, exc, tb)
+
+    def _thread_hook(args) -> None:
+        if args.exc_type is None or issubclass(args.exc_type, KeyboardInterrupt):
+            return
+        name = args.thread.name if args.thread else "thread"
+        detail = "".join(
+            traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)
+        )[-1500:]
+        notify_error(
+            f"thread {name}",
+            f"{args.exc_type.__name__}: {args.exc_value}\n{detail}",
+            cooldown_sec=30,
+        )
+
+    sys.excepthook = _hook
+    threading.excepthook = _thread_hook

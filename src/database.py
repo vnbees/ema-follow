@@ -43,7 +43,7 @@ def init_db() -> None:
             );
             """
         )
-    from src.ema_rsi import store
+    from src.rsi_rev import store
 
     store.ensure_schema()
 
@@ -159,8 +159,13 @@ def prune_equity_snapshots(*, older_than_days: int = 90) -> int:
 
 
 def clear_dashboard_history(*, reset_baseline: bool = True) -> dict[str, int]:
-    """Delete EMA-RSI trade history and equity chart data."""
-    tables = ("ema_rsi_trades", "ema_rsi_seen_signals", "equity_snapshots")
+    """Delete RSI-rev trade history and equity chart data."""
+    tables = (
+        "rsi_rev_lots",
+        "rsi_rev_pending",
+        "rsi_rev_skips",
+        "equity_snapshots",
+    )
     counts: dict[str, int] = {}
     with get_connection() as conn:
         for table in tables:

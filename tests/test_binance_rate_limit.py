@@ -24,10 +24,14 @@ class TestBinanceRateLimit(unittest.TestCase):
         binance._boot_quiet_until_mono = 0.0
         binance._used_weight_1m = 0
         binance._used_weight_at_mono = 0.0
+        binance._last_boot_rest_mono = 0.0
         self._notify_patch = patch("src.notify.notify_error")
         self._notify_mock = self._notify_patch.start()
+        self._persist_patch = patch("src.exchange.binance._persist_rate_limit")
+        self._persist_patch.start()
 
     def tearDown(self) -> None:
+        self._persist_patch.stop()
         self._notify_patch.stop()
         binance._rate_limited_until_ms = 0.0
         binance._rate_limit_kind = "ban"
@@ -35,6 +39,7 @@ class TestBinanceRateLimit(unittest.TestCase):
         binance._boot_quiet_until_mono = 0.0
         binance._used_weight_1m = 0
         binance._used_weight_at_mono = 0.0
+        binance._last_boot_rest_mono = 0.0
 
     def test_418_ban_no_retry_and_cooldown(self) -> None:
         banned_until = int((time.time() + 300) * 1000)
@@ -139,6 +144,20 @@ class TestBinanceRateLimit(unittest.TestCase):
                 binance._public_get("/fapi/v1/ticker/24hr", {})
             mock_get.assert_not_called()
         binance._boot_quiet_until_mono = 0.0
+
+    def test_boot_quiet_zero_does_not_block(self) -> None:
+        binance.mark_boot_rest_quiet(0.0)
+        self.assertFalse(binance.is_boot_rest_quiet())
+        self.assertFalse(binance.is_optional_rest_blocked())
+
+    def test_boot_optional_rest_slot_enforces_gap(self) -> None:
+        with patch("src.config.REST_BOOT_GAP_SEC", 0.25):
+            with binance.boot_optional_rest_slot(timeout_sec=1.0):
+                pass
+            self.assertGreater(binance.boot_rest_gap_remaining_sec(), 0.05)
+            with self.assertRaises(binance.RateLimitError):
+                with binance.boot_optional_rest_slot(timeout_sec=0.0):
+                    pass
 
     def test_normal_error_still_retries(self) -> None:
         resp = _response(500, {"code": -1000, "msg": "Internal error"})

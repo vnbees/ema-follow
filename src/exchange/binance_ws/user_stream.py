@@ -135,12 +135,12 @@ def apply_user_payload(payload: dict[str, Any]) -> None:
             except Exception:  # noqa: BLE001
                 pass
             try:
-                from src.ema_rsi.watcher import on_position_flat
+                from src.rsi_rev.watcher import on_position_flat
 
                 for symbol, side in closed:
                     on_position_flat(symbol, side)
             except Exception as exc:  # noqa: BLE001
-                logging.debug("EMA-RSI position-flat hook skipped: %s", exc)
+                logging.debug("RSI-rev position-flat hook skipped: %s", exc)
         # ACCOUNT_UPDATE "wb" is wallet balance, NOT margin equity / available.
         # Overwriting those fields skewed dashboard + equity snapshots. Keep the
         # last REST-reconciled balance; positions above are still applied.
@@ -170,11 +170,11 @@ def apply_user_payload(payload: dict[str, Any]) -> None:
                 [o for o in existing if o.order_id != str(detail.get("orderId"))],
             )
         try:
-            from src.ema_rsi.watcher import on_order_update
+            from src.rsi_rev.watcher import on_order_update
 
             on_order_update(detail)
         except Exception as exc:  # noqa: BLE001
-            logging.debug("EMA-RSI order-update hook skipped: %s", exc)
+            logging.debug("RSI-rev order-update hook skipped: %s", exc)
 
 
 class UserStream:
@@ -218,10 +218,10 @@ class UserStream:
 
                 # Persisted listenKey can reconnect over WS without REST create.
                 has_key = bool(load_listen_key())
-                wait = 0.0 if has_key else binance_mod.optional_rest_blocked_sec()
+                wait = 0.0 if has_key else binance_mod.boot_optional_rest_wait_sec()
                 if wait > 0:
                     logging.warning(
-                        "Binance user WS waiting %.0fs for rate-limit cooldown before listenKey",
+                        "Binance user WS waiting %.0fs before listenKey REST (gap/weight/cooldown)",
                         wait,
                     )
                     end = asyncio.get_running_loop().time() + wait + 2.0

@@ -83,7 +83,7 @@ def resolve_order_fill(
                 fallback_price,
             )
             notify_error(
-                f"EMA-RSI fill {symbol}",
+                f"order fill {symbol}",
                 f"No orderId — using fallback {fallback_price:.6f}",
             )
             return fallback_price
@@ -129,7 +129,7 @@ def resolve_order_fill(
                     exc,
                 )
                 notify_error(
-                    f"EMA-RSI fill {symbol}",
+                    f"order fill {symbol}",
                     f"Fill poll failed for order {order_id}: {exc}",
                 )
 
@@ -154,7 +154,7 @@ def resolve_order_fill(
             fallback_price,
         )
         notify_error(
-            f"EMA-RSI fill {symbol}",
+            f"order fill {symbol}",
             f"Order {order_id} fill unknown — using price fallback {fallback_price:.6f}",
         )
         return fallback_price

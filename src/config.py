@@ -222,8 +222,10 @@ REST_BAN_RESUME_SEC = float(os.getenv("REST_BAN_RESUME_SEC", "900"))
 REST_BAN_RESUME_GAP_SEC = float(os.getenv("REST_BAN_RESUME_GAP_SEC", "5"))
 # Always serialize REST so TP + listenKey + spot cannot hit Binance in the same instant.
 REST_SERIAL_GAP_SEC = float(os.getenv("REST_SERIAL_GAP_SEC", "0.25"))
-# After deploy/restart: block optional REST this long (WS/disk only). Critical orders still allowed.
-REST_BOOT_QUIET_SEC = float(os.getenv("REST_BOOT_QUIET_SEC", "600"))
+# Blanket optional-REST pause after start. 0 = off (prefer gap + weight). Set 600 only on a hot 418 IP.
+REST_BOOT_QUIET_SEC = float(os.getenv("REST_BOOT_QUIET_SEC", "0"))
+# Min seconds between optional *boot* REST (listenKey create, kline warmup, cold account).
+REST_BOOT_GAP_SEC = float(os.getenv("REST_BOOT_GAP_SEC", "60"))
 # USDT-M futures IP weight / minute (Binance). Header X-MBX-USED-WEIGHT-1M.
 REST_WEIGHT_LIMIT_1M = int(os.getenv("REST_WEIGHT_LIMIT_1M", "2400"))
 # Skip optional REST at this used weight (leave headroom for shared Railway IPs).
