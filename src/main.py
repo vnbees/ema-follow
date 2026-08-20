@@ -1,7 +1,7 @@
 def main() -> None:
-    from src.rsi_rev.cycle import main as rsi_rev_main
+    from src.donchian.cycle import main as donchian_main
 
-    rsi_rev_main()
+    donchian_main()
 
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ templates.env.filters["vn_time"] = format_vn_time
 templates.env.filters["dash_price"] = format_dashboard_price
 templates.env.filters["dash_pnl"] = format_dashboard_pnl
 
-app = FastAPI(title=f"{EXCHANGE_DISPLAY_NAME} RSI Reversion Bot Dashboard")
+app = FastAPI(title=f"{EXCHANGE_DISPLAY_NAME} Donchian Trend Bot Dashboard")
 
 _PUBLIC_PATHS = frozenset({"/login"})
 _SESSION_SECRET = DASHBOARD_SESSION_SECRET or secrets.token_urlsafe(48)
@@ -220,14 +220,12 @@ def _margin_mode_label() -> str:
 
 
 def _serialize_lot(row, marks: dict[str, float], *, now_ts: float) -> dict:
-    from src.rsi_rev import store
-    from src.rsi_rev.config import BE_AFTER_HOURS, MAX_AGE_DAYS
-    from src.rsi_rev.signals import ZONE_LABELS, exit_status_label, lot_age_hours
-    from src.rsi_rev.trading import realized_pnl
+    from src.donchian import store
+    from src.donchian.trading import realized_pnl
 
     symbol = str(row["symbol"])
     side = str(row["side"])
-    entry = float(row["entry"] or 0)
+    entry = float(row["entry_px"] or 0)
     size = float(row["size"] or 0)
     status = str(row["status"])
     margin = _row_float(row, "margin_usdt")
@@ -239,9 +237,9 @@ def _serialize_lot(row, marks: dict[str, float], *, now_ts: float) -> dict:
     closed_raw = str(row["closed_at"] or "") if status == "closed" else ""
     opened_epoch = _lot_opened_epoch(opened_raw) if opened_raw else 0.0
     closed_epoch = _lot_opened_epoch(closed_raw) if closed_raw else 0.0
-    age_h = lot_age_hours(opened_epoch, now_ts) if opened_raw else 0.0
     hold_end = closed_epoch if closed_epoch > 0 else now_ts
     duration_sec = max(0.0, hold_end - opened_epoch) if opened_epoch > 0 else 0.0
+    age_h = max(0.0, (now_ts - opened_epoch) / 3600) if opened_epoch > 0 else 0.0
     unreal = None
     roi_pct = None
     if status == "open" and mark > 0 and size > 0 and entry > 0:
@@ -251,32 +249,34 @@ def _serialize_lot(row, marks: dict[str, float], *, now_ts: float) -> dict:
         elif entry * size > 0:
             roi_pct = unreal / (entry * size) * 100
     closed_pnl = row["pnl_usdt"]
-    pnl_gross = row["pnl_gross_usdt"] if "pnl_gross_usdt" in row.keys() else None
     if status == "closed" and closed_pnl is not None and margin > 0:
         roi_pct = float(closed_pnl) / margin * 100
     elif status == "closed" and closed_pnl is not None and entry > 0 and size > 0:
         roi_pct = float(closed_pnl) / (entry * size) * 100
     reason = str(row["close_reason"] or "")
+    trend = str(row["trend"] or "")
+    tp_band = float(row["tp_band"] or 0)
     return {
         "id": int(row["id"]),
         "symbol": symbol,
         "side": side,
         "side_label": "Mua" if side == "long" else "Bán",
-        "zone": str(row["zone"] or ""),
-        "zone_label": ZONE_LABELS.get(str(row["zone"] or ""), str(row["zone"] or "")),
+        "trend": trend,
+        "trend_label": f"Trend {trend.upper()}" if trend else "—",
+        "zone": trend,
+        "zone_label": f"Trend {trend.upper()}" if trend else "—",
         "status": status,
         "status_label": "Đã đóng" if status == "closed" else "Đang mở",
         "margin_mode": _margin_mode_label(),
-        "anchor": float(row["anchor_price"] or 0),
         "entry": entry,
-        "tp": float(row["tp"] or 0),
+        "tp": tp_band,
+        "tp_band": tp_band,
         "size": size,
         "margin_usdt": margin,
-        "close_price": row["close_price"],
+        "close_price": row["close_px"] if "close_px" in row.keys() else None,
         "close_reason": reason,
         "close_reason_label": store.REASON_LABELS.get(reason, reason),
         "pnl_usdt": closed_pnl,
-        "pnl_gross_usdt": pnl_gross,
         "pnl_pct": roi_pct,
         "fee_open_usdt": fee_open,
         "fee_close_usdt": fee_close,
@@ -286,17 +286,15 @@ def _serialize_lot(row, marks: dict[str, float], *, now_ts: float) -> dict:
         "age_hours": age_h,
         "age_label": _lot_age_label(age_h),
         "duration_label": _duration_vi(duration_sec),
-        "exit_status": exit_status_label(age_h, BE_AFTER_HOURS, MAX_AGE_DAYS)
-        if status == "open"
-        else "",
+        "exit_status": f"TP band: {tp_band:.4f}" if status == "open" and tp_band > 0 else "",
         "opened_at": format_vn_time(opened_raw) if opened_raw else "",
         "closed_at": format_vn_time(closed_raw) if closed_raw else "",
     }
 
 
-def _rsi_rev_summary() -> dict:
-    from src.rsi_rev import store
-    from src.rsi_rev.trading import realized_pnl
+def _donchian_summary() -> dict:
+    from src.donchian import store
+    from src.donchian.trading import realized_pnl
 
     open_rows = store.get_open_lots()
     symbols = sorted({str(row["symbol"]) for row in open_rows})
@@ -309,7 +307,7 @@ def _rsi_rev_summary() -> dict:
             continue
         open_unrealized += realized_pnl(
             str(row["side"]),
-            float(row["entry"] or 0),
+            float(row["entry_px"] or 0),
             mark,
             float(row["size"] or 0),
         )
@@ -317,7 +315,7 @@ def _rsi_rev_summary() -> dict:
     return {
         "open_count": store.count_open(),
         "closed_count": store.count_closed(),
-        "pending_count": store.count_pending(),
+        "pending_count": 0,
         "summary": {
             "open_unrealized": open_unrealized,
             "closed_realized": closed_realized,
@@ -328,11 +326,11 @@ def _rsi_rev_summary() -> dict:
     }
 
 
-def _rsi_rev_trades_payload(*, status: str, page: int, page_size: int) -> dict:
-    from src.rsi_rev import store
+def _donchian_trades_payload(*, status: str, page: int, page_size: int) -> dict:
+    from src.donchian import store
 
     rows, total = store.list_lots_paged(status=status, page=page, page_size=page_size)
-    summary = _rsi_rev_summary()
+    summary = _donchian_summary()
     marks = summary["marks"]
     now_ts = summary["now_ts"]
     if status == "open":
@@ -350,28 +348,28 @@ def _rsi_rev_trades_payload(*, status: str, page: int, page_size: int) -> dict:
         "trades": [_serialize_lot(row, marks, now_ts=now_ts) for row in rows],
         "open_count": summary["open_count"],
         "closed_count": summary["closed_count"],
-        "pending_count": summary["pending_count"],
+        "pending_count": 0,
         "summary": summary["summary"],
     }
 
 
 def _dashboard_context() -> dict:
     account = get_account_balance()
-    open_payload = _rsi_rev_trades_payload(status="open", page=1, page_size=50)
-    closed_payload = _rsi_rev_trades_payload(status="closed", page=1, page_size=50)
-    from src.rsi_rev import store
+    open_payload = _donchian_trades_payload(status="open", page=1, page_size=50)
+    closed_payload = _donchian_trades_payload(status="closed", page=1, page_size=50)
+    from src.donchian import store
 
     daily = store.daily_stats(30)
     return {
         "exchange_name": EXCHANGE_DISPLAY_NAME,
-        "bot_title": "RSI Reversion",
+        "bot_title": "Donchian Trend",
         "account": account,
         "last_cycle_at": get_last_cycle_at(),
         "trading_enabled": is_trading_enabled(),
         "rsi_rev": {
             "open_count": open_payload["open_count"],
             "closed_count": open_payload["closed_count"],
-            "pending_count": open_payload["pending_count"],
+            "pending_count": 0,
             "summary": open_payload["summary"],
             "open_trades": open_payload["trades"],
             "closed_trades": closed_payload["trades"],
@@ -390,7 +388,7 @@ def dashboard(request: Request) -> HTMLResponse:
 @app.get("/api/status")
 def api_status() -> dict:
     account = get_account_balance()
-    rsi_rev = _rsi_rev_summary()
+    donchian = _donchian_summary()
     rate_limited = False
     rate_limit_remaining_sec = 0.0
     try:
@@ -411,10 +409,22 @@ def api_status() -> dict:
         },
         "trading_enabled": is_trading_enabled(),
         "last_cycle_at": format_vn_time(get_last_cycle_at()),
-        "rsi_rev": rsi_rev,
+        "rsi_rev": donchian,
         "rate_limited": rate_limited,
         "rate_limit_remaining_sec": rate_limit_remaining_sec,
     }
+
+
+@app.get("/api/donchian/trades")
+def api_donchian_trades(
+    status: str = Query(default="open"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=20, le=100),
+) -> dict:
+    kind = status.strip().lower()
+    if kind not in {"open", "closed"}:
+        kind = "open"
+    return _donchian_trades_payload(status=kind, page=page, page_size=page_size)
 
 
 @app.get("/api/rsi-rev/trades")
@@ -423,15 +433,24 @@ def api_rsi_rev_trades(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=20, le=100),
 ) -> dict:
+    """Alias kept for dashboard JS compatibility."""
     kind = status.strip().lower()
     if kind not in {"open", "closed"}:
         kind = "open"
-    return _rsi_rev_trades_payload(status=kind, page=page, page_size=page_size)
+    return _donchian_trades_payload(status=kind, page=page, page_size=page_size)
+
+
+@app.get("/api/donchian/daily")
+def api_donchian_daily(days: int = Query(default=30, ge=1, le=90)) -> dict:
+    from src.donchian import store
+
+    return {"days": days, "rows": store.daily_stats(days)}
 
 
 @app.get("/api/rsi-rev/daily")
 def api_rsi_rev_daily(days: int = Query(default=30, ge=1, le=90)) -> dict:
-    from src.rsi_rev import store
+    """Alias kept for dashboard JS compatibility."""
+    from src.donchian import store
 
     return {"days": days, "rows": store.daily_stats(days)}
 

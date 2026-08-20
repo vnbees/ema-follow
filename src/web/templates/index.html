@@ -97,8 +97,8 @@
       <div class="value" id="closedCount">{{ rsi_rev.closed_count }}</div>
     </div>
     <div class="summary-card">
-      <div class="label">Pending anchors</div>
-      <div class="value" id="pendingCount">{{ rsi_rev.pending_count }}</div>
+      <div class="label">Symbols scanned</div>
+      <div class="value" id="pendingCount">—</div>
     </div>
     <div class="summary-card">
       <div class="label">Unrealized PnL</div>
@@ -122,10 +122,7 @@
           <tr>
             <th>Ngày</th>
             <th>Vào</th>
-            <th>Đóng TP</th>
-            <th>BE 7 ngày</th>
-            <th>Timeout 30 ngày</th>
-            <th>Skip hết số dư</th>
+            <th>Đóng TP band</th>
             <th>PnL ngày</th>
           </tr>
         </thead>
@@ -135,13 +132,10 @@
             <td>{{ d.day }}</td>
             <td>{{ d.opened }}</td>
             <td>{{ d.tp }}</td>
-            <td>{{ d.be }}</td>
-            <td>{{ d.timeout }}</td>
-            <td>{{ d.skips }}</td>
             <td class="{% if d.pnl >= 0 %}green{% else %}red{% endif %}">{{ d.pnl | dash_pnl }}</td>
           </tr>
           {% else %}
-          <tr><td colspan="7" class="empty">Chưa có thống kê.</td></tr>
+          <tr><td colspan="4" class="empty">Chưa có thống kê.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -160,7 +154,7 @@
             <span class="pos-symbol">{{ t.symbol }}</span>
             <span class="pill">Vĩnh cửu</span>
             <span class="pill">{{ t.margin_mode }}</span>
-            <span class="pill">{{ t.zone_label }}</span>
+              <span class="pill">{{ t.trend_label or t.zone_label }}</span>
           </div>
           <span class="pos-status">{{ t.status_label }}</span>
         </div>
@@ -364,7 +358,7 @@
               <span class="pos-symbol">${t.symbol}</span>
               <span class="pill">Vĩnh cửu</span>
               <span class="pill">${t.margin_mode || ''}</span>
-              <span class="pill">${t.zone_label || t.zone || ''}</span>
+              <span class="pill">${t.trend_label || t.zone_label || t.zone || ''}</span>
             </div>
             <span class="pos-status">${t.status_label || (kind === 'open' ? 'Đang mở' : 'Đã đóng')}</span>
           </div>
@@ -417,17 +411,14 @@
         <tr>
           <td>${d.day}</td>
           <td>${d.opened}</td>
-          <td>${d.tp}</td>
-          <td>${d.be}</td>
-          <td>${d.timeout}</td>
-          <td>${d.skips}</td>
+          <td>${d.tp || 0}</td>
           <td class="${pnlClass(d.pnl)}">${fmtPnl(d.pnl)}</td>
         </tr>
       `).join('');
     }
 
     async function loadTrades(status, page) {
-      const res = await fetch('/api/rsi-rev/trades?status=' + status + '&page=' + page + '&page_size=' + pageSize);
+      const res = await fetch('/api/donchian/trades?status=' + status + '&page=' + page + '&page_size=' + pageSize);
       if (!res.ok) return null;
       return await res.json();
     }
@@ -436,7 +427,7 @@
       const [openData, closedData, dailyData] = await Promise.all([
         loadTrades('open', openPage),
         loadTrades('closed', closedPage),
-        fetch('/api/rsi-rev/daily?days=30').then(r => r.ok ? r.json() : null),
+        fetch('/api/donchian/daily?days=30').then(r => r.ok ? r.json() : null),
       ]);
       if (openData) {
         renderOpen(openData.trades || []);
@@ -466,6 +457,14 @@
         );
       }
       if (dailyData && dailyData.rows) renderDaily(dailyData.rows);
+    }
+
+    async function refreshDaily() {
+      const res = await fetch('/api/donchian/daily?days=30');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.rows) renderDaily(data.rows);
+      }
     }
 
     async function refreshStatus() {

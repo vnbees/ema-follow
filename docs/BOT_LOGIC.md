@@ -1,13 +1,8 @@
- 
-# Bot RSI-anchor mean reversion (USDT-M)
+# Bot Donchian Parallel-Trend (USDT-M)
 
-Bot chạy vòng **5 phút**, chiến lược **RSI reversion** trên nến **5m**: khi RSI14 **vừa vào** vùng 70 / 30 / 48–52, lưu **anchor = close** nến đó; khi giá **rời 0.5%** thì vào **LONG hoặc SHORT** (song song, stack lot). Thoát: **TP về anchor ± 0.25%**, **BE sau 7 ngày**, **timeout 30 ngày**.
+Bot chạy vòng **15 phút**, chiến lược **Donchian parallel-trend** trên nến **15m**: khi 2 band trên/dưới của Donchian Channel **chuyển từ song song sang không song song**, xác định xu hướng theo vị trí close so với band giữa; đợi nến ngược chiều → vào lệnh; thoát khi giá chạm band Donchian đối ứng.
 
-Version hiện tại trade **LINKUSDT, SUIUSDT, WLDUSDT, HYPEUSDT**. Env `RSI_REV_SYMBOLS` (comma-separated).
-
-Hỗ trợ **Bitget** hoặc **Binance** USDT-M qua `EXCHANGE=bitget|binance`. Binance ưu tiên **WebSocket** (kline 5m, mark price, user-data); REST chỉ khi cache thiếu (listenKey / warmup nến / equity fallback) hoặc đặt lệnh.
-
-**Entry point:** `python -m src.main` → `src/rsi_rev/cycle.py`
+**Entry point:** `python -m src.main` → `src/donchian/cycle.py`
 
 ---
 
@@ -15,12 +10,8 @@ Hỗ trợ **Bitget** hoặc **Binance** USDT-M qua `EXCHANGE=bitget|binance`. B
 
 | Env | Ý nghĩa |
 |-----|---------|
-| `EXCHANGE=bitget` | Bitget USDT-M |
 | `EXCHANGE=binance` | Binance USDT-M (`fapi.binance.com`) |
-| `BITGET_*` | API key Bitget (passphrase bắt buộc) |
 | `BINANCE_API_KEY` / `BINANCE_SECRET_KEY` | API key Binance Futures |
-
-Code: [`src/exchange/`](src/exchange/) — facade; Bitget bọc [`src/bitget_client.py`](../src/bitget_client.py); Binance tại [`src/exchange/binance.py`](../src/exchange/binance.py).
 
 ---
 
@@ -28,143 +19,184 @@ Code: [`src/exchange/`](src/exchange/) — facade; Bitget bọc [`src/bitget_cli
 
 ```mermaid
 flowchart TB
-    main["main.py → rsi_rev/cycle.py"]
-    main --> ws["Binance WS kline + mark + user"]
-    main --> entry["try_open — market hedge"]
-    main --> watcher["watcher.py — TP / BE 7d / timeout 30d"]
-    entry --> db["rsi_rev_lots + rsi_rev_pending"]
+    main["main.py → donchian/cycle.py"]
+    main --> ws["Binance WS kline 15m + markPrice + user"]
+    main --> scan["scan top-N symbols theo 24h volume"]
+    main --> entry["check_signal → open_lot"]
+    main --> watcher["donchian/watcher.py — TP khi chạm band"]
+    entry --> db["donchian_lots + donchian_state"]
     main --> web["Dashboard :8080"]
     watcher --> db
 ```
 
 | Module | Vai trò |
 |--------|---------|
-| `src/rsi_rev/cycle.py` | Vòng 5m: WS kline LINK, pending, mở hết tín hiệu nến, log equity |
-| `src/rsi_rev/signals.py` | RSI14 event 70/30/50, trigger rời 0.5%, thứ tự thoát |
-| `src/rsi_rev/trading.py` | Market open hedge; size 0.5% equity × 10x; skip nếu thiếu số dư; reduce-only đóng lot |
-| `src/rsi_rev/watcher.py` | Mark WS mỗi 2s: TP / BE sau 7 ngày / timeout 30 ngày |
-| `src/rsi_rev/store.py` | SQLite `rsi_rev_pending` + `rsi_rev_lots` |
-| `src/rsi_rev/candles.py` | WS kline 5m; REST warmup nền nếu cache < ~20 nến, cách nhau `REST_BOOT_GAP_SEC` |
-| `src/exchange/` | REST + WS, hedge orders |
-| `src/web/app.py` | Dashboard RSI-rev |
+| `src/donchian/cycle.py` | Vòng 15m: scan top-N symbols, detect signal, mở lệnh |
+| `src/donchian/signals.py` | Donchian bands, parallel flag, check_signal per symbol |
+| `src/donchian/trading.py` | Market open/close; size 0.5% equity × 10x |
+| `src/donchian/watcher.py` | Mark WS mỗi 2s: TP khi chạm band Donchian |
+| `src/donchian/store.py` | SQLite `donchian_lots` + `donchian_state` |
+| `src/exchange/` | REST + WS, rate limit, cache — giữ nguyên |
+| `src/web/app.py` | Dashboard Donchian |
 
 ---
 
-## 2. Tín hiệu vào lệnh
-
-Nguồn sự thật: backtest [`scripts/backtest_link_rsi_reversion_parallel.py`](../scripts/backtest_link_rsi_reversion_parallel.py).
+## 2. Logic tín hiệu
 
 ```mermaid
 flowchart TD
-    kline["Nến 5m đóng WS"] --> rsi["RSI14 cross vào 70 / 30 / 48-52"]
-    rsi --> anchor["Pending: close = anchor"]
-    anchor --> leave{"Giá rời xa 0.5%"}
-    leave -->|"high >= anchor * 1.005"| short["Market SHORT"]
-    leave -->|"low <= anchor * 0.995"| long["Market LONG"]
-    short --> hold["Lot độc lập trong DB"]
-    long --> hold
-    hold --> tp{"Mark chạm TP = anchor ± 0.25%"}
-    tp -->|có| closeTp["Reduce-only đóng lot"]
-    tp -->|"sau 7 ngày chưa TP"| be{"Mark về entry"}
-    be -->|có| closeBe["Đóng BE trừ phí"]
-    be -->|"sau 30 ngày"| closeAge["Đóng market"]
+    kline["Nến 15m đóng (WS)"] --> dc["Donchian(20): upper / middle / lower"]
+    dc --> slope["Slope chuẩn hoá upper & lower trong 5 nến"]
+    slope --> parallel{"|slope_upper - slope_lower| ≤ 0.015%/bar?"}
+    parallel -->|Có| wait["Bands song song — giữ nguyên trend state"]
+    parallel -->|Không| exit_check{"Trước đó là song song?"}
+    exit_check -->|Có, vừa thoát| trend["Xác định trend:\nclose > middle → UP\nclose ≤ middle → DOWN"]
+    exit_check -->|Không| entry_check
+    trend --> entry_check{"Trend đã có + đang waiting_entry?"}
+    entry_check -->|Có| counter{"Nến ngược chiều?\nTrend UP: close < open\nTrend DOWN: close > open"}
+    counter -->|Có + bands không song song| open["Vào lệnh market\nLONG (UP) / SHORT (DOWN)"]
+    counter -->|Bands vẫn song song| skip["Skip — chờ nến sau"]
+    open --> tp["Watcher realtime (2s):\nLong → high/mark ≥ upper hiện tại\nShort → low/mark ≤ lower hiện tại"]
+    tp --> close["Đóng reduce-only"]
 ```
 
-Quy tắc:
+**Quy tắc chi tiết:**
 
-- Cả **3 vùng RSI** cùng chạy; long và short **song song**; stack lot khi rời 0.5% **và** còn đủ room tới TP.
-- Event chỉ trên **nến đóng vừa rồi** (không lookahead).
-- Entry = **close** nến rời 0.5%. Nếu close đã **vượt TP** hoặc còn **< 0.12%** tới TP (`RSI_REV_MIN_TP_ROOM_PCT`) thì **không mở** — pending giữ, chờ nến sau (tránh đóng ngay, lãi bị phí ăn hết).
-- Cùng nến: **TP > BE**; BE chỉ sau 7 ngày; timeout 30 ngày đóng theo giá hiện tại.
-- **Không** đặt SL cứng / algo SL-TP trên net position (sẽ cắt nhầm lot khác).
+- Donchian period: **20 nến** · slope lookback: **5 nến** · parallel tolerance: **0.015 %/bar**
+- Trend được xác định tại nến **đầu tiên** sau khi bands thoát trạng thái song song.
+- `waiting_entry = True` sau khi xác định trend; reset khi vào lệnh hoặc khi có lệnh đang mở (`MAX_OPEN` đã đạt).
+- `tp_band` lưu band lúc **entry** (hiển thị / fallback nếu cache thiếu nến). Watcher thoát theo **Donchian đang chạy** giống backtest: long khi high/mark nến hiện tại ≥ **upper hiện tại**, short khi low/mark ≤ **lower hiện tại**. Không TP trên **nến vào lệnh** (giống backtest). Khác backtest: kiểm tra mỗi 2s trên nến đang chạy, **không** đợi đóng nến.
 
----
-
-## 3. Sizing và giới hạn
-
-| | Live (khớp backtest) |
-|---|----------------------|
-| Margin / lệnh | `0.5% equity hiện tại` (`RSI_REV_MARGIN_PCT`) |
-| Leverage | 10x |
-| Max lot đang mở | `RSI_REV_MAX_OPEN=0` = không cap |
-| Lệnh mới / nến 5m | `RSI_REV_ENTRIES_PER_CYCLE=0` = hết tín hiệu trong nến |
-| Thiếu số dư | **bỏ qua** lệnh (`cap_skip`), **không** giảm size; pending giữ lại |
-
-Binance USDT-M hedge: 1 net LONG + 1 net SHORT / symbol. Nhiều lot = cộng dồn position. Đóng từng lot bằng **reduce-only** đúng `size` của lot.
-
-Ví dụ equity 1000 USDT: 1 lệnh khóa **5 USDT** margin, notional **50 USDT**.
+**Khung nến:** `DONCHIAN_INTERVAL` (mặc định `15m`) **ghi đè** `GRANULARITY` / `INTERVAL_MINUTES`. WS kline, REST seed và stale-check phải cùng khung — nếu WS 5m mà bot tính 15m thì cache bị drop, Donchian sai.
+- Chỉ **1 lệnh mở / symbol tại 1 thời điểm** (MAX_OPEN global = 20).
+- Không có SL cứng; thoát khi giá chạm band Donchian **hiện tại**.
 
 ---
 
-## 4. WS-first / rate limit
+## 3. Sizing và phí
 
-- Subscribe `{symbol}@kline_5m` cho từng coin trong `RSI_REV_SYMBOLS` + `!markPrice@arr@1s` + user data.
-- **Không** scan top 50, **không** `refresh_volume_rank` mỗi cycle.
-- Cycle đầu: skip REST reconcile.
-- Boot: **không** chặn REST 10 phút. Optional REST (listenKey nếu chưa có file, kline warmup nếu thiếu nến, account nếu chưa có disk) **cách nhau 60s** (`REST_BOOT_GAP_SEC`) và **skip khi weight ≥ 800**. Critical order không chờ gap.
-- Equity: cache user-stream nếu fresh; REST `/fapi/v2/account` chỉ khi cache stale **và** không `is_optional_rest_blocked`.
-- Watcher **không** poll REST klines; dùng mark WS. REST position chỉ khi lệch size DB vs sàn.
-- `set_watched_symbols(RSI_REV_SYMBOLS)` — hiện LINK, SUI, WLD, HYPE.
+| | Giá trị |
+|---|---------|
+| Margin / lệnh | `0.5% equity hiện tại` (`DONCHIAN_MARGIN_PCT`) |
+| Leverage | `10x` |
+| Max lệnh mở đồng thời | `20` (`DONCHIAN_MAX_OPEN`) |
+| Phí taker Binance | `0.04%/chiều` |
 
----
-
-## 5. Dashboard / Discord
-
-Dashboard ([`src/web/app.py`](../src/web/app.py)):
-
-- Số lệnh mở / đóng, pending anchors, unrealized (mark WS), realized **đã trừ phí** (USDT commission từ user-stream `n`/`N`).
-- Lịch sử vị thế dạng thẻ giống Binance: Mua/Bán, Vĩnh cửu, Cross 10x, PnL đã ghi nhận, ROI (PnL / ký quỹ), khối lượng, giá vào/đóng TB, thời gian giữ. Lệnh mở hiện PnL chưa ghi nhận + mark.
-- Lot cũ (trước khi lưu phí) giữ PnL giá; lệnh mới trừ phí mở + phí đóng.
-- Thống kê theo **ngày VN**, ngày mới nhất trên cùng.
-- Phân trang riêng open/closed; trang 1 = mới nhất. `GET /api/rsi-rev/trades?status=open|closed&page=&page_size=` và `GET /api/rsi-rev/daily?days=30`.
-
-Discord: mỗi lot **mở** (anchor + target + size) và **đóng** với lý do `TP về vùng RSI` | `Break-even sau 7 ngày` | `Timeout 30 ngày`. Fail-soft. Không REST fetch balance trong notify nếu cache WS fresh. **Lỗi runtime** (cycle, watcher, uncaught exception, ERROR log) cũng notify Discord (`Bot lỗi: …`).
+**Công thức phí:**
+```
+phí ≈ 0.10% × vốn × đòn bẩy
+    = 2 × 0.04% × leverage × margin
+```
+Ví dụ equity 1000 USDT: margin = 5 USDT, notional = 50 USDT → phí ≈ 0.10% × 50 = **0.05 USDT/lệnh** (cả 2 chiều).
 
 ---
 
-## 6. SQLite
+## 4. Symbol scan động
+
+Thay vì hardcode, bot scan **tất cả USDT-M futures** theo 24h quote volume từ WS cache (`!miniTicker@arr`):
+
+- `DONCHIAN_TOP_N = 30` coin volume cao nhất
+- Loại trừ: stablecoin (USDC, BUSD, FDUSD…), leverage token (UP/DOWN/BULL/BEAR)
+- `set_watched_symbols(top_30)` → KlineStream tự subscribe/unsubscribe
+- Không tốn REST để scan — dùng `CACHE.quote_volumes` đã có từ AllMarketStream
+
+---
+
+## 5. Boot sequence & rate limit safety
+
+```
+main() →
+  init_db() + ensure_schema()
+  mark_boot_rest_quiet()          ← chặn optional REST trong REST_BOOT_QUIET_SEC
+  start_binance_ws()              ← AllMarket + Kline(top-30) + User stream
+  _wait_binance_ws_ready()        ← block 30s chờ kline WS connected
+  _start_boot_warmup(top_30)     ← daemon thread, tuần tự từng symbol
+                                    boot_optional_rest_slot: gap REST_BOOT_GAP_SEC
+                                    chỉ REST khi WS cache < 30 nến (DONCHIAN_PERIOD+LOOKBACK+5)
+  start_watcher()                 ← donchian watcher mỗi 2s
+  vòng lặp cycle 15m
+```
+
+**Rate limit protection (giữ nguyên từ bot cũ):**
+- Warmup REST tuần tự — `boot_optional_rest_slot()` serialize 1 request/lần + `REST_BOOT_GAP_SEC` gap
+- Trạng thái ban/grace persist vào disk, tự load khi restart
+- Scan candles trong cycle: **WS-only**, không REST
+- Critical orders (đặt/đóng lệnh) không bị block bởi rate limit
+
+---
+
+## 6. SQLite schema
 
 | Bảng | Việc |
 |------|------|
-| `rsi_rev_pending` | Setup chờ rời 0.5%; unique `(symbol, anchor_ts, zone)` |
-| `rsi_rev_lots` | Lot mở/đóng; `pnl_usdt` net sau phí; `fee_open_usdt` / `fee_close_usdt` |
-| `rsi_rev_skips` | Skip hết số dư / max open / TP room quá hẹp |
+| `donchian_lots` | Lot mở/đóng; `pnl_usdt` net sau phí |
+| `donchian_state` | Trend state per symbol (trend, trend_ts, waiting_entry) |
 | `equity_snapshots` | Chart equity dashboard |
 
-`clear_dashboard_history()` — xóa lịch sử RSI-rev + equity chart (không đóng vị thế sàn).
+```sql
+donchian_lots (
+  id, symbol, side, trend, trend_ts,
+  status ('open'|'closed'),
+  entry_ts, entry_px, tp_band,
+  size, margin_usdt, notional_usdt,
+  entry_order_id,
+  close_ts, close_px, close_reason,
+  pnl_usdt, fee_open_usdt, fee_close_usdt,
+  opened_at, closed_at
+)
+
+donchian_state (
+  symbol PK, trend, trend_ts, waiting_entry, updated_at
+)
+```
 
 ---
 
-## 7. Env chính
+## 7. Kết quả backtest
+
+Khung **15m**, **1 năm** (19/8/2025 → 19/8/2026), vốn 1000 USDT, sizing 0.5%/lệnh × 10x.
+
+| Coin | Thị trường | Lệnh/ngày | WR | PnL | % |
+|------|-----------|-----------|-----|-----|---|
+| LINKUSDT | -60% | 3.5 | 80% | +165.50 | +16.6% |
+| SUIUSDT | -81% | 3.4 | 80% | +226.62 | +22.7% |
+| DOGEUSDT | — | 3.4 | 79% | +150.34 | +15.0% |
+| SOLUSDT | — | 3.5 | 79% | +145.11 | +14.5% |
+
+- WR nhất quán **79–80%** trên cả 4 coin, qua cả bear trend -60 đến -81%
+- PnL/ngày TB: **+0.40–0.62 USDT** / 1000 USDT vốn (sizing bảo thủ)
+- Phí tổng 365 ngày: ~55 USDT (backtest script: `scripts/backtest_link_donchian_parallel_trend.py`)
+
+---
+
+## 8. Env vars
 
 ```
 EXCHANGE=binance
-SYMBOL=LINKUSDT
-RSI_REV_SYMBOLS=LINKUSDT,SUIUSDT,WLDUSDT,HYPEUSDT
-RSI_REV_MARGIN_PCT=0.5
+BINANCE_API_KEY=...
+BINANCE_SECRET_KEY=...
+
+DONCHIAN_PERIOD=20
+DONCHIAN_SLOPE_LB=5
+DONCHIAN_PARALLEL_TOL=0.015
+DONCHIAN_INTERVAL=15m
+DONCHIAN_MARGIN_PCT=0.005
+DONCHIAN_MAX_OPEN=20
+DONCHIAN_TOP_N=30
 LEVERAGE=10
-RSI_REV_MAX_OPEN=0
-RSI_REV_ENTRIES_PER_CYCLE=0
-RSI_REV_MOVE_AWAY_PCT=0.005
-RSI_REV_ZONE_PCT=0.0025
-RSI_REV_MIN_TP_ROOM_PCT=0.0012
-RSI_REV_BE_AFTER_HOURS=168
-RSI_REV_MAX_AGE_DAYS=30
-GRANULARITY=5m
-INTERVAL_MINUTES=5
 TRADING_ENABLED=true
 ```
 
 ---
 
-## 8. File map
+## 9. File map
 
 | File | Việc |
 |------|------|
-| `src/main.py` | Entry → `rsi_rev.cycle.main()` |
-| `src/rsi_rev/cycle.py` | Vòng lặp 5m |
-| `src/rsi_rev/signals.py` | RSI event + trigger + thứ tự thoát |
-| `src/rsi_rev/trading.py` | Open/close, sizing, skip hết số dư |
-| `src/rsi_rev/watcher.py` | Mark WS TP/BE/timeout |
-| `src/rsi_rev/store.py` | SQLite schema + CRUD |
+| `src/main.py` | Entry → `donchian.cycle.main()` |
+| `src/donchian/cycle.py` | Vòng lặp 15m, scan symbols, boot warmup |
+| `src/donchian/signals.py` | Donchian bands, parallel flag, check_signal |
+| `src/donchian/trading.py` | Open/close lot, sizing, skip logic |
+| `src/donchian/watcher.py` | Mark WS TP check mỗi 2s |
+| `src/donchian/store.py` | SQLite schema + CRUD |
 | `src/web/app.py` | Dashboard + API |

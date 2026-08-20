@@ -161,8 +161,14 @@ class BinanceWsCache:
         _ = is_closed
         symbol = symbol.upper()
         with self.lock:
-            if self.candle_interval.get(symbol) not in (None, interval):
-                return
+            stored = self.candle_interval.get(symbol)
+            if stored not in (None, interval):
+                from src.config import GRANULARITY
+
+                if interval != GRANULARITY:
+                    return
+                # Take over: leftover 5m cache would otherwise block 15m WS updates.
+                self.candles[symbol] = []
             self.candle_interval[symbol] = interval
             rows = self.candles.setdefault(symbol, [])
             self._upsert_candle_row(rows, candle)

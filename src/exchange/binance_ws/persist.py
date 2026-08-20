@@ -102,6 +102,10 @@ def load_candles_snapshot() -> int:
             except (KeyError, TypeError, ValueError):
                 continue
         if parsed:
+            from src.config import GRANULARITY as _GRAN
+
+            if interval != _GRAN:
+                continue
             CACHE.set_candles(str(sym).upper(), interval, parsed)
             count += 1
     return count

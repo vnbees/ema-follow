@@ -14,7 +14,23 @@ DEFAULT_SYMBOL = os.getenv("SYMBOL", "SUIUSDT")
 SYMBOL = DEFAULT_SYMBOL
 PRODUCT_TYPE = "usdt-futures"
 PRODUCT_TYPE_API = "USDT-FUTURES"
-GRANULARITY = os.getenv("GRANULARITY", "5m")
+
+
+def _interval_minutes(gran: str) -> int:
+    g = gran.strip().lower()
+    if g.endswith("h"):
+        return int(g[:-1] or "1") * 60
+    if g.endswith("m"):
+        return int(g[:-1] or "1")
+    return int(g)
+
+
+# Donchian bot owns the candle interval. If DONCHIAN_INTERVAL is set, WS/REST/stale
+# checks must use it — a leftover GRANULARITY=5m would subscribe 5m klines and
+# silently drop 15m cache updates.
+_DONCHIAN_INTERVAL = os.getenv("DONCHIAN_INTERVAL", "").strip()
+GRANULARITY = _DONCHIAN_INTERVAL or os.getenv("GRANULARITY", "15m")
+INTERVAL_MINUTES = _interval_minutes(GRANULARITY)
 CANDLE_LIMIT = int(os.getenv("CANDLE_LIMIT", "200"))
 EMA_PERIODS = (34, 89, 144, 200)
 
@@ -23,7 +39,6 @@ RSI_LONG_ENTRY = float(os.getenv("RSI_LONG_ENTRY", "25"))
 RSI_LONG_EXIT = float(os.getenv("RSI_LONG_EXIT", "75"))
 RSI_SHORT_ENTRY = float(os.getenv("RSI_SHORT_ENTRY", "75"))
 RSI_SHORT_EXIT = float(os.getenv("RSI_SHORT_EXIT", "25"))
-INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "5"))
 RSI_MIN_CANDLES = RSI_PERIOD + 2
 # Inventory mode: open/maintain pairs without RSI cross entry/stack.
 RSI_ENTRY_ENABLED = os.getenv("RSI_ENTRY_ENABLED", "false").lower() in (

@@ -345,8 +345,10 @@ class KlineStream:
                 if age < self._silence_sec:
                     continue
             else:
+                # age=never: never received a message — give 2× grace period
+                # (low-volume stock tokens may not tick for many minutes)
                 since = self._subscribed_since.get(stream, now)
-                if (now - since) < self._silence_sec:
+                if (now - since) < self._silence_sec * 2:
                     continue
             silent.add(stream)
             logging.warning(

@@ -43,7 +43,7 @@ def init_db() -> None:
             );
             """
         )
-    from src.rsi_rev import store
+    from src.donchian import store
 
     store.ensure_schema()
 
@@ -159,11 +159,11 @@ def prune_equity_snapshots(*, older_than_days: int = 90) -> int:
 
 
 def clear_dashboard_history(*, reset_baseline: bool = True) -> dict[str, int]:
-    """Delete RSI-rev trade history and equity chart data."""
+    """Delete Donchian trade history and equity chart data."""
     tables = (
-        "rsi_rev_lots",
-        "rsi_rev_pending",
-        "rsi_rev_skips",
+        "donchian_lots",
+        "donchian_state",
+        "donchian_skips",
         "equity_snapshots",
     )
     counts: dict[str, int] = {}
