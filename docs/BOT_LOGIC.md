@@ -64,7 +64,7 @@ flowchart TD
 
 - Donchian period: **20 nến** · slope lookback: **5 nến** · parallel tolerance: **0.015 %/bar**
 - Trend được xác định tại nến **đầu tiên** sau khi bands thoát trạng thái song song.
-- `waiting_entry = True` sau khi xác định trend; reset khi vào lệnh hoặc khi có lệnh đang mở (`MAX_OPEN` đã đạt).
+- `waiting_entry = True` sau khi xác định trend; reset khi vào lệnh, khi **symbol đó** đang có lệnh mở, hoặc khi `cap_skip` (max open / margin) — giống backtest: **bỏ tín hiệu**, không queue sang cycle sau. Chỉ retry khi `open_lot` lỗi sàn (`error`).
 - `tp_band` lưu band lúc **entry** (hiển thị / fallback nếu cache thiếu nến). Watcher thoát theo **Donchian đang chạy** giống backtest: long khi high/mark nến hiện tại ≥ **upper hiện tại**, short khi low/mark ≤ **lower hiện tại**. Không TP trên **nến vào lệnh** (giống backtest). Khác backtest: kiểm tra mỗi 2s trên nến đang chạy, **không** đợi đóng nến.
 
 **Khung nến:** `DONCHIAN_INTERVAL` (mặc định `15m`) **ghi đè** `GRANULARITY` / `INTERVAL_MINUTES`. WS kline, REST seed và stale-check phải cùng khung — nếu WS 5m mà bot tính 15m thì cache bị drop, Donchian sai.
@@ -95,10 +95,14 @@ Ví dụ equity 1000 USDT: margin = 5 USDT, notional = 50 USDT → phí ≈ 0.10
 
 Thay vì hardcode, bot scan **tất cả USDT-M futures** theo 24h quote volume từ WS cache (`!miniTicker@arr`):
 
-- `DONCHIAN_TOP_N = 30` coin volume cao nhất
+- `DONCHIAN_TOP_N = 30` coin volume cao nhất (sau khi lọc)
 - Loại trừ: stablecoin (USDC, BUSD, FDUSD…), leverage token (UP/DOWN/BULL/BEAR)
-- `set_watched_symbols(top_30)` → KlineStream tự subscribe/unsubscribe
-- Không tốn REST để scan — dùng `CACHE.quote_volumes` đã có từ AllMarketStream
+- **Symbol filter** (`DONCHIAN_SYMBOL_FILTER=true`):
+  - Listing **≥ 365 ngày** (`DONCHIAN_MIN_LISTING_DAYS`) theo `onboardDate` Binance — **áp dụng mọi coin**
+  - **24h range ≤ 15%** (`DONCHIAN_MAX_RANGE_24H_PCT`) — **chỉ non-major**. Majors bypass range (vẫn cần listing ≥ 365d): BTC, ETH, BNB, SOL, XRP, TRX + L1/L2/infra ổn định (ADA, AVAX, DOT, LINK, LTC, BCH, XLM, ATOM, NEAR, APT, SUI, ARB, OP, UNI, AAVE, FIL). **Không** gồm meme (DOGE, PEPE) hay HYPE.
+  - **Lệnh đang mở không bị đóng**; coin bị lọc chỉ không mở thêm, watcher vẫn TP
+- `set_watched_symbols(top_30 + open lots)` → KlineStream subscribe cả coin đang giữ lệnh
+- Không tốn REST để scan — dùng `CACHE.quote_volumes` + `exchangeInfo` cache
 
 ---
 

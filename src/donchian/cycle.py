@@ -40,6 +40,7 @@ from src.donchian.config import (
     mark_untradable,
 )
 from src.donchian.signals import DonchianBar, SignalState, process_closed_bars
+from src.donchian.symbol_filter import filter_ranked_symbols, is_scan_eligible
 from src.donchian.trading import live_account_balance, open_lot
 from src.donchian.watcher import start_watcher
 from src.web.app import app as web_app
@@ -132,14 +133,33 @@ def _top_symbols() -> list[str]:
                 except Exception:
                     return True
 
-            pool = ranked[: max(TOP_N_SYMBOLS * 3, TOP_N_SYMBOLS)]
-            new_symbols = [sym for sym, _ in pool if _tradable(sym)][:TOP_N_SYMBOLS]
+            pool = ranked[: max(TOP_N_SYMBOLS * 5, TOP_N_SYMBOLS)]
+            tradable_pool = [(sym, vol) for sym, vol in pool if _tradable(sym)]
+            new_symbols, skipped = filter_ranked_symbols(
+                tradable_pool, limit=TOP_N_SYMBOLS, interval=INTERVAL
+            )
+            if skipped:
+                sample = ", ".join(f"{s}({r})" for s, r in skipped[:8])
+                extra = f" +{len(skipped) - 8} more" if len(skipped) > 8 else ""
+                logging.info(
+                    "Donchian symbol filter skipped %d: %s%s",
+                    len(skipped),
+                    sample,
+                    extra,
+                )
         except Exception:  # noqa: BLE001
-            new_symbols = [sym for sym, _ in ranked[:TOP_N_SYMBOLS]]
+            tradable = [(sym, vol) for sym, vol in ranked[: TOP_N_SYMBOLS * 5] if not is_untradable(sym)]
+            new_symbols, skipped = filter_ranked_symbols(tradable, limit=TOP_N_SYMBOLS, interval=INTERVAL)
+            if skipped:
+                logging.info("Donchian symbol filter skipped %d (fallback path)", len(skipped))
         if new_symbols:
             _cached_symbols = new_symbols
             _symbols_refreshed_at = now
-            logging.info("Top-%d symbols refreshed (next refresh in 4h)", TOP_N_SYMBOLS)
+            logging.info(
+                "Top-%d scan pool reset: %s",
+                len(new_symbols),
+                ", ".join(new_symbols),
+            )
         return _cached_symbols
     except Exception:  # noqa: BLE001
         return _cached_symbols
@@ -478,6 +498,11 @@ def _log_balance() -> None:
 
 def _process_symbol(symbol: str, now_ms: int) -> bool:
     """Return True if a lot was opened."""
+    if not store.has_open_lot_for_symbol(symbol):
+        eligible, reason = is_scan_eligible(symbol, interval=INTERVAL)
+        if not eligible:
+            logging.debug("  [%s] scan skip — %s", symbol, reason)
+            return False
     try:
         # Đọc thẳng từ CACHE (bỏ qua staleness check global INTERVAL_MINUTES=5m)
         from src.exchange.binance_ws.cache import CACHE as _CACHE
@@ -530,11 +555,21 @@ def _process_symbol(symbol: str, now_ms: int) -> bool:
         tp_band=tp_band,
     )
     if status != "opened":
-        # Tín hiệu đã clear waiting_entry — nếu chưa vào được thì giữ để cycle sau retry.
-        if not store.has_open_lot_for_symbol(symbol):
+        # check_signal already cleared waiting_entry on emit.
+        # cap_skip (max open / margin / already open): discard like backtest — no queue.
+        # error: keep waiting so a transient exchange failure can retry next cycle.
+        if status == "error" and not store.has_open_lot_for_symbol(symbol):
             state.waiting_entry = True
             state.last_processed_ts = int(bars[-2].ts) if len(bars) >= 2 else None
             logging.info("  [%s] Donchian %s not opened (%s) — will retry next cycle", symbol, signal, status)
+        else:
+            state.waiting_entry = False
+            logging.info(
+                "  [%s] Donchian %s not opened (%s) — signal discarded (no retry)",
+                symbol,
+                signal,
+                status,
+            )
         _persist_state(symbol, state)
         return False
 

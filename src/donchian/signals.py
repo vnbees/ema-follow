@@ -131,6 +131,9 @@ def check_signal(
             state.waiting_entry = False
 
     state.prev_parallel = currently_parallel
+    # Backtest: when max open reached, discard pending entry (no queue while holding).
+    if not allow_entry:
+        state.waiting_entry = False
     return signal, tp_band, entry_px
 
 

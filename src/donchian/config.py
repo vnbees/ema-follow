@@ -17,6 +17,34 @@ BALANCE_CACHE_MAX_AGE_SEC = float(os.getenv("DONCHIAN_BALANCE_CACHE_MAX_AGE_SEC"
 WARMUP_MIN_BARS = DONCHIAN_PERIOD + SLOPE_LOOKBACK + 5
 CANDLE_LIMIT = WARMUP_MIN_BARS + 50
 
+# Symbol pool filter (see symbol_filter.py)
+MIN_LISTING_DAYS = float(os.getenv("DONCHIAN_MIN_LISTING_DAYS", "365"))
+MAX_RANGE_24H_PCT = float(os.getenv("DONCHIAN_MAX_RANGE_24H_PCT", "15"))
+SYMBOL_FILTER_ENABLED = os.getenv("DONCHIAN_SYMBOL_FILTER", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Majors skip 24h range cap (still require MIN_LISTING_DAYS).
+# Criteria: large/liquid, multi-year track record, non-meme, non-narrative hype.
+# Excludes: DOGE/PEPE (meme), HYPE (high-vol newer), mid/small speculative alts.
+# Override: DONCHIAN_MAJOR_SYMBOLS=BTCUSDT,ETHUSDT,...
+_DEFAULT_MAJORS = (
+    # Tier-1: top market-cap / settlement
+    "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,TRXUSDT,"
+    # Established L1 / L2 / infra (years live, deep liquidity)
+    "ADAUSDT,AVAXUSDT,DOTUSDT,LINKUSDT,LTCUSDT,BCHUSDT,XLMUSDT,"
+    "ATOMUSDT,NEARUSDT,APTUSDT,SUIUSDT,ARBUSDT,OPUSDT,"
+    # Blue-chip DeFi / storage (not meme)
+    "UNIUSDT,AAVEUSDT,FILUSDT"
+)
+MAJOR_SYMBOLS: frozenset[str] = frozenset(
+    s.strip().upper()
+    for s in os.getenv("DONCHIAN_MAJOR_SYMBOLS", _DEFAULT_MAJORS).split(",")
+    if s.strip()
+)
+
 LEVERAGE = SHARED_LEVERAGE
 
 _UNTRADABLE: set[str] = set()

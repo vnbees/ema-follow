@@ -87,6 +87,25 @@ class TestCheckSignal(unittest.TestCase):
         self.assertAlmostEqual(entry_px, 10.1)
         self.assertFalse(state.waiting_entry)
 
+    def test_holding_clears_waiting_entry_like_backtest(self) -> None:
+        bars = self._flat_bars(20, close=10.0)
+        state = SignalState(trend="up", trend_ts=1, waiting_entry=True, prev_parallel=False)
+        bars[-1] = DonchianBar(ts=19, open=10.5, high=10.5, low=9.8, close=9.9)
+        signal, _, _ = check_signal(
+            bars, state, period=PERIOD, slope_lookback=LOOKBACK, tol=0.0, allow_entry=False
+        )
+        self.assertIsNone(signal)
+        self.assertFalse(state.waiting_entry)
+
+    def test_parallel_exit_while_holding_clears_waiting_entry(self) -> None:
+        bars = []
+        for i in range(20):
+            bars.append(DonchianBar(ts=i, open=10.0, high=10.0 + i * 0.2, low=9.0, close=10.0))
+        state = SignalState(prev_parallel=True)
+        check_signal(bars, state, period=PERIOD, slope_lookback=LOOKBACK, tol=0.0, allow_entry=False)
+        self.assertIsNotNone(state.trend)
+        self.assertFalse(state.waiting_entry)
+
     def test_no_signal_when_bands_still_parallel(self) -> None:
         bars = self._flat_bars(20, close=10.0)
         state = SignalState(trend="up", trend_ts=1, waiting_entry=True, prev_parallel=False)

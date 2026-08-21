@@ -64,6 +64,8 @@ def _walk_backtest(bars: list[DonchianBar], period: int, lookback: int, tol: flo
                 trades.append((f"open_{side}", bar.ts))
                 pos = side
                 waiting = False
+        if pos is not None:
+            waiting = False
         prev_par = b.parallel
     return trades
 
