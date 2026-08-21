@@ -28,12 +28,16 @@ def _walk_live(bars: list[DonchianBar], period: int, lookback: int, tol: float):
                     trades.append((f"close_{pos['side']}", bar.ts))
                     pos = None
         if pos is not None:
-            check_signal(hist, state, period=period, slope_lookback=lookback, tol=tol, allow_entry=False)
+            check_signal(
+                hist, state, period=period, slope_lookback=lookback, tol=tol, allow_entry=False, apply_quality_filter=False
+            )
             continue
-        signal, tp, _ = check_signal(hist, state, period=period, slope_lookback=lookback, tol=tol)
-        if signal:
-            trades.append((f"open_{signal}", bar.ts))
-            pos = {"side": signal, "entry_ts": bar.ts, "tp": tp}
+        entry = check_signal(
+            hist, state, period=period, slope_lookback=lookback, tol=tol, apply_quality_filter=False
+        )
+        if entry:
+            trades.append((f"open_{entry.side}", bar.ts))
+            pos = {"side": entry.side, "entry_ts": bar.ts, "tp": entry.tp_band}
     return trades
 
 

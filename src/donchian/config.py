@@ -7,14 +7,23 @@ DONCHIAN_PERIOD = int(os.getenv("DONCHIAN_PERIOD", "20"))
 SLOPE_LOOKBACK = int(os.getenv("DONCHIAN_SLOPE_LB", "5"))
 PARALLEL_TOL = float(os.getenv("DONCHIAN_PARALLEL_TOL", "0.015"))
 INTERVAL = os.getenv("DONCHIAN_INTERVAL", "15m")
-MARGIN_PCT = float(os.getenv("DONCHIAN_MARGIN_PCT", "0.005"))
+# body_size_rr05 live default: 1% equity × size_mult (was 0.5%)
+MARGIN_PCT = float(os.getenv("DONCHIAN_MARGIN_PCT", "0.01"))
 MARGIN_MIN_USDT = float(os.getenv("DONCHIAN_MARGIN_MIN_USDT", str(ORDER_MARGIN_MIN_USDT)))
 MAX_OPEN = int(os.getenv("DONCHIAN_MAX_OPEN", "20"))
 TOP_N_SYMBOLS = int(os.getenv("DONCHIAN_TOP_N", "30"))
 WATCHER_INTERVAL_SEC = float(os.getenv("DONCHIAN_WATCHER_INTERVAL_SEC", "2"))
 BALANCE_CACHE_MAX_AGE_SEC = float(os.getenv("DONCHIAN_BALANCE_CACHE_MAX_AGE_SEC", "30"))
-# Minimum nến cần để tính đủ Donchian + slope warmup
-WARMUP_MIN_BARS = DONCHIAN_PERIOD + SLOPE_LOOKBACK + 5
+
+# Entry quality filter (body_size_rr05) — matches backtest config D
+ATR_PERIOD = int(os.getenv("DONCHIAN_ATR_PERIOD", "14"))
+MIN_BODY_ATR = float(os.getenv("DONCHIAN_MIN_BODY_ATR", "0.3"))
+MAX_BODY_ATR = float(os.getenv("DONCHIAN_MAX_BODY_ATR", "1.2"))
+MIN_POT_RR = float(os.getenv("DONCHIAN_MIN_POT_RR", "0.5"))
+SIZE_BY_RR = os.getenv("DONCHIAN_SIZE_BY_RR", "true").lower() in ("1", "true", "yes", "on")
+
+# Minimum nến: Donchian + slope + ATR warmup
+WARMUP_MIN_BARS = DONCHIAN_PERIOD + SLOPE_LOOKBACK + ATR_PERIOD + 5
 CANDLE_LIMIT = WARMUP_MIN_BARS + 50
 
 # Symbol pool filter (see symbol_filter.py)

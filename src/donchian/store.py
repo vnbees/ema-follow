@@ -47,6 +47,10 @@ def ensure_schema(conn: sqlite3.Connection | None = None) -> None:
             pnl_usdt REAL,
             fee_open_usdt REAL,
             fee_close_usdt REAL,
+            body_atr REAL,
+            pot_rr REAL,
+            size_mult REAL,
+            opp_band REAL,
             opened_at TEXT NOT NULL,
             closed_at TEXT,
             updated_at TEXT NOT NULL
@@ -96,6 +100,14 @@ def _migrate_donchian_lots(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(donchian_lots)")}
     if "close_order_id" not in cols:
         conn.execute("ALTER TABLE donchian_lots ADD COLUMN close_order_id TEXT")
+    for col, decl in (
+        ("body_atr", "REAL"),
+        ("pot_rr", "REAL"),
+        ("size_mult", "REAL"),
+        ("opp_band", "REAL"),
+    ):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE donchian_lots ADD COLUMN {col} {decl}")
 
 
 def save_state(
@@ -159,6 +171,10 @@ def insert_lot(
     notional_usdt: float,
     entry_order_id: str,
     fee_open_usdt: float = 0.0,
+    body_atr: float | None = None,
+    pot_rr: float | None = None,
+    size_mult: float | None = None,
+    opp_band: float | None = None,
 ) -> int:
     now = _utc_now()
     with _lock, get_connection() as conn:
@@ -168,13 +184,29 @@ def insert_lot(
             INSERT INTO donchian_lots (
                 symbol, side, trend, trend_ts, status, entry_ts, entry_px, tp_band,
                 size, margin_usdt, notional_usdt, entry_order_id, fee_open_usdt,
+                body_atr, pot_rr, size_mult, opp_band,
                 opened_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                symbol.upper(), side.lower(), trend, trend_ts, entry_ts, entry_px, tp_band,
-                size, margin_usdt, notional_usdt, entry_order_id, float(fee_open_usdt or 0),
-                now, now,
+                symbol.upper(),
+                side.lower(),
+                trend,
+                trend_ts,
+                entry_ts,
+                entry_px,
+                tp_band,
+                size,
+                margin_usdt,
+                notional_usdt,
+                entry_order_id,
+                float(fee_open_usdt or 0),
+                body_atr,
+                pot_rr,
+                size_mult,
+                opp_band,
+                now,
+                now,
             ),
         )
         return int(cur.lastrowid)

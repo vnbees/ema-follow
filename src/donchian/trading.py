@@ -24,7 +24,11 @@ from src.donchian.config import (
     LEVERAGE,
     MARGIN_MIN_USDT,
     MARGIN_PCT,
+    MAX_BODY_ATR,
     MAX_OPEN,
+    MIN_BODY_ATR,
+    MIN_POT_RR,
+    SIZE_BY_RR,
     mark_untradable,
 )
 
@@ -104,23 +108,63 @@ def _real_order_id(result) -> str:
     return text
 
 
-def _notify_open(symbol: str, side: str, *, trend: str, entry: float, tp_band: float, size: float, margin_usdt: float) -> None:
+def _notify_open(
+    symbol: str,
+    side: str,
+    *,
+    trend: str,
+    entry: float,
+    tp_band: float,
+    size: float,
+    margin_usdt: float,
+    equity: float = 0.0,
+    opp_band: float | None = None,
+    body_atr: float | None = None,
+    pot_rr: float | None = None,
+    size_mult: float | None = None,
+    why: str = "",
+) -> None:
     try:
         from src.notify import discord_configured, _send_discord, _fmt_px
         if not discord_configured():
             return
         title = f"{symbol.upper()} {side.upper()} mở — trend {trend.upper()}"
-        body = (
-            f"entry={_fmt_px(entry)}\n"
-            f"target band={_fmt_px(tp_band)}\n"
-            f"size={size:g}  margin={margin_usdt:.2f} USDT"
-        )
-        _send_discord(title, body)
+        lines: list[str] = []
+        if why:
+            lines.append(f"lý do: {why}")
+        if body_atr is not None and pot_rr is not None:
+            lines.append(
+                f"lọc: body_atr={body_atr:.2f} (ok {MIN_BODY_ATR:g}–{MAX_BODY_ATR:g}) · "
+                f"pot_rr={pot_rr:.2f} (≥{MIN_POT_RR:g})"
+            )
+        if size_mult is not None:
+            base_pct = MARGIN_PCT * 100.0
+            lines.append(
+                f"size: size_mult={size_mult:.2f}× · margin_pct={base_pct:.2f}% "
+                f"→ margin={margin_usdt:.2f} USDT"
+                + (f" (equity≈{equity:.0f})" if equity > 0 else "")
+            )
+        lines.append(f"entry={_fmt_px(entry)}")
+        opp_part = f" · opp band={_fmt_px(opp_band)}" if opp_band is not None else ""
+        lines.append(f"target band={_fmt_px(tp_band)}{opp_part}")
+        lines.append(f"size={size:g}")
+        _send_discord(title, "\n".join(lines))
     except Exception as exc:  # noqa: BLE001
         logging.warning("Discord notify_open failed: %s", exc)
 
 
-def _notify_close(symbol: str, side: str, *, reason: str, entry: float, tp_band: float, close_price: float, pnl_usdt: float, opened_at: str = "") -> None:
+def _notify_close(
+    symbol: str,
+    side: str,
+    *,
+    reason: str,
+    entry: float,
+    tp_band: float,
+    close_price: float,
+    pnl_usdt: float,
+    opened_at: str = "",
+    size_mult: float | None = None,
+) -> None:
     try:
         from src.notify import discord_configured, _send_discord, _fmt_px, _hold_label
         if not discord_configured():
@@ -133,6 +177,8 @@ def _notify_close(symbol: str, side: str, *, reason: str, entry: float, tp_band:
             f"pnl={pnl_usdt:+.2f} USDT (đã trừ phí)\n"
             f"giữ {_hold_label(opened_at)}"
         )
+        if size_mult is not None:
+            body += f"\nsize_mult={float(size_mult):.2f}×"
         _send_discord(title, body)
     except Exception as exc:  # noqa: BLE001
         logging.warning("Discord notify_close failed: %s", exc)
@@ -146,6 +192,11 @@ def open_lot(
     trend_ts: int | None,
     entry_ts: int | None,
     tp_band: float,
+    size_mult: float = 1.0,
+    opp_band: float | None = None,
+    body_atr: float | None = None,
+    pot_rr: float | None = None,
+    why: str = "",
 ) -> str:
     """Open a Donchian lot. Returns opened | cap_skip | error | disabled."""
     if not is_trading_enabled() or not has_credentials():
@@ -171,7 +222,10 @@ def open_lot(
                 store.record_skip(symbol, "no_equity")
                 return "cap_skip"
 
-            margin = max(0.0, equity * MARGIN_PCT)
+            mult = 1.0
+            if SIZE_BY_RR:
+                mult = min(2.0, max(0.5, float(size_mult)))
+            margin = max(0.0, equity * MARGIN_PCT * mult)
             if margin < MARGIN_MIN_USDT:
                 logging.info("  [%s] Skip Donchian — margin %.4f below min %.2f", symbol, margin, MARGIN_MIN_USDT)
                 store.record_skip(symbol, "margin_too_small")
@@ -222,11 +276,40 @@ def open_lot(
                 notional_usdt=notional,
                 entry_order_id=order_id,
                 fee_open_usdt=fee_open,
+                body_atr=body_atr,
+                pot_rr=pot_rr,
+                size_mult=mult,
+                opp_band=opp_band,
             )
-            _notify_open(symbol, side, trend=trend, entry=fill, tp_band=tp_band, size=size, margin_usdt=margin)
+            _notify_open(
+                symbol,
+                side,
+                trend=trend,
+                entry=fill,
+                tp_band=tp_band,
+                size=size,
+                margin_usdt=margin,
+                equity=equity,
+                opp_band=opp_band,
+                body_atr=body_atr,
+                pot_rr=pot_rr,
+                size_mult=mult,
+                why=why,
+            )
             logging.info(
-                "  [%s] Donchian %s opened id=%d trend=%s entry=%.6f tp_band=%.6f size=%s margin=%.2f",
-                symbol, side.upper(), lot_id, trend, fill, tp_band, size_str, margin,
+                "  [%s] Donchian %s opened id=%d trend=%s entry=%.6f tp_band=%.6f "
+                "size=%s margin=%.2f size_mult=%.2f body_atr=%s pot_rr=%s",
+                symbol,
+                side.upper(),
+                lot_id,
+                trend,
+                fill,
+                tp_band,
+                size_str,
+                margin,
+                mult,
+                f"{body_atr:.2f}" if body_atr is not None else "-",
+                f"{pot_rr:.2f}" if pot_rr is not None else "-",
             )
             return "opened"
         except ExchangeClientError as exc:
@@ -285,7 +368,24 @@ def _finalize_close(lot, *, reason: str, fill: float, fee_close: float, close_oi
         close_order_id=close_oid,
     ):
         return False
-    _notify_close(symbol, side, reason=reason, entry=entry, tp_band=tp_band, close_price=fill, pnl_usdt=pnl, opened_at=opened_at)
+    size_mult_meta = None
+    try:
+        raw_sm = lot["size_mult"]
+        if raw_sm is not None:
+            size_mult_meta = float(raw_sm)
+    except (KeyError, IndexError, TypeError):
+        pass
+    _notify_close(
+        symbol,
+        side,
+        reason=reason,
+        entry=entry,
+        tp_band=tp_band,
+        close_price=fill,
+        pnl_usdt=pnl,
+        opened_at=opened_at,
+        size_mult=size_mult_meta,
+    )
     logging.info(
         "  [%s] Donchian %s lot %d closed %s @ %.6f pnl=%.4f fee=%.4f",
         symbol, side.upper(), lot_id, reason, fill, pnl, fee_open + fee_close,

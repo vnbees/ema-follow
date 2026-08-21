@@ -25,13 +25,18 @@ from src.exchange.types import Candle
 from src.notify import notify_error, install_error_hooks
 from src.donchian import store
 from src.donchian.config import (
+    ATR_PERIOD,
     CANDLE_LIMIT,
     DONCHIAN_PERIOD,
     INTERVAL,
     LEVERAGE,
     MARGIN_PCT,
+    MAX_BODY_ATR,
     MAX_OPEN,
+    MIN_BODY_ATR,
+    MIN_POT_RR,
     PARALLEL_TOL,
+    SIZE_BY_RR,
     SLOPE_LOOKBACK,
     TOP_N_SYMBOLS,
     WARMUP_MIN_BARS,
@@ -532,27 +537,38 @@ def _process_symbol(symbol: str, now_ms: int) -> bool:
 
     bars = _candles_to_bars(closed)
     state = _load_state(symbol)
-    signal, tp_band, entry_px = process_closed_bars(
+    entry = process_closed_bars(
         bars,
         state,
         period=DONCHIAN_PERIOD,
         slope_lookback=SLOPE_LOOKBACK,
         tol=PARALLEL_TOL,
         allow_entry=not store.has_open_lot_for_symbol(symbol),
+        apply_quality_filter=True,
+        atr_period=ATR_PERIOD,
+        min_body_atr=MIN_BODY_ATR,
+        max_body_atr=MAX_BODY_ATR,
+        min_pot_rr=MIN_POT_RR,
+        size_by_rr=SIZE_BY_RR,
     )
 
-    if signal is None or not is_trading_enabled() or not has_credentials():
+    if entry is None or not is_trading_enabled() or not has_credentials():
         _persist_state(symbol, state)
         return False
 
     last_bar = bars[-1]
     status = open_lot(
         symbol,
-        side=signal,
-        trend=state.trend or signal,
+        side=entry.side,
+        trend=state.trend or entry.side,
         trend_ts=state.trend_ts,
         entry_ts=last_bar.ts,
-        tp_band=tp_band,
+        tp_band=entry.tp_band,
+        size_mult=entry.size_mult,
+        opp_band=entry.opp_band,
+        body_atr=entry.body_atr,
+        pot_rr=entry.pot_rr,
+        why=entry.why,
     )
     if status != "opened":
         # check_signal already cleared waiting_entry on emit.
@@ -561,13 +577,18 @@ def _process_symbol(symbol: str, now_ms: int) -> bool:
         if status == "error" and not store.has_open_lot_for_symbol(symbol):
             state.waiting_entry = True
             state.last_processed_ts = int(bars[-2].ts) if len(bars) >= 2 else None
-            logging.info("  [%s] Donchian %s not opened (%s) — will retry next cycle", symbol, signal, status)
+            logging.info(
+                "  [%s] Donchian %s not opened (%s) — will retry next cycle",
+                symbol,
+                entry.side,
+                status,
+            )
         else:
             state.waiting_entry = False
             logging.info(
                 "  [%s] Donchian %s not opened (%s) — signal discarded (no retry)",
                 symbol,
-                signal,
+                entry.side,
                 status,
             )
         _persist_state(symbol, state)
