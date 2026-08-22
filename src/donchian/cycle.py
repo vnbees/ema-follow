@@ -17,6 +17,11 @@ from src.config import (
     LOG_DIR,
     REST_BOOT_GAP_SEC,
     REST_BOOT_QUIET_SEC,
+    SPOT_TRANSFER_DAY_CAP_PCT,
+    SPOT_TRANSFER_DD_PAUSE_PCT,
+    SPOT_TRANSFER_EXECUTE_HHMM,
+    SPOT_TRANSFER_MODE,
+    SPOT_TRANSFER_SKIM,
     WEB_PORT,
 )
 from src.database import init_db, insert_equity_snapshot
@@ -26,10 +31,16 @@ from src.notify import notify_error, install_error_hooks
 from src.donchian import store
 from src.donchian.config import (
     ATR_PERIOD,
+    BREADTH_ENABLED,
+    BREADTH_MIN_N,
+    BREADTH_MODE,
+    BREADTH_RATIO,
+    BREADTH_UNIVERSE,
     CANDLE_LIMIT,
     DONCHIAN_PERIOD,
     INTERVAL,
     LEVERAGE,
+    MAJOR_SYMBOLS,
     MARGIN_PCT,
     MAX_BODY_ATR,
     MAX_OPEN,
@@ -44,6 +55,7 @@ from src.donchian.config import (
     is_untradable,
     mark_untradable,
 )
+from src.donchian.breadth import BreadthVote, allows_side, flip_entry_signal, mid_side, vote_breadth
 from src.donchian.signals import DonchianBar, SignalState, process_closed_bars
 from src.donchian.symbol_filter import filter_ranked_symbols, is_scan_eligible
 from src.donchian.trading import live_account_balance, open_lot
@@ -182,6 +194,11 @@ def _sync_watched(symbols: list[str]) -> None:
             sym = str(lot["symbol"]).upper()
             if sym not in watched:
                 watched.append(sym)
+        # Breadth mid needs majors' klines even if not in top-N volume
+        if BREADTH_ENABLED and BREADTH_UNIVERSE == "majors":
+            for sym in MAJOR_SYMBOLS:
+                if sym not in watched and not is_untradable(sym) and not is_excluded_symbol(sym):
+                    watched.append(sym)
         set_watched_symbols(watched)
     except Exception as exc:  # noqa: BLE001
         logging.debug("Donchian WS watch sync skipped: %s", exc)
@@ -465,6 +482,74 @@ def _candles_to_bars(raw: list[Candle]) -> list[DonchianBar]:
     ]
 
 
+def _closed_bars_for_symbol(symbol: str, now_ms: int) -> list[DonchianBar] | None:
+    """WS closed candles for symbol, or None if warm-up / gap / missing."""
+    try:
+        from src.exchange.binance_ws.cache import CACHE as _CACHE
+
+        raw = _CACHE.get_candles(symbol.upper(), INTERVAL, CANDLE_LIMIT) or []
+    except ExchangeClientError:
+        return None
+    if not raw:
+        return None
+    interval_ms = _INTERVAL_MINUTES * 60 * 1000
+    period_start = (now_ms // interval_ms) * interval_ms
+    closed = [c for c in raw if c.timestamp < period_start]
+    if len(closed) < WARMUP_MIN_BARS:
+        return None
+    last_ts = int(closed[-1].timestamp)
+    expected_last = period_start - interval_ms
+    if last_ts < expected_last:
+        return None
+    return _candles_to_bars(closed)
+
+
+def _breadth_universe(scan_symbols: list[str]) -> list[str]:
+    if BREADTH_UNIVERSE == "scan":
+        return list(scan_symbols)
+    return sorted(MAJOR_SYMBOLS)
+
+
+def compute_breadth_vote(scan_symbols: list[str], now_ms: int) -> BreadthVote | None:
+    """Pool mid vote for this cycle; None if breadth disabled."""
+    if not BREADTH_ENABLED:
+        return None
+    universe = _breadth_universe(scan_symbols)
+    sides: list[str | None] = []
+    for sym in universe:
+        bars = _closed_bars_for_symbol(sym, now_ms)
+        if bars is None:
+            sides.append(None)
+            continue
+        sides.append(mid_side(bars, DONCHIAN_PERIOD))
+    vote = vote_breadth(sides, ratio=BREADTH_RATIO, min_n=BREADTH_MIN_N)
+    if vote.side is None:
+        logging.info(
+            "Breadth mid: NEUTRAL ups=%d downs=%d tot=%d (need n≥%d lead≥%.2f×) mode=%s universe=%s",
+            vote.ups,
+            vote.downs,
+            vote.total,
+            BREADTH_MIN_N,
+            BREADTH_RATIO,
+            BREADTH_MODE,
+            BREADTH_UNIVERSE,
+        )
+    else:
+        action = "FLIP opposite entries" if BREADTH_MODE == "flip" else "SKIP opposite entries"
+        logging.info(
+            "Breadth mid %s: vote=%s ups=%d downs=%d tot=%d lead=%.2f× universe=%s — %s",
+            BREADTH_MODE.upper(),
+            vote.side.upper(),
+            vote.ups,
+            vote.downs,
+            vote.total,
+            vote.lead_ratio,
+            BREADTH_UNIVERSE,
+            action,
+        )
+    return vote
+
+
 def _log_balance() -> None:
     if not has_credentials():
         return
@@ -497,45 +582,34 @@ def _log_balance() -> None:
             "Futures equity=%.2f %s | maint=%.2f%% | open=%d/%s",
             bal.account_equity, bal.margin_coin, bal.maint_margin_pct, open_n, cap,
         )
+        try:
+            from src.spot_transfer import check_risk_warnings, note_equity_peak
+
+            note_equity_peak(float(bal.account_equity or 0))
+            check_risk_warnings(
+                symbol,
+                equity=float(bal.account_equity or 0),
+                maint_pct=float(bal.maint_margin_pct or 0),
+                initial_pct=float(bal.initial_margin_pct or 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("Risk warn check skipped: %s", exc)
     except ExchangeClientError as exc:
         logging.debug("Donchian balance log skipped: %s", exc)
 
 
-def _process_symbol(symbol: str, now_ms: int) -> bool:
+def _process_symbol(symbol: str, now_ms: int, breadth: BreadthVote | None = None) -> bool:
     """Return True if a lot was opened."""
     if not store.has_open_lot_for_symbol(symbol):
         eligible, reason = is_scan_eligible(symbol, interval=INTERVAL)
         if not eligible:
             logging.debug("  [%s] scan skip — %s", symbol, reason)
             return False
-    try:
-        # Đọc thẳng từ CACHE (bỏ qua staleness check global INTERVAL_MINUTES=5m)
-        from src.exchange.binance_ws.cache import CACHE as _CACHE
-        raw = _CACHE.get_candles(symbol.upper(), INTERVAL, CANDLE_LIMIT) or []
-        if not raw:
-            logging.debug("  [%s] no candles in WS cache yet", symbol)
-            return False
-    except ExchangeClientError as exc:
-        logging.debug("  [%s] fetch candles skipped: %s", symbol, exc)
+
+    bars = _closed_bars_for_symbol(symbol, now_ms)
+    if bars is None:
         return False
 
-    interval_ms = _INTERVAL_MINUTES * 60 * 1000
-    period_start = (now_ms // interval_ms) * interval_ms
-    closed = [c for c in raw if c.timestamp < period_start]
-
-    if len(closed) < WARMUP_MIN_BARS:
-        return False
-
-    # Skip nếu chuỗi nến có gap (downtime) — tránh tính Donchian sai
-    if closed:
-        last_ts = int(closed[-1].timestamp)
-        expected_last = period_start - interval_ms
-        if last_ts < expected_last:
-            gap_bars = max(0, (expected_last - last_ts) // interval_ms)
-            logging.debug("  [%s] kline gap ~%d bars — skip until warmup fills", symbol, gap_bars)
-            return False
-
-    bars = _candles_to_bars(closed)
     state = _load_state(symbol)
     entry = process_closed_bars(
         bars,
@@ -555,6 +629,35 @@ def _process_symbol(symbol: str, now_ms: int) -> bool:
     if entry is None or not is_trading_enabled() or not has_credentials():
         _persist_state(symbol, state)
         return False
+
+    if breadth is not None and breadth.side is not None and not allows_side(breadth, entry.side):
+        if BREADTH_MODE == "hard":
+            store.record_skip(symbol, "breadth_hard")
+            state.waiting_entry = False
+            logging.info(
+                "  [%s] Donchian %s blocked by breadth hard (vote=%s ups=%d downs=%d) — discarded",
+                symbol,
+                entry.side,
+                breadth.side,
+                breadth.ups,
+                breadth.downs,
+            )
+            _persist_state(symbol, state)
+            return False
+        # flip (default): reverse side to match vote
+        orig = entry.side
+        entry = flip_entry_signal(entry, vote=breadth)
+        logging.info(
+            "  [%s] Donchian breadth FLIP %s→%s (vote=%s ups=%d downs=%d) pot_rr=%.2f size_mult=%.2f",
+            symbol,
+            orig,
+            entry.side,
+            breadth.side,
+            breadth.ups,
+            breadth.downs,
+            entry.pot_rr,
+            entry.size_mult,
+        )
 
     last_bar = bars[-1]
     status = open_lot(
@@ -621,11 +724,13 @@ def run_cycle() -> None:
     _wait_for_just_closed(symbols)
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
+    breadth = compute_breadth_vote(symbols, now_ms)
+
     for symbol in symbols:
         if _candle_cache_stale(symbol):
             stale_symbols.append(symbol)
             continue
-        did_open = _process_symbol(symbol, now_ms)
+        did_open = _process_symbol(symbol, now_ms, breadth=breadth)
         if did_open:
             opened += 1
 
@@ -635,6 +740,12 @@ def run_cycle() -> None:
 
     set_last_cycle_at(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
     _log_balance()
+    try:
+        from src.spot_transfer import process_daily_spot_transfer
+
+        process_daily_spot_transfer("BTCUSDT")
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Daily spot transfer check failed: %s", exc)
     if opened:
         logging.info("Cycle done — %d new lot(s) opened", opened)
 
@@ -685,14 +796,23 @@ def main() -> None:
     logging.info("Dashboard: http://localhost:%d", WEB_PORT)
     logging.info(
         "Logic: Donchian(%d) slope_lb=%d tol=%.3f%% interval=%s | WS kline=%s | top_N=%d | "
-        "margin=%.2f%% × %dx | max_open=%d",
+        "margin=%.2f%% × %dx | max_open=%d | breadth=%s (ratio=%.2f min_n=%d universe=%s)",
         DONCHIAN_PERIOD, SLOPE_LOOKBACK, PARALLEL_TOL, INTERVAL, GRANULARITY,
         TOP_N_SYMBOLS, MARGIN_PCT * 100, LEVERAGE, MAX_OPEN,
+        BREADTH_MODE, BREADTH_RATIO, BREADTH_MIN_N, BREADTH_UNIVERSE,
     )
     if is_trading_enabled():
         logging.info("Trading: LIVE")
     else:
         logging.info("Trading: DISABLED — analysis and dashboard only")
+    logging.info(
+        "Spot transfer: mode=%s skim=%.0f%% day_cap=%.2f%% dd_pause=%.0f%% at %s +07",
+        SPOT_TRANSFER_MODE,
+        SPOT_TRANSFER_SKIM * 100,
+        SPOT_TRANSFER_DAY_CAP_PCT * 100,
+        SPOT_TRANSFER_DD_PAUSE_PCT * 100,
+        SPOT_TRANSFER_EXECUTE_HHMM,
+    )
 
     while True:
         try:

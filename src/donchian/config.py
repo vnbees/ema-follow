@@ -22,6 +22,26 @@ MAX_BODY_ATR = float(os.getenv("DONCHIAN_MAX_BODY_ATR", "1.2"))
 MIN_POT_RR = float(os.getenv("DONCHIAN_MIN_POT_RR", "0.5"))
 SIZE_BY_RR = os.getenv("DONCHIAN_SIZE_BY_RR", "true").lower() in ("1", "true", "yes", "on")
 
+# Breadth mid (BT breadth_mid / breadth_flip): pool close ≷ Donchian mid vote
+# Mode: flip (default, live) | hard (skip opposite) | off
+_raw_breadth_mode = os.getenv("DONCHIAN_BREADTH_MODE")
+if _raw_breadth_mode is not None:
+    BREADTH_MODE = _raw_breadth_mode.strip().lower()
+    if BREADTH_MODE in ("off", "none", "false", "0"):
+        BREADTH_MODE = "off"
+    elif BREADTH_MODE not in ("flip", "hard"):
+        BREADTH_MODE = "flip"
+else:
+    # Legacy DONCHIAN_BREADTH_HARD: false→off, else default flip (replaces old hard default)
+    _legacy_hard = os.getenv("DONCHIAN_BREADTH_HARD", "true").lower() in ("1", "true", "yes", "on")
+    BREADTH_MODE = "flip" if _legacy_hard else "off"
+BREADTH_ENABLED = BREADTH_MODE in ("flip", "hard")
+BREADTH_HARD = BREADTH_MODE == "hard"  # compat alias
+BREADTH_RATIO = float(os.getenv("DONCHIAN_BREADTH_RATIO", "1.3"))
+BREADTH_MIN_N = int(os.getenv("DONCHIAN_BREADTH_MIN_N", "12"))
+# majors = MAJOR_SYMBOLS mid vote (near BT 20); scan = current top-N only
+BREADTH_UNIVERSE = os.getenv("DONCHIAN_BREADTH_UNIVERSE", "majors").strip().lower()
+
 # Minimum nến: Donchian + slope + ATR warmup
 WARMUP_MIN_BARS = DONCHIAN_PERIOD + SLOPE_LOOKBACK + ATR_PERIOD + 5
 CANDLE_LIMIT = WARMUP_MIN_BARS + 50

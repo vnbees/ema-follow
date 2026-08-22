@@ -183,11 +183,12 @@ def fetch_spot_balance(asset: str = "USDT", **kwargs) -> float:
     return _client().fetch_spot_balance(asset)
 
 
-def fetch_futures_transfers(start_ms: int, **kwargs) -> list[dict]:
-    """Binance only: income TRANSFER rows for HWM auto-sync."""
+def fetch_futures_transfers(start_ms: int, end_ms: int | None = None, **kwargs) -> list[dict]:
+    """Binance only: income TRANSFER rows for SOD/peak auto-sync."""
+    _ = kwargs
     if _active_exchange() != "binance":
         raise ExchangeClientError("fetch_futures_transfers is only supported on Binance")
-    return binance_mod.fetch_futures_transfers(start_ms, **kwargs)
+    return binance_mod.fetch_futures_transfers(start_ms, end_ms=end_ms)
 
 
 __all__ = [

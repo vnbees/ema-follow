@@ -43,9 +43,48 @@ def init_db() -> None:
             );
             """
         )
+        _migrate_spot_transfer_tables(conn)
     from src.donchian import store
 
     store.ensure_schema()
+
+
+def _migrate_spot_transfer_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS spot_transfers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            transfer_date TEXT NOT NULL,
+            amount REAL NOT NULL,
+            status TEXT NOT NULL,
+            tran_id TEXT,
+            available_before REAL,
+            spot_after REAL,
+            sod_equity REAL,
+            eod_equity REAL,
+            day_pnl REAL,
+            dd_pct REAL,
+            peak_equity REAL,
+            reason TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_spot_transfers_date_status
+            ON spot_transfers(transfer_date, status);
+        """
+    )
+    # Additive columns for DBs created with older schema
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(spot_transfers)").fetchall()}
+    for col, decl in (
+        ("sod_equity", "REAL"),
+        ("eod_equity", "REAL"),
+        ("day_pnl", "REAL"),
+        ("dd_pct", "REAL"),
+        ("peak_equity", "REAL"),
+        ("reason", "TEXT"),
+    ):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE spot_transfers ADD COLUMN {col} {decl}")
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -180,3 +219,183 @@ def clear_dashboard_history(*, reset_baseline: bool = True) -> dict[str, int]:
                 "DELETE FROM settings WHERE key IN ('baseline_equity', 'baseline_updated_at')"
             )
     return counts
+
+
+def insert_spot_transfer(
+    *,
+    transfer_date: str,
+    amount: float,
+    status: str,
+    tran_id: str | None = None,
+    available_before: float | None = None,
+    spot_after: float | None = None,
+    sod_equity: float | None = None,
+    eod_equity: float | None = None,
+    day_pnl: float | None = None,
+    dd_pct: float | None = None,
+    peak_equity: float | None = None,
+    reason: str | None = None,
+    error: str | None = None,
+) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO spot_transfers (
+                transfer_date, amount, status, tran_id,
+                available_before, spot_after,
+                sod_equity, eod_equity, day_pnl, dd_pct, peak_equity,
+                reason, error, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transfer_date,
+                amount,
+                status,
+                tran_id,
+                available_before,
+                spot_after,
+                sod_equity,
+                eod_equity,
+                day_pnl,
+                dd_pct,
+                peak_equity,
+                reason,
+                error,
+                _utc_now(),
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def get_spot_transfers(limit: int = 50) -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM spot_transfers
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def get_spot_transfers_paged(
+    *,
+    since_date: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[list[sqlite3.Row], int]:
+    """Paginated spot_transfers, newest first. since_date = YYYY-MM-DD inclusive."""
+    page = max(1, int(page))
+    page_size = max(1, min(100, int(page_size)))
+    offset = (page - 1) * page_size
+    with get_connection() as conn:
+        if since_date:
+            total_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM spot_transfers WHERE transfer_date >= ?",
+                (since_date,),
+            ).fetchone()
+            rows = conn.execute(
+                """
+                SELECT * FROM spot_transfers
+                WHERE transfer_date >= ?
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (since_date, page_size, offset),
+            ).fetchall()
+        else:
+            total_row = conn.execute("SELECT COUNT(*) AS cnt FROM spot_transfers").fetchone()
+            rows = conn.execute(
+                """
+                SELECT * FROM spot_transfers
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (page_size, offset),
+            ).fetchall()
+        total = int(total_row["cnt"]) if total_row else 0
+    return rows, total
+
+
+def has_successful_transfer_on_date(transfer_date: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM spot_transfers
+            WHERE transfer_date = ? AND status = 'success'
+            LIMIT 1
+            """,
+            (transfer_date,),
+        ).fetchone()
+        return row is not None
+
+
+def has_transfer_decision_on_date(transfer_date: str) -> bool:
+    """True if we already recorded success / skipped / failed for this VN date."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM spot_transfers
+            WHERE transfer_date = ? AND status IN ('success', 'skipped', 'failed')
+            LIMIT 1
+            """,
+            (transfer_date,),
+        ).fetchone()
+        return row is not None
+
+
+def is_spot_transfer_enabled(default: bool = True) -> bool:
+    return get_setting_bool("spot_transfer_enabled", default)
+
+
+def set_spot_transfer_enabled(enabled: bool) -> None:
+    set_setting_bool("spot_transfer_enabled", enabled)
+
+
+def _get_float_setting(key: str) -> float | None:
+    raw = get_setting(key, "")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def get_equity_peak() -> float | None:
+    return _get_float_setting("equity_peak")
+
+
+def set_equity_peak(value: float) -> None:
+    set_setting("equity_peak", str(value))
+    set_setting("equity_peak_updated_at", _utc_now())
+
+
+def get_spot_sod_equity() -> float | None:
+    return _get_float_setting("spot_sod_equity")
+
+
+def set_spot_sod_equity(value: float, *, day: str | None = None) -> None:
+    set_setting("spot_sod_equity", str(value))
+    set_setting("spot_sod_updated_at", _utc_now())
+    if day:
+        set_setting("spot_sod_day", day)
+
+
+def get_spot_sod_day() -> str:
+    return get_setting("spot_sod_day", "")
+
+
+def get_spot_manual_synced_at_ms() -> int | None:
+    raw = get_setting("spot_manual_synced_at_ms", "")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def set_spot_manual_synced_at_ms(ms: int) -> None:
+    set_setting("spot_manual_synced_at_ms", str(int(ms)))

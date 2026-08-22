@@ -1,10 +1,10 @@
 # Bot Donchian Parallel-Trend (USDT-M)
 
-Bot chạy vòng **15 phút**, chiến lược **Donchian parallel-trend** trên nến **15m**: khi 2 band trên/dưới của Donchian Channel **chuyển từ song song sang không song song**, xác định xu hướng theo vị trí close so với band giữa; đợi nến ngược chiều → lọc body ATR + pot RR → vào lệnh với `size_mult`; thoát khi giá chạm band Donchian hiện tại (không SL cứng).
+Bot chạy vòng **15 phút**, chiến lược **Donchian parallel-trend** trên nến **15m**: khi 2 band trên/dưới của Donchian Channel **chuyển từ song song sang không song song**, xác định xu hướng theo vị trí close so với band giữa; đợi nến ngược chiều → lọc body ATR + pot RR → vào lệnh với `size_mult`; **breadth mid flip** (mặc định): nếu tín hiệu ngược đa số coin trên/dưới mid thì **lật side** rồi vẫn vào (neutral = cả hai); thoát khi giá chạm band Donchian hiện tại (không SL cứng).
 
 **Entry point:** `python -m src.main` → `src/donchian/cycle.py`
 
-Cấu hình live khớp backtest **body_size_rr05** + **margin 1%** (config `D_margin_1pct`).
+Cấu hình live khớp backtest **body_size_rr05** + **margin 1%** + **breadth_flip** (paper: ~**+22.6%/ngày**, MaxDD ~**25%**, ~49 lệnh/ngày — xem §7.1b).
 
 ---
 
@@ -58,8 +58,13 @@ flowchart TD
     entry_check -->|Có| counter{"Nến ngược chiều?\nTrend UP: close < open\nTrend DOWN: close > open"}
     counter -->|Có + bands không song song| filt{"body_atr ∈ 0.3–1.2\nvà pot_rr ≥ 0.5?"}
     filt -->|Không| keepWait["Giữ waiting_entry — chờ nến ngược sau"]
-    filt -->|Có| size["size_mult = clip(0.5+pot_rr, 0.5, 2)"]
-    size --> open["Vào lệnh market\nLONG (UP) / SHORT (DOWN)"]
+    filt -->|Có| breadth{"Breadth mid\n(DONCHIAN_BREADTH_MODE)"}
+    breadth -->|Neutral / off| size["size_mult = clip(0.5+pot_rr, 0.5, 2)"]
+    breadth -->|Vote khớp side| size
+    breadth -->|flip + ngược vote| flip["Lật long↔short\nđổi TP/opp + pot/size"]
+    breadth -->|hard + ngược vote| skipB["Skip breadth_hard"]
+    flip --> size
+    size --> open["Vào lệnh market"]
     open --> tp["Watcher realtime (2s):\nLong → high/mark ≥ upper hiện tại\nShort → low/mark ≤ lower hiện tại"]
     tp --> close["Đóng reduce-only"]
 ```
@@ -75,16 +80,26 @@ flowchart TD
    - `body_atr = |close − open| / ATR(14)` ∈ **[0.3, 1.2]**
    - `pot_rr = dist(entry, TP band) / dist(entry, opposite band)` ≥ **0.5**
    - Fail → **không vào**, **giữ** `waiting_entry=True` (chờ counter sau)
-5. Pass → `size_mult = clip(0.5 + pot_rr, 0.5, 2.0)` → mở market.
+5. Pass → `size_mult = clip(0.5 + pot_rr, 0.5, 2.0)`.
+6. **Breadth mid** (`DONCHIAN_BREADTH_MODE`, mặc định **`flip`**):
+   - Mỗi cycle: universe `majors` (mặc định) hoặc `scan`, đếm `close > Donchian mid` (up) vs `≤ mid` (down).
+   - Vote **long** nếu ups ≥ downs × `DONCHIAN_BREADTH_RATIO` (1.3) và tot ≥ `DONCHIAN_BREADTH_MIN_N` (12); tương tự **short**.
+   - Neutral (mẫu yếu / hòa) → cho cả hai phía như không có breadth.
+   - **`flip` (live):** tín hiệu **ngược** vote → **lật** long↔short, đổi TP/opp band, tính lại `pot_rr` + `size_mult`, **vẫn mở** (không lọc lại pot ≥ 0.5 — khớp BT `breadth_flip`). Discord `why` ghi `breadth FLIP …`.
+   - **`hard`:** ngược vote → skip `breadth_hard`, discard (BT cũ, MaxDD thấp hơn nhưng lãi ngày thấp hơn).
+   - **`off`:** tắt breadth.
+   - **Không** đóng / resize lot đang mở.
+7. Mở market → watcher TP theo band live.
 
 **Đóng lệnh:** không SL cứng. Watcher TP theo **band Donchian live** (long ≥ upper hiện tại, short ≤ lower hiện tại). `tp_band` lúc entry chỉ để hiển thị / fallback.
 
 **Khác:**
 
-- `waiting_entry` reset khi vào lệnh thành công, khi **symbol đó** đang có lot mở, hoặc `cap_skip` (max open / margin) — bỏ tín hiệu, không queue. Chỉ retry khi `open_lot` lỗi sàn (`error`).
+- `waiting_entry` reset khi vào lệnh thành công, khi **symbol đó** đang có lot mở, hoặc `cap_skip` / `breadth_hard` — bỏ tín hiệu, không queue. Flip **không** discard. Chỉ retry khi `open_lot` lỗi sàn (`error`).
 - Filter fail **không** clear `waiting_entry`.
 - Chỉ **1 lot / symbol**; `DONCHIAN_MAX_OPEN` global (mặc định 20).
 - Khung nến: `DONCHIAN_INTERVAL` (mặc định `15m`) ghi đè `GRANULARITY`.
+- Breadth universe `majors`: WS subscribe thêm majors (kể cả ngoài top-N) để đủ mẫu mid.
 
 ### Discord khi mở lệnh
 
@@ -130,6 +145,7 @@ Ví dụ equity 1000 USDT, `size_mult=1.35`: margin = 13.50 USDT, notional = 135
 | Lot `status=open` trong DB / trên sàn | Watcher vẫn TP theo band Donchian live |
 | Size / margin lot cũ | Giữ lúc mở (vd. 0.5% cũ); **không** chỉnh lên 1% hay `size_mult` |
 | Filter body / pot_rr | Chỉ khi **mở lệnh mới** |
+| Breadth mid flip/hard | Chỉ khi **mở lệnh mới**; lot mở sẵn không bị đóng / lật |
 | Cột DB mới (`body_atr`, `pot_rr`, `size_mult`, `opp_band`) | Lot cũ = `NULL`; close notify bỏ qua dòng meta nếu thiếu |
 | Symbol đang có lot mở | `allow_entry=False` → không mở thêm |
 | Sau khi lot cũ TP | Lệnh tiếp theo dùng rule mới + margin 1% + notify đầy đủ |
@@ -213,13 +229,31 @@ So sánh cùng pool / cùng filter:
 
 | Config | %/ngày | MaxDD | lệnh/ngày | Note |
 |--------|--------|-------|-----------|------|
-| **D20_like_bot** (1%, max20) | +33.5% | 49.9% | 46.3 | Giống tham số bot hiện tại |
-| D20_max10 (1%, max10) | +10.2% | 35.7% | 34.8 | Bớt slot → DD thấp hơn |
-| A20_half (0.5%, max20) | +2.9% | 25.1% | 46.3 | Nhẹ rủi ro hơn |
+| **D20_like_bot** (1%, max20) | +33.5% | 49.9% | 46.3 | Không breadth |
+| **+ breadth_flip** | **+22.6%** | **25.3%** | **48.7** | **Live mặc định** |
+| + breadth_mid hard | +8.75% | 19.0% | 38.6 | Mode `hard` (skip ngược) |
+| D20_max10 (1%, max10) | +10.2% | 35.7% | 34.8 | Bớt slot |
+| A20_half (0.5%, max20) | +2.9% | 25.1% | 46.3 | Margin nhẹ hơn |
 
-**Cách đọc:** %/ngày paper D20 **phóng đại** (nhiều lệnh song song trên equity tăng); đáng chú ý hơn là **MaxDD ~50%** và PF/WR vẫn ổn. Live top-N theo volume ≠ đúng 20 major cố định.
+**Cách đọc:** D20 không gate lãi cao nhất nhưng MaxDD ~50%. **Flip** (live) giữ ~2/3 lãi ngày D20, MaxDD ~25%. **Hard** MaxDD thấp nhất (~19%) nhưng lãi ngày chỉ ~1/4 D20.
 
-Chi tiết: [`backtest_MULTI_donchian_20major_shared_D_15m_365d.md`](backtest_MULTI_donchian_20major_shared_D_15m_365d.md) · script `scripts/backtest_donchian_20coin_shared_d.py`
+Chi tiết baseline D20: [`backtest_MULTI_donchian_20major_shared_D_15m_365d.md`](backtest_MULTI_donchian_20major_shared_D_15m_365d.md) · `scripts/backtest_donchian_20coin_shared_d.py`
+
+### 7.1b Breadth mid — **flip (live)** vs hard
+
+Cùng D20; sau body/RR, vote pool mid (ratio ≥ 1.3, n ≥ 12). Neutral → cả hai phía.
+
+| | D20 | **flip (live)** | hard (skip) |
+|--|--:|--:|--:|
+| %/ngày | +33.45% | **+22.57%** | +8.75% |
+| MaxDD | 49.9% | **25.3%** | **19.0%** |
+| PF / WR | 1.48 / 73.4% | 1.37 / 75.1% | 1.39 / 73.8% |
+| Lệnh / ngày | 46.3 | **48.7** | 38.6 |
+| Xử lý ngược vote | — | **lật side + vào** (~6010 lệnh flip, PnL flip paper **+27k**) | bỏ (~15248 skip) |
+
+- **Flip doc + số đầy đủ:** [`backtest_MULTI_donchian_20major_breadth_flip_15m_365d.md`](backtest_MULTI_donchian_20major_breadth_flip_15m_365d.md) · script `scripts/backtest_donchian_20coin_breadth_flip.py`
+- **Hard (so sánh):** [`backtest_MULTI_donchian_20major_timewindow_trend_15m_365d.md`](backtest_MULTI_donchian_20major_timewindow_trend_15m_365d.md) · config `breadth_mid` · `scripts/backtest_donchian_20coin_timewindow_trend.py`
+- Soft-size (paper only, không live): [`backtest_MULTI_donchian_20major_trend_size_15m_365d.md`](backtest_MULTI_donchian_20major_trend_size_15m_365d.md)
 
 ### 7.2 Ref rủi ro thấp hơn: **5 coin** shared (`D_margin_1pct` / `D5_ref`)
 
@@ -234,11 +268,40 @@ LINK, HYPE, SUI, DOGE, SOL (không BTW), margin 1%, max_open 10:
 | Lệnh / ngày | ~**11–12** |
 | MaxDD | ~**7.6%** |
 
-### 7.3 Docs / script liên quan
+### 7.3 Rút lãi ngày → spot (skim 40% + pause DD≥20%)
 
-- [`backtest_MULTI_donchian_20major_shared_D_15m_365d.md`](backtest_MULTI_donchian_20major_shared_D_15m_365d.md) — **20 majors vs 5-coin** (config gần live)
-- [`backtest_MULTI_hunt_pct_per_day_shared_15m_365d.md`](backtest_MULTI_hunt_pct_per_day_shared_15m_365d.md) — hunt %/ngày, config **`D_margin_1pct`** (5 coin)
-- [`backtest_MULTI_body_size_rr05_pnl_quality_15m_365d.md`](backtest_MULTI_body_size_rr05_pnl_quality_15m_365d.md) — chất lượng PnL / wipe theo coin (margin 0.5% tách sổ; cùng filter)
+Live (mặc định): mỗi ngày **07:00 +07**, futures → spot:
+
+```
+nếu day_pnl ≤ 0 hoặc DD_from_peak ≥ 20% → rút 0
+ngược lại rút = min(cash_free, day_pnl × 0.4, equity_đầu_ngày × 1.5%)
+```
+
+Lần đầu chưa có mốc SOD → lấy equity hiện tại làm mốc, **chưa rút**. Không auto-nạp lại. Lịch sử + lý do (rút / no_profit / dd_pause / …) trên dashboard + Discord. Warn chỉ khi **DD > 50%** hoặc **maint > 50%** (khuyến nghị nạp optional).
+
+**Sync nạp/rút tay:** trước khi rút và khi tính DD, bot đọc income `TRANSFER` futures (Binance), **trừ** lệnh bot đã ghi (`tranId` / fallback ngày+amount), rồi chỉnh **SOD + peak** theo net thủ công → nạp/rút tay không làm lệch `day_pnl` / DD. Sync fail → hoãn rút ngày đó.
+
+**Backtest** (D20_like_bot, 15m ~365d, vốn 1000$):  
+[`backtest_MULTI_donchian_20major_wd_skim40_dd20_15m_365d.md`](backtest_MULTI_donchian_20major_wd_skim40_dd20_15m_365d.md) · `scripts/backtest_donchian_20coin_wd_skim40.py`
+
+| | Paper |
+|--|--:|
+| %/ngày total | **+5.97%** |
+| End bot / spot / total | 12.2k / 10.6k / **22.8k** |
+| Ngày rút / tháng | **8 – 29** (TB ~20) |
+| **Rút % total đầu tháng** | **min 5.5% – max 27.5%** (TB ~13.6%) |
+
+(Tháng đủ ngày: ít nhất **~7.9%** / 10 ngày rút — 2025-10; nhiều % nhất **~27.5%** — 2025-11.)
+
+### 7.4 Docs / script liên quan
+
+- [`backtest_MULTI_donchian_20major_breadth_flip_15m_365d.md`](backtest_MULTI_donchian_20major_breadth_flip_15m_365d.md) — **breadth flip vs hard** (**live = flip**)
+- [`backtest_MULTI_donchian_20major_shared_D_15m_365d.md`](backtest_MULTI_donchian_20major_shared_D_15m_365d.md) — **20 majors** D20 không breadth
+- [`backtest_MULTI_donchian_20major_timewindow_trend_15m_365d.md`](backtest_MULTI_donchian_20major_timewindow_trend_15m_365d.md) — breadth hard + vote sách
+- [`backtest_MULTI_donchian_20major_trend_size_15m_365d.md`](backtest_MULTI_donchian_20major_trend_size_15m_365d.md) — soft-size (paper only)
+- [`backtest_MULTI_donchian_20major_wd_skim40_dd20_15m_365d.md`](backtest_MULTI_donchian_20major_wd_skim40_dd20_15m_365d.md) — rút skim 40% + DD pause 20%
+- [`backtest_MULTI_hunt_pct_per_day_shared_15m_365d.md`](backtest_MULTI_hunt_pct_per_day_shared_15m_365d.md) — hunt %/ngày, `D_margin_1pct` (5 coin)
+- [`backtest_MULTI_body_size_rr05_pnl_quality_15m_365d.md`](backtest_MULTI_body_size_rr05_pnl_quality_15m_365d.md) — chất lượng PnL / wipe theo coin
 
 Baseline cũ (margin 0.5%, không filter body/RR): `scripts/backtest_link_donchian_parallel_trend.py` — không còn cấu hình live mặc định.
 
@@ -261,10 +324,23 @@ DONCHIAN_MIN_BODY_ATR=0.3
 DONCHIAN_MAX_BODY_ATR=1.2
 DONCHIAN_MIN_POT_RR=0.5
 DONCHIAN_SIZE_BY_RR=true
+DONCHIAN_BREADTH_MODE=flip
+DONCHIAN_BREADTH_RATIO=1.3
+DONCHIAN_BREADTH_MIN_N=12
+DONCHIAN_BREADTH_UNIVERSE=majors
 DONCHIAN_MAX_OPEN=20
 DONCHIAN_TOP_N=30
 LEVERAGE=10
 TRADING_ENABLED=true
+
+SPOT_TRANSFER_ENABLED=true
+SPOT_TRANSFER_MODE=skim
+SPOT_TRANSFER_SKIM=0.4
+SPOT_TRANSFER_DAY_CAP_PCT=1.5
+SPOT_TRANSFER_DD_PAUSE_PCT=20
+SPOT_TRANSFER_EXECUTE_HHMM=0700
+SPOT_WARN_DD_PCT=50
+SPOT_WARN_MAINT_PCT=50
 ```
 
 ---
@@ -274,9 +350,11 @@ TRADING_ENABLED=true
 | File | Việc |
 |------|------|
 | `src/main.py` | Entry → `donchian.cycle.main()` |
-| `src/donchian/cycle.py` | Vòng lặp 15m, scan symbols, boot warmup |
+| `src/donchian/cycle.py` | Vòng lặp 15m, scan symbols, breadth vote, boot warmup, gọi spot transfer |
+| `src/donchian/breadth.py` | Breadth mid vote + flip_entry / hard allow |
 | `src/donchian/signals.py` | Donchian bands, filters, `EntrySignal` |
 | `src/donchian/trading.py` | Open/close lot, sizing × size_mult, Discord why |
 | `src/donchian/watcher.py` | Mark WS TP check mỗi 2s |
 | `src/donchian/store.py` | SQLite schema + CRUD |
+| `src/spot_transfer.py` | Rút skim 07:00 +07, lịch sử, risk warn |
 | `src/web/app.py` | Dashboard + API |

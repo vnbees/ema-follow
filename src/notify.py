@@ -160,6 +160,42 @@ class DiscordErrorLogHandler(logging.Handler):
             pass
 
 
+def notify_spot_transfer(
+    *,
+    transfer_date: str,
+    status: str,
+    amount: float,
+    detail: str,
+    day_pnl: float = 0.0,
+    dd_pct: float = 0.0,
+    equity: float = 0.0,
+    peak: float = 0.0,
+) -> None:
+    """Discord daily futures→spot decision (success / skipped / failed). Fail-soft."""
+    try:
+        if not discord_configured():
+            return
+        title = f"Spot transfer {transfer_date} — {status}"
+        body = (
+            f"{detail}\n"
+            f"amount={amount:.2f} {MARGIN_COIN} | day_pnl={day_pnl:+.2f} | "
+            f"DD={dd_pct*100:.1f}% | equity={equity:.2f} | peak={peak:.2f}"
+        )
+        _send_discord(title, body)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_spot_transfer failed: %s", exc)
+
+
+def notify_risk_warning(kind: str, message: str) -> None:
+    """Discord risk warn (DD / maint / initial). Fail-soft."""
+    try:
+        if not discord_configured():
+            return
+        _send_discord(f"Risk warn — {kind}", message)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_risk_warning failed: %s", exc)
+
+
 def notify_error(context: str, detail: str, *, cooldown_sec: float | None = None) -> None:
     """Send bot-error notification to Discord. Never raises; no balance fetch (avoid API during bans)."""
     try:

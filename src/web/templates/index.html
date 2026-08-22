@@ -69,6 +69,22 @@
     | initial={% if account.initial_margin_pct is not none %}{{ "%.2f"|format(account.initial_margin_pct) }}{% else %}—{% endif %}%
   </p>
 
+  {% set risk = spot_transfer.risk if spot_transfer else none %}
+  {% if risk and (risk.warn_dd or risk.warn_maint) %}
+  <div class="panel" style="border-color:#a371f7;">
+    <h2 style="margin-top:0;color:#d2a8ff;">Risk warning</h2>
+    <ul style="margin:0;padding-left:18px;line-height:1.7;font-size:13px;">
+      {% if risk.warn_dd %}
+      <li class="red">DD từ peak {{ "%.1f"|format(risk.dd_pct) }}% &gt; 50% (peak={{ "%.0f"|format(risk.peak) }}).
+        Khuyến nghị nạp ~{{ "%.0f"|format(risk.suggest_topup) }} USDT (optional).</li>
+      {% endif %}
+      {% if risk.warn_maint %}
+      <li class="red">Maint {{ "%.2f"|format(risk.maint_pct or 0) }}% &gt; 50%.</li>
+      {% endif %}
+    </ul>
+  </div>
+  {% endif %}
+
   <p class="meta">Cycle gần nhất: {{ last_cycle_at | vn_time }}</p>
 
   <div class="controls">
@@ -266,12 +282,60 @@
     </div>
   </div>
 
+  <div class="panel">
+    <h2 style="margin-top:0;">Futures → Spot (hàng ngày 07:00 +07)</h2>
+    {% set st = spot_transfer.status if spot_transfer else none %}
+    <p class="meta" style="margin-top:0;" id="spotStatusMeta">
+      mode={{ st.mode if st else "—" }}
+      · skim={% if st and st.skim is not none %}{{ "%.0f"|format(st.skim * 100) }}{% else %}—{% endif %}%
+      · cap={{ "%.1f"|format(st.day_cap_pct) if st and st.day_cap_pct is not none else "—" }}%/ngày
+      · pause DD≥{{ "%.0f"|format(st.dd_pause_pct) if st and st.dd_pause_pct is not none else "—" }}%
+      · SOD={{ "%.2f"|format(st.sod_equity) if st and st.sod_equity is not none else "—" }}
+      · peak={{ "%.2f"|format(st.peak_equity) if st and st.peak_equity is not none else "—" }}
+      · hôm nay: {{ st.latest_status or "chưa chạy" }}{% if st and st.latest_reason %} — {{ st.latest_reason }}{% endif %}
+    </p>
+    <p class="meta" style="margin:0 0 8px;">Lịch sử từ hôm nay (+07)</p>
+    <div class="table-wrap">
+      <table id="spotTransferTable">
+        <thead>
+          <tr>
+            <th>Ngày</th>
+            <th>Status</th>
+            <th>Amount</th>
+            <th>Day PnL</th>
+            <th>DD%</th>
+            <th>Lý do</th>
+          </tr>
+        </thead>
+        <tbody id="spotTransferBody">
+          {% for r in (spot_transfer.rows if spot_transfer else []) %}
+          <tr>
+            <td>{{ r.date }}</td>
+            <td>{{ r.status }}</td>
+            <td>{{ "%.2f"|format(r.amount) }}</td>
+            <td class="{% if r.day_pnl is not none and r.day_pnl >= 0 %}green{% elif r.day_pnl is not none %}red{% endif %}">
+              {% if r.day_pnl is not none %}{{ "%+.2f"|format(r.day_pnl) }}{% else %}—{% endif %}
+            </td>
+            <td>{% if r.dd_pct is not none %}{{ "%.1f"|format(r.dd_pct) }}{% else %}—{% endif %}</td>
+            <td style="white-space:normal;max-width:420px;">{{ r.detail or r.reason or "—" }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6" class="empty">Chưa có lịch sử chuyển tiền hôm nay.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="pager" id="spotTransferPager"></div>
+  </div>
+
   <script>
     let equityChart = null;
     let equityRange = '7d';
     let openPage = 1;
     let closedPage = 1;
+    let spotPage = 1;
     const pageSize = 50;
+    const spotPageSize = 20;
 
     function pnlClass(v) {
       return (v || 0) >= 0 ? 'green' : 'red';
@@ -367,11 +431,12 @@
         </article>`;
     }
 
-    function renderPager(el, page, pages, total, onPrev, onNext) {
+    function renderPager(el, page, pages, total, onPrev, onNext, unitLabel) {
       if (!el) return;
+      const unit = unitLabel || 'lệnh';
       el.innerHTML = `
         <button type="button" ${page <= 1 ? 'disabled' : ''}>Prev</button>
-        <span>Trang ${page} / ${pages} · ${total} lệnh</span>
+        <span>Trang ${page} / ${pages} · ${total} ${unit}</span>
         <button type="button" ${page >= pages ? 'disabled' : ''}>Next</button>
       `;
       const buttons = el.querySelectorAll('button');
@@ -399,6 +464,72 @@
         return;
       }
       list.innerHTML = trades.map(t => tradeCard(t, 'closed')).join('');
+    }
+
+    function renderSpotTransfers(data) {
+      const tbody = document.getElementById('spotTransferBody');
+      const pager = document.getElementById('spotTransferPager');
+      if (!tbody) return;
+      const rows = (data && data.rows) || [];
+      if (!rows.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty">Chưa có lịch sử chuyển tiền hôm nay.</td></tr>';
+      } else {
+        tbody.innerHTML = rows.map(r => {
+          const pnl = r.day_pnl;
+          const pnlCls = (pnl === null || pnl === undefined) ? '' : pnlClass(pnl);
+          const pnlTxt = (pnl === null || pnl === undefined) ? '—' : ((pnl >= 0 ? '+' : '') + Number(pnl).toFixed(2));
+          const dd = (r.dd_pct === null || r.dd_pct === undefined) ? '—' : Number(r.dd_pct).toFixed(1);
+          const detail = (r.detail || r.reason || '—').replace(/</g, '&lt;');
+          return `<tr>
+            <td>${r.date || '—'}</td>
+            <td>${r.status || '—'}</td>
+            <td>${Number(r.amount || 0).toFixed(2)}</td>
+            <td class="${pnlCls}">${pnlTxt}</td>
+            <td>${dd}</td>
+            <td style="white-space:normal;max-width:420px;">${detail}</td>
+          </tr>`;
+        }).join('');
+      }
+      const page = (data && data.page) || 1;
+      const pages = (data && data.pages) || 1;
+      const total = (data && data.total) || 0;
+      renderPager(
+        pager,
+        page, pages, total,
+        () => { if (spotPage > 1) { spotPage -= 1; refreshSpotTransfers(); } },
+        () => { if (spotPage < pages) { spotPage += 1; refreshSpotTransfers(); } },
+        'bản ghi (từ hôm nay)',
+      );
+    }
+
+    async function refreshSpotTransfers() {
+      try {
+        const res = await fetch(
+          '/api/spot-transfers?page=' + spotPage + '&page_size=' + spotPageSize
+        );
+        if (!res.ok) return;
+        const data = await res.json();
+        renderSpotTransfers(data);
+        const meta = document.getElementById('spotStatusMeta');
+        const st = data.status || {};
+        if (meta && st) {
+          const skim = st.skim != null ? (st.skim * 100).toFixed(0) : '—';
+          const cap = st.day_cap_pct != null ? Number(st.day_cap_pct).toFixed(1) : '—';
+          const ddPause = st.dd_pause_pct != null ? Number(st.dd_pause_pct).toFixed(0) : '—';
+          const sod = st.sod_equity != null ? Number(st.sod_equity).toFixed(2) : '—';
+          const peak = st.peak_equity != null ? Number(st.peak_equity).toFixed(2) : '—';
+          let today = st.latest_status || 'chưa chạy';
+          if (st.latest_reason) today += ' — ' + st.latest_reason;
+          meta.textContent =
+            'mode=' + (st.mode || '—') +
+            ' · skim=' + skim + '%' +
+            ' · cap=' + cap + '%/ngày' +
+            ' · pause DD≥' + ddPause + '%' +
+            ' · SOD=' + sod +
+            ' · peak=' + peak +
+            ' · hôm nay: ' + today;
+        }
+      } catch (_) {}
     }
 
     function renderDaily(rows) {
@@ -429,6 +560,7 @@
         loadTrades('closed', closedPage),
         fetch('/api/donchian/daily?days=30').then(r => r.ok ? r.json() : null),
       ]);
+      refreshSpotTransfers();
       if (openData) {
         renderOpen(openData.trades || []);
         renderPager(

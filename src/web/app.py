@@ -360,12 +360,28 @@ def _dashboard_context() -> dict:
     from src.donchian import store
 
     daily = store.daily_stats(30)
+    try:
+        from src.spot_transfer import dashboard_payload as spot_dashboard
+
+        spot = spot_dashboard(page=1, page_size=20, since_today=True)
+    except Exception:  # noqa: BLE001
+        spot = {
+            "status": {},
+            "rows": [],
+            "risk": {},
+            "page": 1,
+            "pages": 1,
+            "total": 0,
+            "page_size": 20,
+            "since": None,
+        }
     return {
         "exchange_name": EXCHANGE_DISPLAY_NAME,
         "bot_title": "Donchian Trend",
         "account": account,
         "last_cycle_at": get_last_cycle_at(),
         "trading_enabled": is_trading_enabled(),
+        "spot_transfer": spot,
         "rsi_rev": {
             "open_count": open_payload["open_count"],
             "closed_count": open_payload["closed_count"],
@@ -410,9 +426,37 @@ def api_status() -> dict:
         "trading_enabled": is_trading_enabled(),
         "last_cycle_at": format_vn_time(get_last_cycle_at()),
         "rsi_rev": donchian,
+        "spot_transfer": _spot_api_payload(),
         "rate_limited": rate_limited,
         "rate_limit_remaining_sec": rate_limit_remaining_sec,
     }
+
+
+def _spot_api_payload(*, page: int = 1, page_size: int = 20) -> dict:
+    try:
+        from src.spot_transfer import dashboard_payload
+
+        return dashboard_payload(page=page, page_size=page_size, since_today=True)
+    except Exception:  # noqa: BLE001
+        return {
+            "status": {},
+            "rows": [],
+            "risk": {},
+            "page": 1,
+            "pages": 1,
+            "total": 0,
+            "page_size": page_size,
+            "since": None,
+        }
+
+
+@app.get("/api/spot-transfers")
+def api_spot_transfers(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=5, le=100),
+) -> dict:
+    """Lịch sử rút futures→spot từ hôm nay (+07), có phân trang."""
+    return _spot_api_payload(page=page, page_size=page_size)
 
 
 @app.get("/api/donchian/trades")

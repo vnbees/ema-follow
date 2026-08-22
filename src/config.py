@@ -249,10 +249,20 @@ REST_WEIGHT_SAFE_MAX = int(os.getenv("REST_WEIGHT_SAFE_MAX", "800"))
 REST_WEIGHT_HARD_MAX = int(os.getenv("REST_WEIGHT_HARD_MAX", "1800"))
 
 SPOT_TRANSFER_ENABLED = os.getenv("SPOT_TRANSFER_ENABLED", "true").lower() in ("1", "true", "yes")
+# skim (default): green-day profit skim | pct/hwm: legacy modes retained for env compat
+_SPOT_TRANSFER_MODE_RAW = os.getenv("SPOT_TRANSFER_MODE", "skim").strip().lower()
+SPOT_TRANSFER_MODE = (
+    _SPOT_TRANSFER_MODE_RAW if _SPOT_TRANSFER_MODE_RAW in ("skim", "pct", "hwm") else "skim"
+)
+# Legacy pct mode: fixed % of equity / day
 SPOT_TRANSFER_PCT = float(os.getenv("SPOT_TRANSFER_PCT", "1"))
-# pct: fixed % of equity daily | hwm: share of equity above high-water mark (Binance only).
-_SPOT_TRANSFER_MODE_RAW = os.getenv("SPOT_TRANSFER_MODE", "pct").strip().lower()
-SPOT_TRANSFER_MODE = _SPOT_TRANSFER_MODE_RAW if _SPOT_TRANSFER_MODE_RAW in ("pct", "hwm") else "pct"
 SPOT_TRANSFER_HWM_SHARE = float(os.getenv("SPOT_TRANSFER_HWM_SHARE", "50"))
-SPOT_TRANSFER_PREPARE_HHMM = os.getenv("SPOT_TRANSFER_PREPARE_HHMM", "0655").strip()
+# Skim mode (confirm live): rút = min(cash, day_pnl×skim, sod×day_cap); pause nếu DD≥pause
+SPOT_TRANSFER_SKIM = float(os.getenv("SPOT_TRANSFER_SKIM", "0.4"))
+SPOT_TRANSFER_DAY_CAP_PCT = float(os.getenv("SPOT_TRANSFER_DAY_CAP_PCT", "1.5")) / 100.0
+SPOT_TRANSFER_DD_PAUSE_PCT = float(os.getenv("SPOT_TRANSFER_DD_PAUSE_PCT", "20")) / 100.0
 SPOT_TRANSFER_EXECUTE_HHMM = os.getenv("SPOT_TRANSFER_EXECUTE_HHMM", "0700").strip()
+# Risk warnings (Discord + dashboard) — chỉ khi DD hoặc maint > 50%
+SPOT_WARN_DD_PCT = float(os.getenv("SPOT_WARN_DD_PCT", "50")) / 100.0
+SPOT_WARN_MAINT_PCT = float(os.getenv("SPOT_WARN_MAINT_PCT", "50"))
+SPOT_WARN_COOLDOWN_SEC = float(os.getenv("SPOT_WARN_COOLDOWN_SEC", "3600"))
