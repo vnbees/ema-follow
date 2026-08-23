@@ -4,7 +4,7 @@ Bot chạy vòng **15 phút**, chiến lược **Donchian parallel-trend** trên
 
 **Entry point:** `python -m src.main` → `src/donchian/cycle.py`
 
-Cấu hình live khớp backtest **body_size_rr05** + **margin 1%** + **breadth_flip** (paper: ~**+22.6%/ngày**, MaxDD ~**25%**, ~49 lệnh/ngày — xem §7.1b).
+Cấu hình live khớp backtest **breadth_flip + skim spot** (paper 365d, vốn 1000$: total **~18.6×**, MaxDD total **~16%**, ~**+4.8%/ngày** total — xem §7.3). Chi tiết flip thuần / 3 năm: §7.1b–c.
 
 ---
 
@@ -154,18 +154,25 @@ Restart bot sau deploy: reconcile lot mở như cũ; **không** force-flat. Prod
 
 ---
 
-## 4. Symbol scan động
+## 4. Symbol scan pool
 
-Thay vì hardcode, bot scan **tất cả USDT-M futures** theo 24h quote volume từ WS cache (`!miniTicker@arr`):
+**Mặc định live (khớp backtest):** `DONCHIAN_SCAN_MODE=fixed` — **20 majors cố định**, cùng list BT `SYMBOLS_20`:
+
+BTC, ETH, BNB, SOL, XRP, TRX, ADA, AVAX, DOT, LINK, LTC, BCH, XLM, ATOM, NEAR, APT, SUI, ARB, OP, UNI.
+
+- Breadth vote dùng **cùng 20 coin** (trade + vote một pool — khớp backtest).
+- Override list: `DONCHIAN_FIXED_SYMBOLS=BTCUSDT,...`
+- Boot **không** chờ miniTicker volume rank.
+
+**Tùy chọn:** `DONCHIAN_SCAN_MODE=volume` — scan **top-N** theo 24h quote volume từ WS (`!miniTicker@arr`):
 
 - `DONCHIAN_TOP_N = 30` coin volume cao nhất (sau khi lọc)
 - Loại trừ: stablecoin (USDC, BUSD, FDUSD…), leverage token (UP/DOWN/BULL/BEAR)
 - **Symbol filter** (`DONCHIAN_SYMBOL_FILTER=true`):
   - Listing **≥ 365 ngày** (`DONCHIAN_MIN_LISTING_DAYS`) theo `onboardDate` Binance — **áp dụng mọi coin**
-  - **24h range ≤ 15%** (`DONCHIAN_MAX_RANGE_24H_PCT`) — **chỉ non-major**. Majors bypass range (vẫn cần listing ≥ 365d): BTC, ETH, BNB, SOL, XRP, TRX + L1/L2/infra ổn định (ADA, AVAX, DOT, LINK, LTC, BCH, XLM, ATOM, NEAR, APT, SUI, ARB, OP, UNI, AAVE, FIL). **Không** gồm meme (DOGE, PEPE) hay HYPE.
+  - **24h range ≤ 15%** (`DONCHIAN_MAX_RANGE_24H_PCT`) — **chỉ non-major**. Majors bypass range (vẫn cần listing ≥ 365d).
   - **Lệnh đang mở không bị đóng**; coin bị lọc chỉ không mở thêm, watcher vẫn TP
-- `set_watched_symbols(top_30 + open lots)` → KlineStream subscribe cả coin đang giữ lệnh
-- Không tốn REST để scan — dùng `CACHE.quote_volumes` + `exchangeInfo` cache
+- `set_watched_symbols(pool + open lots)` → KlineStream subscribe cả coin đang giữ lệnh
 
 ---
 
@@ -251,9 +258,40 @@ Cùng D20; sau body/RR, vote pool mid (ratio ≥ 1.3, n ≥ 12). Neutral → c�
 | Lệnh / ngày | 46.3 | **48.7** | 38.6 |
 | Xử lý ngược vote | — | **lật side + vào** (~6010 lệnh flip, PnL flip paper **+27k**) | bỏ (~15248 skip) |
 
-- **Flip doc + số đầy đủ:** [`backtest_MULTI_donchian_20major_breadth_flip_15m_365d.md`](backtest_MULTI_donchian_20major_breadth_flip_15m_365d.md) · script `scripts/backtest_donchian_20coin_breadth_flip.py`
+- **Flip doc + số đầy đủ (365d):** [`backtest_MULTI_donchian_20major_breadth_flip_15m_365d.md`](backtest_MULTI_donchian_20major_breadth_flip_15m_365d.md) · script `scripts/backtest_donchian_20coin_breadth_flip.py`
 - **Hard (so sánh):** [`backtest_MULTI_donchian_20major_timewindow_trend_15m_365d.md`](backtest_MULTI_donchian_20major_timewindow_trend_15m_365d.md) · config `breadth_mid` · `scripts/backtest_donchian_20coin_timewindow_trend.py`
 - Soft-size (paper only, không live): [`backtest_MULTI_donchian_20major_trend_size_15m_365d.md`](backtest_MULTI_donchian_20major_trend_size_15m_365d.md)
+
+### 7.1c Backtest **3 năm** — chỉ `breadth_flip` (logic live)
+
+Cùng rule §7.1b · pool **20 majors** · 15m · ~**1095 ngày** · vốn 1000$ · fee 0.04%/side · 10x · margin 1%×`size_mult` (compound).
+
+**Doc đầy đủ:** [`backtest_MULTI_donchian_20major_breadth_flip_15m_1095d.md`](backtest_MULTI_donchian_20major_breadth_flip_15m_1095d.md) · script `scripts/backtest_donchian_20coin_breadth_flip_3y.py`
+
+**Cách đọc 3 năm:** `%/ngày` trong doc 1095d **không dùng để so sánh** — margin theo equity compound khiến số % phình vô nghĩa. So **MaxDD, PF, WR, lệnh/ngày, % lệnh flip** (không phụ thuộc compound).
+
+| Cửa sổ | MaxDD | PF | WR | lệnh/ngày | flip_ok / n |
+|--------|------:|---:|---:|----------:|------------:|
+| **365d** (BT cũ, live ref) | **25.3%** | 1.37 | 75.1% | 48.7 | ~34% |
+| **Full 3y** | **37.2%** | 1.40 | 74.7% | 48.5 | ~33% |
+| Y1 (2023-08 → 2024-08) | 19.1% | 1.49 | 74.1% | 49.2 | ~33% |
+| Y2 (2024-08 → 2025-08) | **37.2%** | 1.40 | 74.8% | 47.8 | ~33% |
+| Y3 (2025-08 → 2026-08) | 25.3% | 1.40 | 75.0% | 48.6 | ~34% |
+
+**Kết luận paper (live = flip):**
+
+- **Edge ổn định** qua 3 năm: PF ~1.37–1.49, WR ~74–75%, ~48 lệnh/ngày, ~33% lệnh qua flip — gần như không đổi so với 365d.
+- **MaxDD không đều:** 365d gần nhất ~25%; full 3y ~**37%** (Y2 kéo DD sâu). Kỳ vọng deploy: chuẩn bị DD **~30–40%** trong giai đoạn xấu, không chỉ ~25% từ 1 năm gần.
+- 365d cuối (từ cache 3y) khớp BT 365d cũ → data và logic nhất quán.
+
+365d vs 3y (chỉ metric so sánh được):
+
+| | 365d flip | 3y flip | Δ |
+|--|--:|--:|--|
+| MaxDD | 25.3% | 37.2% | +11.9pp |
+| PF | 1.37 | 1.40 | +0.03 |
+| WR | 75.1% | 74.7% | −0.4pp |
+| lệnh/ngày | 48.7 | 48.5 | ~0 |
 
 ### 7.2 Ref rủi ro thấp hơn: **5 coin** shared (`D_margin_1pct` / `D5_ref`)
 
@@ -268,34 +306,62 @@ LINK, HYPE, SUI, DOGE, SOL (không BTW), margin 1%, max_open 10:
 | Lệnh / ngày | ~**11–12** |
 | MaxDD | ~**7.6%** |
 
-### 7.3 Rút lãi ngày → spot (skim 40% + pause DD≥20%)
+### 7.3 **Live stack** — breadth_flip + rút spot (skim 40% + pause DD≥20%)
 
-Live (mặc định): mỗi ngày **07:00 +07**, futures → spot:
+**Backtest sát bot đang chạy nhất** (trade + rút):  
+[`backtest_MULTI_donchian_20major_breadth_flip_wd_skim40_15m_365d.md`](backtest_MULTI_donchian_20major_breadth_flip_wd_skim40_15m_365d.md) · `scripts/backtest_donchian_20coin_breadth_flip_wd_skim40.py`
+
+Rule trade: §2 (**breadth_flip**, body ATR, pot_rr, margin 1%×size_mult, max_open 20, 20 majors paper).
+
+Rule rút live — mỗi ngày **07:00 +07**, futures → spot:
 
 ```
 nếu day_pnl ≤ 0 hoặc DD_from_peak ≥ 20% → rút 0
 ngược lại rút = min(cash_free, day_pnl × 0.4, equity_đầu_ngày × 1.5%)
 ```
 
-Lần đầu chưa có mốc SOD → lấy equity hiện tại làm mốc, **chưa rút**. Không auto-nạp lại. Lịch sử + lý do (rút / no_profit / dd_pause / …) trên dashboard + Discord. Warn chỉ khi **DD > 50%** hoặc **maint > 50%** (khuyến nghị nạp optional).
+Lần đầu chưa có mốc SOD → lấy equity hiện tại làm mốc, **chưa rút**. Không auto-nạp lại. Lịch sử + lý do trên dashboard + Discord. Warn khi **DD > 50%** hoặc **maint > 50%**.
 
-**Sync nạp/rút tay:** trước khi rút và khi tính DD, bot đọc income `TRANSFER` futures (Binance), **trừ** lệnh bot đã ghi (`tranId` / fallback ngày+amount), rồi chỉnh **SOD + peak** theo net thủ công → nạp/rút tay không làm lệch `day_pnl` / DD. Sync fail → hoãn rút ngày đó.
+**Sync nạp/rút tay:** bot đọc income `TRANSFER` futures, trừ lệnh bot đã ghi, chỉnh **SOD + peak** → nạp/rút tay không lệch `day_pnl` / DD.
 
-**Backtest** (D20_like_bot, 15m ~365d, vốn 1000$):  
-[`backtest_MULTI_donchian_20major_wd_skim40_dd20_15m_365d.md`](backtest_MULTI_donchian_20major_wd_skim40_dd20_15m_365d.md) · `scripts/backtest_donchian_20coin_wd_skim40.py`
+#### Paper 365d · vốn 1000 USDT
 
-| | Paper |
-|--|--:|
-| %/ngày total | **+5.97%** |
-| End bot / spot / total | 12.2k / 10.6k / **22.8k** |
-| Ngày rút / tháng | **8 – 29** (TB ~20) |
-| **Rút % total đầu tháng** | **min 5.5% – max 27.5%** (TB ~13.6%) |
+| Metric | Value |
+|--------|------:|
+| **%/ngày total** (bot+spot) | **+4.83%** |
+| Cuối kỳ bot / spot / **total** | 9,871 / 8,741 / **18,612** |
+| MaxDD bot / **total** | 25.9% / **16.0%** |
+| PF / WR / lệnh/ngày | 1.40 / 75.0% / 48.6 |
+| Ngày rút | **260/365** (skip: no_profit 104, dd_pause 2) |
+| Rút % đầu tháng (min–max–avg) | **4.8% – 22.6% – 12.6%** |
 
-(Tháng đủ ngày: ít nhất **~7.9%** / 10 ngày rút — 2025-10; nhiều % nhất **~27.5%** — 2025-11.)
+**Total (bot+spot) đầu tháng** (paper):
+
+| Tháng | Total | Spot | Bot | vs 1000$ |
+|-------|------:|-----:|----:|---------:|
+| 2025-08 | 1,000$ | 0$ | 1,000$ | +0% |
+| 2025-09 | 1,265$ | 73$ | 1,192$ | +27% |
+| 2025-10 | 1,563$ | 287$ | 1,275$ | +56% |
+| 2025-12 | 3,347$ | 1,054$ | 2,293$ | +235% |
+| 2026-06 | 11,559$ | 5,549$ | 6,010$ | +1056% |
+| 2026-08 | 16,019$ | 7,929$ | 8,090$ | +1502% |
+
+(Bot = Total − Spot. Bảng đầy đủ 13 tháng trong doc link trên.)
+
+**Cách đọc:**
+
+- Sau ~1 năm paper: **~18.6×** vốn gốc; **~47%** total đã sang spot (bảo toàn lãi).
+- MaxDD **total ~16%** — thấp hơn flip không rút (~25%) nhờ skim hàng ngày.
+- Compound futures chậm hơn flip thuần (~89k bot-only) — đổi lấy rủi ro total thấp + spot tích lũy.
+- Live có thể thấp hơn paper (slippage, pool top-N động ≠ 20 majors cố định).
+
+BT cũ D20 + skim (không breadth): [`backtest_MULTI_donchian_20major_wd_skim40_dd20_15m_365d.md`](backtest_MULTI_donchian_20major_wd_skim40_dd20_15m_365d.md) — total ~22.8k nhưng MaxDD total ~40%.
 
 ### 7.4 Docs / script liên quan
 
-- [`backtest_MULTI_donchian_20major_breadth_flip_15m_365d.md`](backtest_MULTI_donchian_20major_breadth_flip_15m_365d.md) — **breadth flip vs hard** (**live = flip**)
+- [`backtest_MULTI_donchian_20major_breadth_flip_wd_skim40_15m_365d.md`](backtest_MULTI_donchian_20major_breadth_flip_wd_skim40_15m_365d.md) — **live stack: flip + skim spot (365d)** ← **BT sát live nhất**
+- [`backtest_MULTI_donchian_20major_breadth_flip_15m_365d.md`](backtest_MULTI_donchian_20major_breadth_flip_15m_365d.md) — breadth flip vs hard, 365d (trade only)
+- [`backtest_MULTI_donchian_20major_breadth_flip_15m_1095d.md`](backtest_MULTI_donchian_20major_breadth_flip_15m_1095d.md) — **breadth flip, 3 năm (~1095d)** · xem §7.1c
 - [`backtest_MULTI_donchian_20major_shared_D_15m_365d.md`](backtest_MULTI_donchian_20major_shared_D_15m_365d.md) — **20 majors** D20 không breadth
 - [`backtest_MULTI_donchian_20major_timewindow_trend_15m_365d.md`](backtest_MULTI_donchian_20major_timewindow_trend_15m_365d.md) — breadth hard + vote sách
 - [`backtest_MULTI_donchian_20major_trend_size_15m_365d.md`](backtest_MULTI_donchian_20major_trend_size_15m_365d.md) — soft-size (paper only)
@@ -329,6 +395,8 @@ DONCHIAN_BREADTH_RATIO=1.3
 DONCHIAN_BREADTH_MIN_N=12
 DONCHIAN_BREADTH_UNIVERSE=majors
 DONCHIAN_MAX_OPEN=20
+DONCHIAN_SCAN_MODE=fixed
+# DONCHIAN_FIXED_SYMBOLS=...  # optional override; default = BT 20 majors
 DONCHIAN_TOP_N=30
 LEVERAGE=10
 TRADING_ENABLED=true

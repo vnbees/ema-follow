@@ -38,6 +38,7 @@ from src.donchian.config import (
     BREADTH_UNIVERSE,
     CANDLE_LIMIT,
     DONCHIAN_PERIOD,
+    FIXED_SCAN_SYMBOLS,
     INTERVAL,
     LEVERAGE,
     MAJOR_SYMBOLS,
@@ -47,6 +48,7 @@ from src.donchian.config import (
     MIN_BODY_ATR,
     MIN_POT_RR,
     PARALLEL_TOL,
+    SCAN_MODE,
     SIZE_BY_RR,
     SLOPE_LOOKBACK,
     TOP_N_SYMBOLS,
@@ -115,10 +117,26 @@ def start_web_server() -> None:
 
 
 def _top_symbols() -> list[str]:
-    """Pick top-N USDT-M futures by 24h quote volume. Cached for 4h to reduce churn."""
+    """Scan pool: fixed BT-20 list or top-N by 24h quote volume (cached 4h)."""
     global _cached_symbols, _symbols_refreshed_at
 
     now = time.monotonic()
+    if SCAN_MODE == "fixed":
+        syms = [
+            s
+            for s in FIXED_SCAN_SYMBOLS
+            if not is_excluded_symbol(s) and not is_untradable(s)
+        ]
+        if syms != _cached_symbols:
+            _cached_symbols = syms
+            _symbols_refreshed_at = now
+            logging.info(
+                "Fixed scan pool (%d, BT majors): %s",
+                len(syms),
+                ", ".join(syms),
+            )
+        return syms
+
     if _cached_symbols and (now - _symbols_refreshed_at) < _SYMBOLS_REFRESH_INTERVAL_SEC:
         return [s for s in _cached_symbols if not is_untradable(s)]
 
@@ -505,6 +523,9 @@ def _closed_bars_for_symbol(symbol: str, now_ms: int) -> list[DonchianBar] | Non
 
 
 def _breadth_universe(scan_symbols: list[str]) -> list[str]:
+    # Fixed scan = same 20 coins for trade + breadth (khớp backtest)
+    if SCAN_MODE == "fixed":
+        return list(scan_symbols)
     if BREADTH_UNIVERSE == "scan":
         return list(scan_symbols)
     return sorted(MAJOR_SYMBOLS)
@@ -707,7 +728,10 @@ def run_cycle() -> None:
 
     symbols = _top_symbols()
     if not symbols:
-        logging.info("No symbols from WS volume cache yet — waiting...")
+        if SCAN_MODE == "fixed":
+            logging.info("Fixed scan pool empty — check DONCHIAN_FIXED_SYMBOLS")
+        else:
+            logging.info("No symbols from WS volume cache yet — waiting...")
         return
 
     _sync_watched(symbols)
@@ -777,12 +801,15 @@ def main() -> None:
             _maybe_clear_stale_rate_limit()
             start_binance_ws()
             _wait_binance_ws_ready()
-            # Wait for miniTicker to populate quote_volumes (15m candles → no rush)
-            for _ in range(6):
-                time.sleep(5)
-                if _top_symbols():
-                    break
-            initial_symbols = _top_symbols()
+            if SCAN_MODE == "fixed":
+                initial_symbols = _top_symbols()
+            else:
+                # Wait for miniTicker to populate quote_volumes (15m candles → no rush)
+                for _ in range(6):
+                    time.sleep(5)
+                    if _top_symbols():
+                        break
+                initial_symbols = _top_symbols()
             if initial_symbols:
                 _sync_watched(initial_symbols)
             _start_boot_warmup(initial_symbols or [])
@@ -795,11 +822,13 @@ def main() -> None:
     logging.info("%s Donchian Parallel-Trend bot started", EXCHANGE_DISPLAY_NAME)
     logging.info("Dashboard: http://localhost:%d", WEB_PORT)
     logging.info(
-        "Logic: Donchian(%d) slope_lb=%d tol=%.3f%% interval=%s | WS kline=%s | top_N=%d | "
+        "Logic: Donchian(%d) slope_lb=%d tol=%.3f%% interval=%s | WS kline=%s | scan=%s | "
         "margin=%.2f%% × %dx | max_open=%d | breadth=%s (ratio=%.2f min_n=%d universe=%s)",
         DONCHIAN_PERIOD, SLOPE_LOOKBACK, PARALLEL_TOL, INTERVAL, GRANULARITY,
-        TOP_N_SYMBOLS, MARGIN_PCT * 100, LEVERAGE, MAX_OPEN,
-        BREADTH_MODE, BREADTH_RATIO, BREADTH_MIN_N, BREADTH_UNIVERSE,
+        f"fixed×{len(FIXED_SCAN_SYMBOLS)}" if SCAN_MODE == "fixed" else f"top-{TOP_N_SYMBOLS}",
+        MARGIN_PCT * 100, LEVERAGE, MAX_OPEN,
+        BREADTH_MODE, BREADTH_RATIO, BREADTH_MIN_N,
+        "bt20" if SCAN_MODE == "fixed" else BREADTH_UNIVERSE,
     )
     if is_trading_enabled():
         logging.info("Trading: LIVE")

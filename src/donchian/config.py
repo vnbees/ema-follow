@@ -15,6 +15,44 @@ TOP_N_SYMBOLS = int(os.getenv("DONCHIAN_TOP_N", "30"))
 WATCHER_INTERVAL_SEC = float(os.getenv("DONCHIAN_WATCHER_INTERVAL_SEC", "2"))
 BALANCE_CACHE_MAX_AGE_SEC = float(os.getenv("DONCHIAN_BALANCE_CACHE_MAX_AGE_SEC", "30"))
 
+# Scan pool: fixed = BT 20 majors (default, khớp backtest); volume = top-N theo 24h quote vol
+SCAN_MODE = os.getenv("DONCHIAN_SCAN_MODE", "fixed").strip().lower()
+if SCAN_MODE not in ("fixed", "volume"):
+    SCAN_MODE = "fixed"
+
+# Same list as scripts/backtest_donchian_20coin_breadth_flip.py SYMBOLS_20
+BACKTEST_SYMBOLS_20: tuple[str, ...] = (
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
+    "TRXUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "DOTUSDT",
+    "LINKUSDT",
+    "LTCUSDT",
+    "BCHUSDT",
+    "XLMUSDT",
+    "ATOMUSDT",
+    "NEARUSDT",
+    "APTUSDT",
+    "SUIUSDT",
+    "ARBUSDT",
+    "OPUSDT",
+    "UNIUSDT",
+)
+
+
+def _parse_symbol_csv(raw: str) -> list[str]:
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
+
+
+FIXED_SCAN_SYMBOLS: list[str] = _parse_symbol_csv(
+    os.getenv("DONCHIAN_FIXED_SYMBOLS", ",".join(BACKTEST_SYMBOLS_20))
+)
+
 # Entry quality filter (body_size_rr05) — matches backtest config D
 ATR_PERIOD = int(os.getenv("DONCHIAN_ATR_PERIOD", "14"))
 MIN_BODY_ATR = float(os.getenv("DONCHIAN_MIN_BODY_ATR", "0.3"))
