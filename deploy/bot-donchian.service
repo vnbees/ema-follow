@@ -1,0 +1,17 @@
+[Unit]
+Description=Donchian Parallel-Trend Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+Group=bot
+WorkingDirectory=/home/bot/app
+ExecStart=/home/bot/app/.venv/bin/python -m src.main
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

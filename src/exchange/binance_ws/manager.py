@@ -113,7 +113,7 @@ def _create_listen_key() -> str:
     """Reuse persisted listenKey; create via REST only when disk has none.
 
     Never REST-validate on boot/deploy — PUT validate was hitting HTTP 418 and
-    writing a multi-hour IP cooldown after every railway up. Dead keys are
+    writing a multi-hour IP cooldown after every restart. Dead keys are
     cleared by keepalive -1125 or listenKeyExpired on the user stream.
     """
     global _listen_key_validated
@@ -539,12 +539,7 @@ def get_symbol_positions_from_ws(symbol: str) -> dict[str, Position] | None:
         return None
     sides = CACHE.get_symbol_positions(symbol)
     if sides is None:
-        # Known empty after reconcile: return empty hedge sides
-        if CACHE.positions_updated_at > 0:
-            return {
-                "long": Position(symbol=symbol.upper(), side=None, size=0.0, avg_price=0.0),
-                "short": Position(symbol=symbol.upper(), side=None, size=0.0, avg_price=0.0),
-            }
+        # Missing symbol ≠ flat — partial disk/WS cache must not phantom-close DB lots.
         return None
     return sides
 

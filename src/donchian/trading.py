@@ -399,7 +399,22 @@ def reconcile_flat_lots() -> None:
         symbol = str(lot["symbol"])
         side = str(lot["side"])
         held = _held_size(symbol, side)
-        if held is None or held > 1e-12:
+        if held is None:
+            continue
+        if held > 1e-12:
+            continue
+        # WS says flat — confirm via REST (or lenient WS fallback) before closing DB.
+        try:
+            from src.exchange.binance import RateLimitError, fetch_symbol_positions
+
+            rest_sides = fetch_symbol_positions(symbol)
+            rest_pos = rest_sides.get(side.lower())
+            rest_held = abs(float(rest_pos.size or 0)) if rest_pos else 0.0
+            if rest_held > 1e-12:
+                continue
+        except RateLimitError:
+            continue
+        except Exception:  # noqa: BLE001
             continue
         mark = _get_mark(symbol)
         fill = mark if mark > 0 else float(lot["entry_px"])

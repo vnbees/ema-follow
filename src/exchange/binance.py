@@ -177,7 +177,7 @@ def _infer_rest_priority(method: str, path: str) -> str:
     """POST orders + positionRisk are critical; GET order query is optional (fill poll).
 
     Fill-poll GET /order after every market fill was re-triggering 418 on shared
-    Railway IPs during REST resume — keep place/cancel critical, query optional.
+    VPS IPs during REST resume — keep place/cancel critical, query optional.
     """
     p = (path or "").split("?")[0].rstrip("/")
     method_u = (method or "GET").upper()
@@ -813,7 +813,7 @@ def _decimals_from_step(step: str) -> int:
 
 
 def _load_exchange_info(*, force_rest: bool = False) -> dict:
-    """Lot/tick filters. Prefer volume snapshot so Railway deploys skip GET /exchangeInfo."""
+    """Lot/tick filters. Prefer disk snapshot so deploys skip GET /exchangeInfo."""
     global _EXCHANGE_INFO_CACHE
     if _EXCHANGE_INFO_CACHE is not None and not force_rest:
         return _EXCHANGE_INFO_CACHE
@@ -1150,8 +1150,8 @@ def fetch_top_futures_by_volume(limit: int | None = None) -> list[tuple[str, flo
                 except Exception:  # noqa: BLE001
                     pass
                 # Do NOT call GET /fapi/v1/exchangeInfo here — that REST on every
-                # restart re-banned the shared Railway IP (418) even when miniTicker
-                # already had a rank. Listing-age filter applies on REST fallback only.
+                # restart can 418 the VPS IP even when miniTicker already had a rank.
+                # Listing-age filter applies on REST fallback only.
                 if ranked:
                     return ranked if limit is None else ranked[:limit]
                 ws_scan = [(s, v) for s, v in ranked_raw if _is_scan(s)]

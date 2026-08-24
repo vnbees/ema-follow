@@ -1,4 +1,4 @@
-"""exchangeInfo must come from volume on deploy — GET /exchangeInfo 418'd Railway IPs."""
+"""exchangeInfo must come from disk on deploy — GET /exchangeInfo can 418 VPS IPs."""
 
 from __future__ import annotations
 

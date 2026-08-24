@@ -180,7 +180,7 @@ BINANCE_SPOT_API_BASE = os.getenv("BINANCE_SPOT_API_BASE", "https://api.binance.
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
 BINANCE_WS_ENABLED = os.getenv("BINANCE_WS_ENABLED", "true").lower() in ("1", "true", "yes")
-# One-shot: clear persisted 418 cooldown on boot (e.g. after Railway region / IP change).
+# One-shot: clear persisted 418 cooldown on boot (e.g. after VPS / egress IP change).
 BINANCE_CLEAR_RATE_LIMIT = os.getenv("BINANCE_CLEAR_RATE_LIMIT", "false").lower() in (
     "1",
     "true",
@@ -243,7 +243,7 @@ REST_BOOT_QUIET_SEC = float(os.getenv("REST_BOOT_QUIET_SEC", "0"))
 REST_BOOT_GAP_SEC = float(os.getenv("REST_BOOT_GAP_SEC", "60"))
 # USDT-M futures IP weight / minute (Binance). Header X-MBX-USED-WEIGHT-1M.
 REST_WEIGHT_LIMIT_1M = int(os.getenv("REST_WEIGHT_LIMIT_1M", "2400"))
-# Skip optional REST at this used weight (leave headroom for shared Railway IPs).
+# Skip optional REST at this used weight (leave headroom for shared / busy IPs).
 REST_WEIGHT_SAFE_MAX = int(os.getenv("REST_WEIGHT_SAFE_MAX", "800"))
 # Skip ALL REST including orders at this used weight.
 REST_WEIGHT_HARD_MAX = int(os.getenv("REST_WEIGHT_HARD_MAX", "1800"))

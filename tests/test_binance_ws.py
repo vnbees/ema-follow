@@ -786,10 +786,35 @@ class TestBootReconcileSkip(unittest.TestCase):
             CACHE.user_last_msg_at = _now()
         self.assertTrue(self.mgr.positions_fresh())
 
+    def test_get_symbol_positions_unknown_symbol_not_flat(self) -> None:
+        """Partial disk cache (one symbol) must not synthesize flat for others."""
+        from src.exchange.binance_ws import get_symbol_positions_from_ws
+
+        CACHE.set_positions(
+            [
+                Position(
+                    symbol="BTCUSDT",
+                    side="long",
+                    size=0.1,
+                    avg_price=50000,
+                    unrealized_pnl=0,
+                )
+            ],
+            {
+                "BTCUSDT": {
+                    "long": Position(symbol="BTCUSDT", side="long", size=0.1, avg_price=50000),
+                    "short": Position(symbol="BTCUSDT", side=None, size=0.0, avg_price=0.0),
+                }
+            },
+        )
+        with patch.object(self.mgr, "is_ws_enabled", return_value=True):
+            self.assertIsNotNone(get_symbol_positions_from_ws("BTCUSDT"))
+            self.assertIsNone(get_symbol_positions_from_ws("ETHUSDT"))
+
 
 class TestUserStreamRecvTimeout(unittest.TestCase):
     def test_timeout_error_str_is_empty(self) -> None:
-        """Documents why empty 'user WS error:' appeared in Railway logs."""
+        """Documents why empty 'user WS error:' appeared in logs."""
         self.assertEqual(str(TimeoutError()), "")
 
 

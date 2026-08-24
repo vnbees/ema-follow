@@ -27,3 +27,19 @@ python -m src.main
 ```
 
 Log: `logs/rsi_rev.log`. Database: `data/bot.db`. Dashboard: `http://localhost:8080`.
+
+
+--- PROMPT deploy
+
+Deploy PROD bot Donchian lên VPS. BẮT BUỘC:
+1. Đọc docs/DEPLOY_RATE_LIMIT_CHECKLIST.md — không bỏ bước
+2. Bot local đang chạy → scripts/sync_prod_deploy_data.py exit 0
+3. scripts/preflight_prod_deploy.py --strict-candles exit 0 — fail thì báo user, KHÔNG deploy
+4. Whitelist IP VPS trên Binance API key
+5. VPS_HOST=IP ./scripts/deploy_to_vps.sh — MỘT LẦN
+6. Verify log: candles_symbols≥18, skip REST warmup; REST seed >5 coin hoặc 418 → stop VPS, bật local
+7. Local OFF cho đến khi PROD verify xong
+
+Báo cáo từng bước pass/fail trước khi deploy.
+
+\\ --- PROMPT deploy
