@@ -4,7 +4,7 @@ Bot chạy vòng **15 phút**, chiến lược **Donchian parallel-trend** trên
 
 **Entry point:** `python -m src.main` → `src/donchian/cycle.py`
 
-Cấu hình live khớp backtest **breadth_flip + skim spot** (paper 365d, vốn 1000$: total **~18.6×**, MaxDD total **~16%**, ~**+4.8%/ngày** total — xem §7.3). Chi tiết flip thuần / 3 năm: §7.1b–c.
+Cấu hình live khớp backtest **breadth_flip + skim spot** (paper 365d, vốn 1000$: total **~18.6×**, MaxDD total **~16%**, lãi TB **~+1.3%/ngày** trên vốn bot đầu ngày — $/ngày = SOD × ~1.3%; xem §7.3). Chi tiết flip thuần / 3 năm: §7.1b–c.
 
 ---
 
@@ -326,27 +326,61 @@ Lần đầu chưa có mốc SOD → lấy equity hiện tại làm mốc, **ch�
 
 #### Paper 365d · vốn 1000 USDT
 
+`%/ngày total` trong bảng dưới = (total cuối − 1000) / 1000 / số ngày — **linear trên vốn gốc**, không phải lãi mỗi ngày. Số dùng để kỳ vọng live: **`day_pnl` / SOD** (~**+1.3%/ngày**).
+
 | Metric | Value |
 |--------|------:|
-| **%/ngày total** (bot+spot) | **+4.83%** |
+| **Lãi TB / SOD** (vốn bot đầu ngày) | **+1.29%** (median +1.36%) |
+| Ngày lãi / lỗ | **262 / 104** (366 ngày) |
+| $/ngày TB cả kỳ (linear vs 1000$) | +48$ — **không** dùng khi vốn còn ~1k |
+| 30 ngày đầu (~1k) | TB **+15$/ngày** (min −68$, max +106$) |
+| %/ngày total linear (bot+spot) | +4.83% |
 | Cuối kỳ bot / spot / **total** | 9,871 / 8,741 / **18,612** |
 | MaxDD bot / **total** | 25.9% / **16.0%** |
 | PF / WR / lệnh/ngày | 1.40 / 75.0% / 48.6 |
 | Ngày rút | **260/365** (skip: no_profit 104, dd_pause 2) |
 | Rút % đầu tháng (min–max–avg) | **4.8% – 22.6% – 12.6%** |
 
+**Ngày lỗ / lãi nhiều nhất** (365d; `% tài sản` trade = % vốn **bot** đầu ngày):
+
+| | Ngày | PnL | % bot | % tổng (bot+spot) | Bot SOD | Total SOD |
+|--|------|----:|------:|------------------:|--------:|------------------:|
+| Lỗ nhất | 2026-02-25 | **−704$** | **−13.8%** | −8.7% | 5,117$ (5.1× gốc) | 8,130$ |
+| Lãi nhất | 2026-08-22 | **+1,527$** | **+18.0%** | +8.9% | 8,492$ (8.5× gốc) | 17,106$ |
+
+Cực trị xảy ra khi vốn đã lớn hơn 1k nhiều — không phải lúc mới chạy.
+
+**Cách đọc $:** `profit ≈ vốn bot đầu ngày × ~1.3%`. Vốn ~1.1k → ~+14$/ngày; vốn 2k → ~+26$/ngày. Skim kéo chậm SOD futures nên $/ngày tăng chậm hơn total (bot+spot).
+
+**Khi TB 30 ngày vượt mốc $** (paper, bắt đầu 1000$):
+
+| Mốc TB 30 ngày | Sau | Vốn bot |
+|----------------|-----|--------:|
+| >15$/ngày | ~7 tuần | ~1.3k |
+| >20$/ngày | ~2 tháng | ~1.5k |
+| >30$/ngày | ~3 tháng | ~1.8k |
+| >50$/ngày | ~5.5 tháng | ~3.4k |
+
 **Total (bot+spot) đầu tháng** (paper):
 
-| Tháng | Total | Spot | Bot | vs 1000$ |
-|-------|------:|-----:|----:|---------:|
-| 2025-08 | 1,000$ | 0$ | 1,000$ | +0% |
-| 2025-09 | 1,265$ | 73$ | 1,192$ | +27% |
-| 2025-10 | 1,563$ | 287$ | 1,275$ | +56% |
-| 2025-12 | 3,347$ | 1,054$ | 2,293$ | +235% |
-| 2026-06 | 11,559$ | 5,549$ | 6,010$ | +1056% |
-| 2026-08 | 16,019$ | 7,929$ | 8,090$ | +1502% |
+| Tháng | Total | Δ total | Spot | Bot | Δ bot |
+|-------|------:|--------:|-----:|----:|------:|
+| 2025-08 | 1,000$ | — | 0$ | 1,000$ | — |
+| 2025-09 | 1,265$ | +27% | 73$ | 1,192$ | +19% |
+| 2025-10 | 1,563$ | +24% | 287$ | 1,275$ | +7% |
+| 2025-11 | 2,058$ | +32% | 594$ | 1,464$ | +15% |
+| 2025-12 | 3,347$ | +63% | 1,054$ | 2,293$ | +57% |
+| 2026-01 | 4,214$ | +26% | 1,529$ | 2,685$ | +17% |
+| 2026-02 | 5,608$ | +33% | 2,169$ | 3,439$ | +28% |
+| 2026-03 | 7,270$ | +30% | 3,013$ | 4,257$ | +24% |
+| 2026-04 | 9,401$ | +29% | 3,839$ | 5,561$ | +31% |
+| 2026-05 | 10,893$ | +16% | 4,657$ | 6,236$ | +12% |
+| 2026-06 | 11,559$ | **+6%** | 5,549$ | 6,010$ | **−4%** |
+| 2026-07 | 13,377$ | +16% | 6,685$ | 6,691$ | +11% |
+| 2026-08 | 16,019$ | +20% | 7,929$ | 8,090$ | +21% |
 
-(Bot = Total − Spot. Bảng đầy đủ 13 tháng trong doc link trên.)
+- **Total:** không có tháng nào giảm; chậm nhất 2026-06 **+6%**. Không phải tăng đều — tháng mạnh +63%, trong tháng vẫn lỗ (104 ngày âm, MaxDD total 16%).
+- **Bot:** 2026-06 **−3.6%** (skim + tháng yếu); total vẫn tăng nhờ lãi đã sang spot.
 
 **Cách đọc:**
 
@@ -354,6 +388,46 @@ Lần đầu chưa có mốc SOD → lấy equity hiện tại làm mốc, **ch�
 - MaxDD **total ~16%** — thấp hơn flip không rút (~25%) nhờ skim hàng ngày.
 - Compound futures chậm hơn flip thuần (~89k bot-only) — đổi lấy rủi ro total thấp + spot tích lũy.
 - Live có thể thấp hơn paper (slippage, pool top-N động ≠ 20 majors cố định).
+
+#### Paper 3 năm (~1095d) · cùng stack skim
+
+Cùng script `backtest_donchian_20coin_breadth_flip_wd_skim40.py`, `LOOKBACK_DAYS=1095`, cache 15m (2023-08-24 → 2026-08-23, 1096 ngày). Không viết doc riêng — `%/ngày` compound $ không dùng.
+
+| | 365d skim | 3y skim |
+|--|----------:|--------:|
+| Lãi TB / SOD | +1.29% | **+1.50%** |
+| Median / SOD | +1.36% | +1.43% |
+| Ngày lãi | 72% | 73% |
+| MaxDD bot / **total** | 25.9% / **16.0%** | **37.8%** / **21.5%** |
+| PF / WR / lệnh/ngày | 1.40 / 75.0% / 48.6 | 1.40 / 74.7% / 48.5 |
+| Tháng total âm | 0 | **0** |
+| Tháng bot âm | 1 (2026-06) | 2 (2025-07, 2026-06) |
+| 30 ngày đầu (~1k) | +15$/ngày | +15$/ngày |
+
+**1 tuần trung bình** (3y skim, 156 tuần đủ 7 ngày):
+
+| | TB / tuần | Trung vị | Min–max |
+|--|----------:|---------:|---------|
+| Ngày lãi | **~5.1** | 5 | 2–7 |
+| Ngày lỗ | **~1.9** | 2 | 0–5 |
+
+**91%** tuần có số ngày lãi > ngày lỗ (14 tuần lỗ ≥ lãi).
+
+**Ngày lỗ / lãi nhiều nhất — theo % vốn bot** (quan trọng hơn $ tuyệt đối):
+
+| | Ngày | PnL | % bot | % tổng | Bot SOD |
+|--|------|----:|------:|-------:|--------:|
+| Lỗ % nhất | **2024-11-23** | −29,170$ | **−27.4%** | −15.6% | 106k |
+| Lãi % nhất | **2024-02-29** | +1,662$ | **+31.3%** | +18.1% | 5.3k |
+
+**Theo $ tuyệt đối** (vốn đã compound rất lớn — cùng ngày với cực trị 365d):
+
+| | Ngày | PnL | % bot | % tổng |
+|--|------|----:|------:|-------:|
+| Lỗ $ nhất | 2026-02-25 | −396k | −13.8% | −7.8% |
+| Lãi $ nhất | 2026-08-22 | +858k | +18.0% | +8.5% |
+
+Edge (%/SOD, WR, PF) giữ qua 3 năm; rủi ro xấu hơn (DD sâu, ngày lỗ % nặng hơn 365d). Với vốn ~1k kỳ vọng vẫn quanh **+10–15$/ngày**, không phải $ TB cả kỳ 3 năm.
 
 BT cũ D20 + skim (không breadth): [`backtest_MULTI_donchian_20major_wd_skim40_dd20_15m_365d.md`](backtest_MULTI_donchian_20major_wd_skim40_dd20_15m_365d.md) — total ~22.8k nhưng MaxDD total ~40%.
 
