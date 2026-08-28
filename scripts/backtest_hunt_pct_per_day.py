@@ -63,13 +63,23 @@ def fetch_klines(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         for r in rows:
             ts = int(r[0])
             if start_ms <= ts < end_ms:
-                out.append({"ts": ts, "open": float(r[1]), "high": float(r[2]), "low": float(r[3]), "close": float(r[4])})
+                out.append(
+                    {
+                        "ts": ts,
+                        "open": float(r[1]),
+                        "high": float(r[2]),
+                        "low": float(r[3]),
+                        "close": float(r[4]),
+                        "volume": float(r[5]),
+                        "quote_volume": float(r[7]),
+                    }
+                )
         nxt = int(rows[-1][0]) + BAR_MS
         if nxt <= cursor:
             break
         cursor = nxt
     if not out:
-        return pd.DataFrame(columns=["ts", "open", "high", "low", "close"])
+        return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume", "quote_volume"])
     return pd.DataFrame(out).drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
 
 

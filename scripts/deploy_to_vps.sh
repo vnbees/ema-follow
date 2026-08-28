@@ -18,6 +18,9 @@ VPS_USER="${VPS_USER:-root}"
 REMOTE="${VPS_USER}@${VPS_HOST}"
 APP="/home/bot/app"
 
+echo "=== Reset Donchian state (fresh start) ==="
+.venv/bin/python scripts/reset_donchian_fresh_start.py --yes || true
+
 echo "=== Pre-flight ==="
 .venv/bin/python scripts/sync_prod_deploy_data.py
 .venv/bin/python scripts/preflight_prod_deploy.py --strict-candles
@@ -39,6 +42,9 @@ tar czf - \
 
 echo "=== Remote setup + systemd ==="
 ssh "$REMOTE" "bash $APP/deploy/vps-remote-setup.sh"
+
+echo "=== Reset VPS Donchian state ==="
+ssh "$REMOTE" "cd $APP && sudo -u bot .venv/bin/python scripts/reset_donchian_fresh_start.py --yes"
 
 echo "=== Start bot ==="
 ssh "$REMOTE" "systemctl restart bot-donchian && sleep 3 && systemctl status bot-donchian --no-pager"

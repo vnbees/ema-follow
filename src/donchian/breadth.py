@@ -98,5 +98,6 @@ def flip_entry_signal(entry: EntrySignal, *, vote: BreadthVote) -> EntrySignal:
         pot_rr=pot_rr,
         size_mult=size_mult,
         atr=entry.atr,
+        vol_ratio=entry.vol_ratio,
         why=why,
     )

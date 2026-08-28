@@ -49,6 +49,7 @@ def parse_kline_message(payload: dict[str, Any]) -> tuple[str, str, Candle, bool
             low=float(k["l"]),
             close=float(k["c"]),
             volume=float(k["v"]),
+            quote_volume=float(k.get("q") or 0),
         )
         is_closed = bool(k.get("x"))
     except (KeyError, TypeError, ValueError):

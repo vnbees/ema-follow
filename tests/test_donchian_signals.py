@@ -65,10 +65,10 @@ class TestComputeAtr(unittest.TestCase):
 
 
 class TestSizeMult(unittest.TestCase):
-    def test_clip_bounds(self) -> None:
-        self.assertAlmostEqual(size_mult_from_pot_rr(0.0), 0.5)
-        self.assertAlmostEqual(size_mult_from_pot_rr(0.5), 1.0)
-        self.assertAlmostEqual(size_mult_from_pot_rr(1.5), 2.0)
+    def test_matches_backtest_config_a(self) -> None:
+        self.assertAlmostEqual(size_mult_from_pot_rr(0.5), 0.5)
+        self.assertAlmostEqual(size_mult_from_pot_rr(1.0), 1.0)
+        self.assertAlmostEqual(size_mult_from_pot_rr(1.5), 1.5)
         self.assertAlmostEqual(size_mult_from_pot_rr(3.0), 2.0)
 
     def test_disabled(self) -> None:
@@ -267,6 +267,60 @@ class TestQualityFilter(unittest.TestCase):
             )
         self.assertIsNone(entry)
         self.assertTrue(state.waiting_entry)
+
+
+class TestVolRatioFilter(unittest.TestCase):
+    def _bars_with_volumes(self, *, last_qv: float, sma_qv: float = 10.0) -> list[DonchianBar]:
+        bars: list[DonchianBar] = []
+        for i in range(24):
+            qv = sma_qv if i < 23 else last_qv
+            bars.append(
+                DonchianBar(
+                    ts=i,
+                    open=10.0,
+                    high=10.5 + i * 0.05,
+                    low=9.5,
+                    close=10.0,
+                    quote_volume=qv,
+                )
+            )
+        bars.append(DonchianBar(ts=24, open=10.0, high=12.0, low=8.0, close=9.3, quote_volume=last_qv))
+        return bars
+
+    def test_rejects_low_vol_ratio(self) -> None:
+        bars = self._bars_with_volumes(last_qv=8.0, sma_qv=10.0)  # ratio 0.8
+        state = SignalState(trend="up", trend_ts=1, waiting_entry=True, prev_parallel=False)
+        with patch("src.donchian.signals.compute_atr") as mock_atr:
+            mock_atr.return_value = [None] * (len(bars) - 1) + [1.0]
+            entry = check_signal(
+                bars,
+                state,
+                period=PERIOD,
+                slope_lookback=LOOKBACK,
+                tol=0.0,
+                min_vol_ratio=1.2,
+                vol_ratio_period=20,
+            )
+        self.assertIsNone(entry)
+        self.assertTrue(state.waiting_entry)
+
+    def test_accepts_high_vol_ratio(self) -> None:
+        bars = self._bars_with_volumes(last_qv=14.0, sma_qv=10.0)  # ratio 1.4
+        state = SignalState(trend="up", trend_ts=1, waiting_entry=True, prev_parallel=False)
+        with patch("src.donchian.signals.compute_atr") as mock_atr:
+            mock_atr.return_value = [None] * (len(bars) - 1) + [1.0]
+            entry = check_signal(
+                bars,
+                state,
+                period=PERIOD,
+                slope_lookback=LOOKBACK,
+                tol=0.0,
+                min_vol_ratio=1.2,
+                vol_ratio_period=20,
+            )
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertGreaterEqual(entry.vol_ratio, 1.2)
 
 
 class TestRollingChannel(unittest.TestCase):

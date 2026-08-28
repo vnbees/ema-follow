@@ -1,0 +1,35 @@
+[[services]]
+name = "backend"
+source = "backend/"
+
+[services.build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[services.deploy]
+startCommand = "./start.sh"
+healthcheckPath = "/api/v1/health"
+healthcheckTimeout = 30
+
+[services.variables]
+DATABASE_URL = "${{Postgres.DATABASE_URL}}"
+SIGNAL_API_KEY = "${{SIGNAL_API_KEY}}"
+PORT = "8000"
+CORS_ORIGINS = '["https://${{frontend.RAILWAY_PUBLIC_DOMAIN}}"]'
+
+[[services]]
+name = "frontend"
+source = "frontend/"
+
+[services.build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[services.deploy]
+startCommand = "node server.js"
+healthcheckPath = "/"
+healthcheckTimeout = 30
+
+[services.variables]
+NEXT_PUBLIC_API_URL = "https://${{backend.RAILWAY_PUBLIC_DOMAIN}}"
+PORT = "3000"

@@ -13,6 +13,7 @@ class Candle:
     low: float
     close: float
     volume: float
+    quote_volume: float = 0.0
 
 
 @dataclass

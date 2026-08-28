@@ -67,15 +67,21 @@ def _load_hunt():
     return mod
 
 
-def fetch_klines_slow(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-    """Paginated klines with backoff on 418/429 and disk cache."""
+def fetch_klines_slow(symbol: str, start_ms: int, end_ms: int, *, force: bool = False) -> pd.DataFrame:
+    """Paginated klines with backoff on 418/429 and disk cache.
+
+    Cache columns: ts, open, high, low, close, volume, quote_volume.
+    Files without volume are treated as stale and re-fetched unless ``force`` skips cache.
+    """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = CACHE_DIR / f"{symbol}_{INTERVAL}_{start_ms}_{end_ms}.csv"
-    if cache_path.exists() and cache_path.stat().st_size > 1000:
+    if not force and cache_path.exists() and cache_path.stat().st_size > 1000:
         df = pd.read_csv(cache_path)
-        if len(df) >= 100:
+        if len(df) >= 100 and {"volume", "quote_volume"}.issubset(df.columns):
             print(f"  cache hit {symbol} bars={len(df)}", flush=True)
             return df
+        if len(df) >= 100:
+            print(f"  cache stale (no volume) — refetch {symbol}", flush=True)
 
     out: list[dict] = []
     cursor = start_ms
@@ -123,6 +129,8 @@ def fetch_klines_slow(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
                         "high": float(r[2]),
                         "low": float(r[3]),
                         "close": float(r[4]),
+                        "volume": float(r[5]),
+                        "quote_volume": float(r[7]),
                     }
                 )
         nxt = int(rows[-1][0]) + BAR_MS
@@ -131,7 +139,7 @@ def fetch_klines_slow(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         cursor = nxt
 
     if not out:
-        return pd.DataFrame(columns=["ts", "open", "high", "low", "close"])
+        return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume", "quote_volume"])
     df = pd.DataFrame(out).drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
     df.to_csv(cache_path, index=False)
     print(f"  fetched {symbol} bars={len(df)} → {cache_path.name}", flush=True)

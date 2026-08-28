@@ -59,6 +59,7 @@ def save_candles_snapshot() -> None:
                         "l": c.low,
                         "c": c.close,
                         "v": c.volume,
+                        "q": c.quote_volume,
                     }
                     for c in rows
                 ]
@@ -97,6 +98,7 @@ def load_candles_snapshot() -> int:
                         low=float(row["l"]),
                         close=float(row["c"]),
                         volume=float(row["v"]),
+                        quote_volume=float(row.get("q") or 0),
                     )
                 )
             except (KeyError, TypeError, ValueError):

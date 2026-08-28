@@ -10,8 +10,10 @@ INTERVAL = os.getenv("DONCHIAN_INTERVAL", "15m")
 # body_size_rr05 live default: 1% equity × size_mult (was 0.5%)
 MARGIN_PCT = float(os.getenv("DONCHIAN_MARGIN_PCT", "0.01"))
 MARGIN_MIN_USDT = float(os.getenv("DONCHIAN_MARGIN_MIN_USDT", str(ORDER_MARGIN_MIN_USDT)))
-MAX_OPEN = int(os.getenv("DONCHIAN_MAX_OPEN", "20"))
+MAX_OPEN = int(os.getenv("DONCHIAN_MAX_OPEN", "10"))
+TOP_K_PER_CYCLE = int(os.getenv("DONCHIAN_TOP_K", "5"))
 TOP_N_SYMBOLS = int(os.getenv("DONCHIAN_TOP_N", "30"))
+MARGIN_CAP_PCT = float(os.getenv("DONCHIAN_MARGIN_CAP_PCT", "0.15"))
 WATCHER_INTERVAL_SEC = float(os.getenv("DONCHIAN_WATCHER_INTERVAL_SEC", "2"))
 BALANCE_CACHE_MAX_AGE_SEC = float(os.getenv("DONCHIAN_BALANCE_CACHE_MAX_AGE_SEC", "30"))
 
@@ -60,6 +62,10 @@ MAX_BODY_ATR = float(os.getenv("DONCHIAN_MAX_BODY_ATR", "1.2"))
 MIN_POT_RR = float(os.getenv("DONCHIAN_MIN_POT_RR", "0.5"))
 SIZE_BY_RR = os.getenv("DONCHIAN_SIZE_BY_RR", "true").lower() in ("1", "true", "yes", "on")
 
+# Volume filter on counter candle: quote_volume / SMA(20) >= threshold (BT channel+vol)
+MIN_VOL_RATIO = float(os.getenv("DONCHIAN_MIN_VOL_RATIO", "1.2"))
+VOL_RATIO_PERIOD = int(os.getenv("DONCHIAN_VOL_RATIO_PERIOD", "20"))
+
 # Breadth mid (BT breadth_mid / breadth_flip): pool close ≷ Donchian mid vote
 # Mode: flip (default, live) | hard (skip opposite) | off
 _raw_breadth_mode = os.getenv("DONCHIAN_BREADTH_MODE")
@@ -70,9 +76,8 @@ if _raw_breadth_mode is not None:
     elif BREADTH_MODE not in ("flip", "hard"):
         BREADTH_MODE = "flip"
 else:
-    # Legacy DONCHIAN_BREADTH_HARD: false→off, else default flip (replaces old hard default)
-    _legacy_hard = os.getenv("DONCHIAN_BREADTH_HARD", "true").lower() in ("1", "true", "yes", "on")
-    BREADTH_MODE = "flip" if _legacy_hard else "off"
+    # Default off — live khớp backtest channel + counter + vol (không breadth flip)
+    BREADTH_MODE = "off"
 BREADTH_ENABLED = BREADTH_MODE in ("flip", "hard")
 BREADTH_HARD = BREADTH_MODE == "hard"  # compat alias
 BREADTH_RATIO = float(os.getenv("DONCHIAN_BREADTH_RATIO", "1.3"))
@@ -81,13 +86,13 @@ BREADTH_MIN_N = int(os.getenv("DONCHIAN_BREADTH_MIN_N", "12"))
 BREADTH_UNIVERSE = os.getenv("DONCHIAN_BREADTH_UNIVERSE", "majors").strip().lower()
 
 # Minimum nến: Donchian + slope + ATR warmup
-WARMUP_MIN_BARS = DONCHIAN_PERIOD + SLOPE_LOOKBACK + ATR_PERIOD + 5
+WARMUP_MIN_BARS = DONCHIAN_PERIOD + SLOPE_LOOKBACK + ATR_PERIOD + max(VOL_RATIO_PERIOD if MIN_VOL_RATIO > 0 else 0, 0) + 5
 CANDLE_LIMIT = WARMUP_MIN_BARS + 50
 
 # Symbol pool filter (see symbol_filter.py)
 MIN_LISTING_DAYS = float(os.getenv("DONCHIAN_MIN_LISTING_DAYS", "365"))
 MAX_RANGE_24H_PCT = float(os.getenv("DONCHIAN_MAX_RANGE_24H_PCT", "15"))
-SYMBOL_FILTER_ENABLED = os.getenv("DONCHIAN_SYMBOL_FILTER", "true").lower() in (
+SYMBOL_FILTER_ENABLED = os.getenv("DONCHIAN_SYMBOL_FILTER", "false").lower() in (
     "1",
     "true",
     "yes",

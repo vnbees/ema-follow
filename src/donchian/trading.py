@@ -18,10 +18,12 @@ from src.exchange import (
 from src.exchange.fills import resolve_order_commission, resolve_order_fill
 from src.exchange.sizing import format_size
 from src.notify import notify_error
+from src.signal_publish import publish_close, publish_open
 from src.donchian import store
 from src.donchian.config import (
     BALANCE_CACHE_MAX_AGE_SEC,
     LEVERAGE,
+    MARGIN_CAP_PCT,
     MARGIN_MIN_USDT,
     MARGIN_PCT,
     MAX_BODY_ATR,
@@ -226,6 +228,7 @@ def open_lot(
             if SIZE_BY_RR:
                 mult = min(2.0, max(0.5, float(size_mult)))
             margin = max(0.0, equity * MARGIN_PCT * mult)
+            margin = min(margin, equity * MARGIN_CAP_PCT)
             if margin < MARGIN_MIN_USDT:
                 logging.info("  [%s] Skip Donchian — margin %.4f below min %.2f", symbol, margin, MARGIN_MIN_USDT)
                 store.record_skip(symbol, "margin_too_small")
@@ -295,6 +298,17 @@ def open_lot(
                 pot_rr=pot_rr,
                 size_mult=mult,
                 why=why,
+            )
+            opened_row = store.get_lot(lot_id)
+            publish_open(
+                lot_id=lot_id,
+                symbol=symbol,
+                side=side,
+                trend=trend,
+                entry=fill,
+                tp=tp_band,
+                size_mult=mult,
+                opened_at=str(opened_row["opened_at"]) if opened_row else None,
             )
             logging.info(
                 "  [%s] Donchian %s opened id=%d trend=%s entry=%.6f tp_band=%.6f "
@@ -385,6 +399,20 @@ def _finalize_close(lot, *, reason: str, fill: float, fee_close: float, close_oi
         pnl_usdt=pnl,
         opened_at=opened_at,
         size_mult=size_mult_meta,
+    )
+    margin_meta = None
+    try:
+        raw_m = lot["margin_usdt"]
+        if raw_m is not None:
+            margin_meta = float(raw_m)
+    except (KeyError, IndexError, TypeError):
+        pass
+    publish_close(
+        lot_id=lot_id,
+        close_px=fill,
+        pnl_usdt=pnl,
+        margin_usdt=margin_meta,
+        close_reason=reason,
     )
     logging.info(
         "  [%s] Donchian %s lot %d closed %s @ %.6f pnl=%.4f fee=%.4f",

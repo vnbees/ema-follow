@@ -131,6 +131,10 @@ DASHBOARD_COOKIE_SECURE = os.getenv("DASHBOARD_COOKIE_SECURE", "false").lower() 
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
+# Public coins-signal site (Railway). Empty URL = disabled.
+SIGNAL_API_URL = os.getenv("SIGNAL_API_URL", "").strip().rstrip("/")
+SIGNAL_API_KEY = os.getenv("SIGNAL_API_KEY", "").strip()
+
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "0"))
 SAR_AF = float(os.getenv("SAR_AF", "0.02"))
 SAR_MAX_AF = float(os.getenv("SAR_MAX_AF", "0.2"))

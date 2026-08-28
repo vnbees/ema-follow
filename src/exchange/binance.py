@@ -957,6 +957,7 @@ def fetch_candles_rest(
             low=float(row[3]),
             close=float(row[4]),
             volume=float(row[5]),
+            quote_volume=float(row[7]) if len(row) > 7 else 0.0,
         )
         for row in data
     ]

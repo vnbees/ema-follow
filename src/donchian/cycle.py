@@ -31,34 +31,32 @@ from src.notify import notify_error, install_error_hooks
 from src.donchian import store
 from src.donchian.config import (
     ATR_PERIOD,
-    BREADTH_ENABLED,
-    BREADTH_MIN_N,
-    BREADTH_MODE,
-    BREADTH_RATIO,
-    BREADTH_UNIVERSE,
     CANDLE_LIMIT,
     DONCHIAN_PERIOD,
     FIXED_SCAN_SYMBOLS,
     INTERVAL,
     LEVERAGE,
-    MAJOR_SYMBOLS,
+    MARGIN_CAP_PCT,
     MARGIN_PCT,
     MAX_BODY_ATR,
     MAX_OPEN,
     MIN_BODY_ATR,
     MIN_POT_RR,
+    MIN_VOL_RATIO,
     PARALLEL_TOL,
     SCAN_MODE,
     SIZE_BY_RR,
     SLOPE_LOOKBACK,
+    SYMBOL_FILTER_ENABLED,
+    TOP_K_PER_CYCLE,
     TOP_N_SYMBOLS,
+    VOL_RATIO_PERIOD,
     WARMUP_MIN_BARS,
     is_excluded_symbol,
     is_untradable,
     mark_untradable,
 )
-from src.donchian.breadth import BreadthVote, allows_side, flip_entry_signal, mid_side, vote_breadth
-from src.donchian.signals import DonchianBar, SignalState, process_closed_bars
+from src.donchian.signals import DonchianBar, EntrySignal, SignalState, process_closed_bars
 from src.donchian.symbol_filter import filter_ranked_symbols, is_scan_eligible
 from src.donchian.trading import live_account_balance, open_lot
 from src.donchian.watcher import start_watcher
@@ -212,11 +210,6 @@ def _sync_watched(symbols: list[str]) -> None:
             sym = str(lot["symbol"]).upper()
             if sym not in watched:
                 watched.append(sym)
-        # Breadth mid needs majors' klines even if not in top-N volume
-        if BREADTH_ENABLED and BREADTH_UNIVERSE == "majors":
-            for sym in MAJOR_SYMBOLS:
-                if sym not in watched and not is_untradable(sym) and not is_excluded_symbol(sym):
-                    watched.append(sym)
         set_watched_symbols(watched)
     except Exception as exc:  # noqa: BLE001
         logging.debug("Donchian WS watch sync skipped: %s", exc)
@@ -495,7 +488,15 @@ def _persist_state(symbol: str, state: SignalState) -> None:
 
 def _candles_to_bars(raw: list[Candle]) -> list[DonchianBar]:
     return [
-        DonchianBar(ts=int(c.timestamp), open=float(c.open), high=float(c.high), low=float(c.low), close=float(c.close))
+        DonchianBar(
+            ts=int(c.timestamp),
+            open=float(c.open),
+            high=float(c.high),
+            low=float(c.low),
+            close=float(c.close),
+            volume=float(c.volume),
+            quote_volume=float(c.quote_volume or 0),
+        )
         for c in raw
     ]
 
@@ -522,53 +523,97 @@ def _closed_bars_for_symbol(symbol: str, now_ms: int) -> list[DonchianBar] | Non
     return _candles_to_bars(closed)
 
 
-def _breadth_universe(scan_symbols: list[str]) -> list[str]:
-    # Fixed scan = same 20 coins for trade + breadth (khớp backtest)
-    if SCAN_MODE == "fixed":
-        return list(scan_symbols)
-    if BREADTH_UNIVERSE == "scan":
-        return list(scan_symbols)
-    return sorted(MAJOR_SYMBOLS)
+def _should_apply_symbol_filter() -> bool:
+    """Backtest fixed pool has no listing/range filter."""
+    return SYMBOL_FILTER_ENABLED and SCAN_MODE != "fixed"
 
 
-def compute_breadth_vote(scan_symbols: list[str], now_ms: int) -> BreadthVote | None:
-    """Pool mid vote for this cycle; None if breadth disabled."""
-    if not BREADTH_ENABLED:
+def _evaluate_symbol(symbol: str, now_ms: int) -> EntrySignal | None:
+    """Detect entry signal and persist state. Does not open orders."""
+    if not store.has_open_lot_for_symbol(symbol) and _should_apply_symbol_filter():
+        eligible, reason = is_scan_eligible(symbol, interval=INTERVAL)
+        if not eligible:
+            logging.debug("  [%s] scan skip — %s", symbol, reason)
+            return None
+
+    bars = _closed_bars_for_symbol(symbol, now_ms)
+    if bars is None:
         return None
-    universe = _breadth_universe(scan_symbols)
-    sides: list[str | None] = []
-    for sym in universe:
-        bars = _closed_bars_for_symbol(sym, now_ms)
-        if bars is None:
-            sides.append(None)
-            continue
-        sides.append(mid_side(bars, DONCHIAN_PERIOD))
-    vote = vote_breadth(sides, ratio=BREADTH_RATIO, min_n=BREADTH_MIN_N)
-    if vote.side is None:
+
+    state = _load_state(symbol)
+    entry = process_closed_bars(
+        bars,
+        state,
+        period=DONCHIAN_PERIOD,
+        slope_lookback=SLOPE_LOOKBACK,
+        tol=PARALLEL_TOL,
+        allow_entry=not store.has_open_lot_for_symbol(symbol),
+        apply_quality_filter=True,
+        atr_period=ATR_PERIOD,
+        min_body_atr=MIN_BODY_ATR,
+        max_body_atr=MAX_BODY_ATR,
+        min_pot_rr=MIN_POT_RR,
+        size_by_rr=SIZE_BY_RR,
+        min_vol_ratio=MIN_VOL_RATIO,
+        vol_ratio_period=VOL_RATIO_PERIOD,
+    )
+
+    if entry is not None:
+        # Backtest clears waiting only on actual open — keep waiting if not selected in top_k.
+        state.waiting_entry = True
+
+    _persist_state(symbol, state)
+    return entry
+
+
+def _open_candidate(symbol: str, entry: EntrySignal, now_ms: int) -> bool:
+    """Open one ranked candidate. Returns True if lot opened."""
+    if not is_trading_enabled() or not has_credentials():
+        return False
+
+    bars = _closed_bars_for_symbol(symbol, now_ms)
+    if bars is None:
+        return False
+
+    state = _load_state(symbol)
+    last_bar = bars[-1]
+    status = open_lot(
+        symbol,
+        side=entry.side,
+        trend=state.trend or entry.side,
+        trend_ts=state.trend_ts,
+        entry_ts=last_bar.ts,
+        tp_band=entry.tp_band,
+        size_mult=entry.size_mult,
+        opp_band=entry.opp_band,
+        body_atr=entry.body_atr,
+        pot_rr=entry.pot_rr,
+        why=entry.why,
+    )
+    if status == "opened":
+        state.waiting_entry = False
+        _persist_state(symbol, state)
+        return True
+
+    if status == "error" and not store.has_open_lot_for_symbol(symbol):
+        state.waiting_entry = True
+        state.last_processed_ts = int(bars[-2].ts) if len(bars) >= 2 else None
         logging.info(
-            "Breadth mid: NEUTRAL ups=%d downs=%d tot=%d (need n≥%d lead≥%.2f×) mode=%s universe=%s",
-            vote.ups,
-            vote.downs,
-            vote.total,
-            BREADTH_MIN_N,
-            BREADTH_RATIO,
-            BREADTH_MODE,
-            BREADTH_UNIVERSE,
+            "  [%s] Donchian %s not opened (%s) — will retry next cycle",
+            symbol,
+            entry.side,
+            status,
         )
     else:
-        action = "FLIP opposite entries" if BREADTH_MODE == "flip" else "SKIP opposite entries"
+        state.waiting_entry = False
         logging.info(
-            "Breadth mid %s: vote=%s ups=%d downs=%d tot=%d lead=%.2f× universe=%s — %s",
-            BREADTH_MODE.upper(),
-            vote.side.upper(),
-            vote.ups,
-            vote.downs,
-            vote.total,
-            vote.lead_ratio,
-            BREADTH_UNIVERSE,
-            action,
+            "  [%s] Donchian %s not opened (%s) — signal discarded (no retry)",
+            symbol,
+            entry.side,
+            status,
         )
-    return vote
+    _persist_state(symbol, state)
+    return False
 
 
 def _log_balance() -> None:
@@ -619,109 +664,6 @@ def _log_balance() -> None:
         logging.debug("Donchian balance log skipped: %s", exc)
 
 
-def _process_symbol(symbol: str, now_ms: int, breadth: BreadthVote | None = None) -> bool:
-    """Return True if a lot was opened."""
-    if not store.has_open_lot_for_symbol(symbol):
-        eligible, reason = is_scan_eligible(symbol, interval=INTERVAL)
-        if not eligible:
-            logging.debug("  [%s] scan skip — %s", symbol, reason)
-            return False
-
-    bars = _closed_bars_for_symbol(symbol, now_ms)
-    if bars is None:
-        return False
-
-    state = _load_state(symbol)
-    entry = process_closed_bars(
-        bars,
-        state,
-        period=DONCHIAN_PERIOD,
-        slope_lookback=SLOPE_LOOKBACK,
-        tol=PARALLEL_TOL,
-        allow_entry=not store.has_open_lot_for_symbol(symbol),
-        apply_quality_filter=True,
-        atr_period=ATR_PERIOD,
-        min_body_atr=MIN_BODY_ATR,
-        max_body_atr=MAX_BODY_ATR,
-        min_pot_rr=MIN_POT_RR,
-        size_by_rr=SIZE_BY_RR,
-    )
-
-    if entry is None or not is_trading_enabled() or not has_credentials():
-        _persist_state(symbol, state)
-        return False
-
-    if breadth is not None and breadth.side is not None and not allows_side(breadth, entry.side):
-        if BREADTH_MODE == "hard":
-            store.record_skip(symbol, "breadth_hard")
-            state.waiting_entry = False
-            logging.info(
-                "  [%s] Donchian %s blocked by breadth hard (vote=%s ups=%d downs=%d) — discarded",
-                symbol,
-                entry.side,
-                breadth.side,
-                breadth.ups,
-                breadth.downs,
-            )
-            _persist_state(symbol, state)
-            return False
-        # flip (default): reverse side to match vote
-        orig = entry.side
-        entry = flip_entry_signal(entry, vote=breadth)
-        logging.info(
-            "  [%s] Donchian breadth FLIP %s→%s (vote=%s ups=%d downs=%d) pot_rr=%.2f size_mult=%.2f",
-            symbol,
-            orig,
-            entry.side,
-            breadth.side,
-            breadth.ups,
-            breadth.downs,
-            entry.pot_rr,
-            entry.size_mult,
-        )
-
-    last_bar = bars[-1]
-    status = open_lot(
-        symbol,
-        side=entry.side,
-        trend=state.trend or entry.side,
-        trend_ts=state.trend_ts,
-        entry_ts=last_bar.ts,
-        tp_band=entry.tp_band,
-        size_mult=entry.size_mult,
-        opp_band=entry.opp_band,
-        body_atr=entry.body_atr,
-        pot_rr=entry.pot_rr,
-        why=entry.why,
-    )
-    if status != "opened":
-        # check_signal already cleared waiting_entry on emit.
-        # cap_skip (max open / margin / already open): discard like backtest — no queue.
-        # error: keep waiting so a transient exchange failure can retry next cycle.
-        if status == "error" and not store.has_open_lot_for_symbol(symbol):
-            state.waiting_entry = True
-            state.last_processed_ts = int(bars[-2].ts) if len(bars) >= 2 else None
-            logging.info(
-                "  [%s] Donchian %s not opened (%s) — will retry next cycle",
-                symbol,
-                entry.side,
-                status,
-            )
-        else:
-            state.waiting_entry = False
-            logging.info(
-                "  [%s] Donchian %s not opened (%s) — signal discarded (no retry)",
-                symbol,
-                entry.side,
-                status,
-            )
-        _persist_state(symbol, state)
-        return False
-
-    _persist_state(symbol, state)
-    return True
-
-
 def run_cycle() -> None:
     global _first_cycle
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -748,14 +690,27 @@ def run_cycle() -> None:
     _wait_for_just_closed(symbols)
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-    breadth = compute_breadth_vote(symbols, now_ms)
-
+    candidates: list[tuple[str, EntrySignal]] = []
     for symbol in symbols:
         if _candle_cache_stale(symbol):
             stale_symbols.append(symbol)
             continue
-        did_open = _process_symbol(symbol, now_ms, breadth=breadth)
-        if did_open:
+        entry = _evaluate_symbol(symbol, now_ms)
+        if entry is not None:
+            candidates.append((symbol, entry))
+
+    candidates.sort(key=lambda item: item[1].pot_rr, reverse=True)
+    if candidates:
+        logging.info(
+            "Entry candidates: %d — opening top %d by pot_rr (max_open=%d)",
+            len(candidates),
+            TOP_K_PER_CYCLE,
+            MAX_OPEN,
+        )
+    for symbol, entry in candidates[:TOP_K_PER_CYCLE]:
+        if store.count_open() >= MAX_OPEN:
+            break
+        if _open_candidate(symbol, entry, now_ms):
             opened += 1
 
     if stale_symbols:
@@ -823,12 +778,11 @@ def main() -> None:
     logging.info("Dashboard: http://localhost:%d", WEB_PORT)
     logging.info(
         "Logic: Donchian(%d) slope_lb=%d tol=%.3f%% interval=%s | WS kline=%s | scan=%s | "
-        "margin=%.2f%% × %dx | max_open=%d | breadth=%s (ratio=%.2f min_n=%d universe=%s)",
+        "margin=%.2f%% (cap %.0f%%) × %dx | max_open=%d top_k=%d | vol_ratio≥%.2f (period=%d)",
         DONCHIAN_PERIOD, SLOPE_LOOKBACK, PARALLEL_TOL, INTERVAL, GRANULARITY,
         f"fixed×{len(FIXED_SCAN_SYMBOLS)}" if SCAN_MODE == "fixed" else f"top-{TOP_N_SYMBOLS}",
-        MARGIN_PCT * 100, LEVERAGE, MAX_OPEN,
-        BREADTH_MODE, BREADTH_RATIO, BREADTH_MIN_N,
-        "bt20" if SCAN_MODE == "fixed" else BREADTH_UNIVERSE,
+        MARGIN_PCT * 100, MARGIN_CAP_PCT * 100, LEVERAGE, MAX_OPEN, TOP_K_PER_CYCLE,
+        MIN_VOL_RATIO, VOL_RATIO_PERIOD,
     )
     if is_trading_enabled():
         logging.info("Trading: LIVE")

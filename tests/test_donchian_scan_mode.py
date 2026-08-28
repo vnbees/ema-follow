@@ -26,11 +26,10 @@ class TestDonchianScanMode(unittest.TestCase):
                 syms = cycle_mod._top_symbols()
         self.assertEqual(syms, list(cfg_mod.BACKTEST_SYMBOLS_20))
 
-    def test_breadth_universe_fixed_matches_scan(self) -> None:
-        scan = ["BTCUSDT", "ETHUSDT"]
+    def test_symbol_filter_off_for_fixed_scan(self) -> None:
         with patch.object(cfg_mod, "SCAN_MODE", "fixed"):
-            uni = cycle_mod._breadth_universe(scan)
-        self.assertEqual(uni, scan)
+            with patch.object(cfg_mod, "SYMBOL_FILTER_ENABLED", True):
+                self.assertFalse(cycle_mod._should_apply_symbol_filter())
 
 
 if __name__ == "__main__":

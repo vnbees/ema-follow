@@ -23,6 +23,8 @@ class DonchianBar:
     high: float
     low: float
     close: float
+    volume: float = 0.0
+    quote_volume: float = 0.0
 
 
 @dataclass
@@ -57,6 +59,7 @@ class EntrySignal:
     size_mult: float
     atr: float
     why: str
+    vol_ratio: float = 0.0
 
 
 def compute_bands(
@@ -85,6 +88,31 @@ def compute_bands(
     return result
 
 
+def bar_quote_volume(bar: DonchianBar) -> float:
+    if bar.quote_volume > 0:
+        return bar.quote_volume
+    if bar.volume > 0 and bar.close > 0:
+        return bar.volume * bar.close
+    return 0.0
+
+
+def compute_vol_ratio(bars: Sequence[DonchianBar], period: int = 20) -> float | None:
+    """quote_volume / SMA(period) on closed bars; None if warm-up or zero volume."""
+    if period <= 0 or len(bars) < period:
+        return None
+    window = bars[-period:]
+    vols = [bar_quote_volume(b) for b in window]
+    if any(v <= 0 for v in vols):
+        return None
+    sma = sum(vols) / period
+    if sma <= 0:
+        return None
+    last = bar_quote_volume(bars[-1])
+    if last <= 0:
+        return None
+    return last / sma
+
+
 def compute_atr(bars: Sequence[DonchianBar], period: int) -> list[float | None]:
     """SMA of True Range. Index i is None until i >= period (needs period TRs → period+1 bars)."""
     n = len(bars)
@@ -107,9 +135,10 @@ def compute_atr(bars: Sequence[DonchianBar], period: int) -> list[float | None]:
 
 
 def size_mult_from_pot_rr(pot_rr: float, *, enabled: bool = True) -> float:
+    """Match backtest_price_vol_channel Config A: mult = min(pot_rr, 2.0)."""
     if not enabled:
         return 1.0
-    return float(min(2.0, max(0.5, 0.5 + pot_rr)))
+    return float(min(2.0, max(0.0, pot_rr)))
 
 
 def rolling_channel(highs: Sequence[float], lows: Sequence[float], period: int) -> tuple[float, float] | None:
@@ -135,6 +164,8 @@ def check_signal(
     max_body_atr: float = 1.2,
     min_pot_rr: float = 0.5,
     size_by_rr: bool = True,
+    min_vol_ratio: float = 0.0,
+    vol_ratio_period: int = 20,
 ) -> EntrySignal | None:
     """Process the last closed bar against current state.
 
@@ -148,6 +179,8 @@ def check_signal(
     min_bars = period + slope_lookback
     if apply_quality_filter:
         min_bars = max(min_bars, atr_period + 1)
+    if min_vol_ratio > 0:
+        min_bars = max(min_bars, vol_ratio_period)
     if len(bars) < min_bars:
         return None
 
@@ -183,6 +216,7 @@ def check_signal(
 
             atr_val = 0.0
             body_atr = 0.0
+            vol_ratio = 0.0
             if apply_quality_filter:
                 atrs = compute_atr(bars, atr_period)
                 atr_raw = atrs[last_idx]
@@ -207,12 +241,27 @@ def check_signal(
                     state.prev_parallel = currently_parallel
                     return None
 
+            if min_vol_ratio > 0:
+                vr_raw = compute_vol_ratio(bars, vol_ratio_period)
+                if vr_raw is None or vr_raw < min_vol_ratio:
+                    logging.debug(
+                        "Donchian vol filter skip: vol_ratio=%s (need ≥%.2f, period=%d)",
+                        f"{vr_raw:.3f}" if vr_raw is not None else "n/a",
+                        min_vol_ratio,
+                        vol_ratio_period,
+                    )
+                    state.prev_parallel = currently_parallel
+                    return None
+                vol_ratio = float(vr_raw)
+
             size_mult = size_mult_from_pot_rr(pot_rr, enabled=size_by_rr and apply_quality_filter)
             counter_label = "nến đỏ ngược chiều" if side == "long" else "nến xanh ngược chiều"
             why = (
                 f"thoát song song → {state.trend.upper()}; {counter_label}; "
                 f"band không song song"
             )
+            if min_vol_ratio > 0:
+                why += f"; vol_ratio={vol_ratio:.2f} (≥{min_vol_ratio:.2f})"
             entry = EntrySignal(
                 side=side,
                 tp_band=tp_band,
@@ -222,6 +271,7 @@ def check_signal(
                 pot_rr=pot_rr,
                 size_mult=size_mult,
                 atr=atr_val,
+                vol_ratio=vol_ratio,
                 why=why,
             )
             state.waiting_entry = False
@@ -247,6 +297,8 @@ def process_closed_bars(
     max_body_atr: float = 1.2,
     min_pot_rr: float = 0.5,
     size_by_rr: bool = True,
+    min_vol_ratio: float = 0.0,
+    vol_ratio_period: int = 20,
 ) -> EntrySignal | None:
     """Apply every new closed bar to state.
 
@@ -268,6 +320,8 @@ def process_closed_bars(
         max_body_atr=max_body_atr,
         min_pot_rr=min_pot_rr,
         size_by_rr=size_by_rr,
+        min_vol_ratio=min_vol_ratio,
+        vol_ratio_period=vol_ratio_period,
     )
 
     latest_ts = bars[-1].ts
