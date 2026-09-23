@@ -27,8 +27,25 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE_DIR = ROOT / "data" / "bt_klines_15m"
-THREE_Y_START_MS = 1692828900000
+THREE_Y_START_MS = 1692828900000  # legacy 3y cache prefix
 BAR_MS = 15 * 60 * 1000
+
+
+def _best_cache_file(sym: str) -> Path | None:
+    """Prefer longest CSV (max history); fall back to legacy 3y prefix."""
+    files = list(CACHE_DIR.glob(f"{sym}_15m_*.csv"))
+    if not files:
+        return None
+
+    def score(p: Path) -> tuple[int, float]:
+        # Prefer files whose stem encodes a wide [start,end] window.
+        parts = p.stem.split("_")
+        span = 0
+        if len(parts) >= 4 and parts[-2].isdigit() and parts[-1].isdigit():
+            span = int(parts[-1]) - int(parts[-2])
+        return (span, p.stat().st_mtime)
+
+    return max(files, key=score)
 
 _bt = importlib.util.spec_from_file_location("bt", ROOT / "scripts/backtest_sr_rr_30d.py")
 bt = importlib.util.module_from_spec(_bt)
@@ -83,32 +100,63 @@ def channel_enrich(df: pd.DataFrame, period: int, slope_lb: int, parallel_tol: f
     prev_p = np.roll(parallel, 1)
     prev_p[0] = False
     out["channel_expand"] = prev_p & (~parallel)
+    # EMA stack (for optional trend filter)
+    c = out["close"]
+    out["ema21"] = c.ewm(span=21, adjust=False).mean()
+    out["ema89"] = c.ewm(span=89, adjust=False).mean()
+    out["ema200"] = c.ewm(span=200, adjust=False).mean()
     return out
 
 
-def load_pool(days: int) -> tuple[dict[str, pd.DataFrame], int, int]:
+def load_pool(days: int, *, min_cover_days: int | None = None) -> tuple[dict[str, pd.DataFrame], int, int]:
+    """Load shared-wallet pool for ``days`` eval window.
+
+    Symbols whose cache does not cover ``min_cover_days`` (default=days) are
+    dropped so longer windows (5y/7y) use the subset that actually has history.
+    """
+    cover = min_cover_days if min_cover_days is not None else days
     dfs: dict[str, pd.DataFrame] = {}
     for sym in SYMBOLS_20:
-        files = sorted(
-            CACHE_DIR.glob(f"{sym}_15m_{THREE_Y_START_MS}_*.csv"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if not files:
+        path = _best_cache_file(sym)
+        if path is None:
             continue
-        raw = pd.read_csv(files[0])
+        raw = pd.read_csv(path)
+        if "quote_volume" not in raw.columns:
+            continue
         dfs[sym] = raw
-    # enrich after load with cfg period — default 20
+    if not dfs:
+        raise RuntimeError("no cache files with quote_volume")
+
     last = min(int(d["ts"].max()) for d in dfs.values())
+    need_start = last - cover * 86400 * 1000
     wf = last - (days + 12) * 86400 * 1000
     trimmed: dict[str, pd.DataFrame] = {}
+    skipped: list[str] = []
     for sym, raw in dfs.items():
+        t0, t1 = int(raw["ts"].min()), int(raw["ts"].max())
+        if t0 > need_start or t1 < last - 2 * 86400 * 1000:
+            skipped.append(sym)
+            continue
         df = raw[raw["ts"] >= wf - WARMUP_BARS * BAR_MS].copy().reset_index(drop=True)
         if len(df) < WARMUP_BARS + 200:
+            skipped.append(sym)
             continue
         trimmed[sym] = df
+    if len(trimmed) < 3:
+        raise RuntimeError(
+            f"only {len(trimmed)} symbols cover {cover}d "
+            f"(have={sorted(trimmed)} skipped={skipped})"
+        )
     common = sorted(set.intersection(*[set(d["ts"].tolist()) for d in trimmed.values()]))
-    eval_start = common[-1] - days * 86400 * 1000
+    if not common:
+        raise RuntimeError("empty common timeline")
+    eval_start = max(common[0], common[-1] - days * 86400 * 1000)
+    print(
+        f"  pool={len(trimmed)}/{len(SYMBOLS_20)} "
+        f"(dropped {len(skipped)}: {','.join(skipped) or '-'}) "
+        f"common_bars={len(common)}",
+        flush=True,
+    )
     return trimmed, eval_start, common[-1]
 
 
@@ -123,13 +171,18 @@ class Cfg:
     body_hi: float = 1.2
     min_pot_rr: float = 0.5
     size_by_rr: bool = True
+    size_mult_cap: float = 2.0
+    time_stop_hours: float | None = None  # close @ bar close after N hours if still open
+    time_stop_underwater_only: bool = False  # if True, TIME only when unrealized pnl ≤ 0
     margin_pct: float = 0.01
     max_open: int = 10
     skip_parallel: bool = True
     top_k: int = 5
+    # none | stack (21>89>200) | ema200 (close vs 200) | stack_soft (21>89 only)
+    ema_filter: str | None = None
 
 
-def run(cfg: Cfg, raw_dfs: dict[str, pd.DataFrame], eval_start: int) -> dict:
+def run(cfg: Cfg, raw_dfs: dict[str, pd.DataFrame], eval_start: int, *, record_eod: bool = False) -> dict:
     dfs = {
         sym: channel_enrich(df, cfg.period, cfg.slope_lb, cfg.parallel_tol)
         for sym, df in raw_dfs.items()
@@ -138,6 +191,9 @@ def run(cfg: Cfg, raw_dfs: dict[str, pd.DataFrame], eval_start: int) -> dict:
     indexed = {sym: df.set_index("ts").loc[common] for sym, df in dfs.items()}
     symbols = list(indexed)
     days = max((common[-1] - eval_start) / 86400000.0, 1e-9)
+    # clamp: if data starts after requested eval_start, measure real span
+    first_eval = next((t for t in common if t >= eval_start), common[-1])
+    days = max((common[-1] - first_eval) / 86400000.0, 1e-9)
 
     cash = CAPITAL
     opens: list[dict] = []
@@ -146,6 +202,10 @@ def run(cfg: Cfg, raw_dfs: dict[str, pd.DataFrame], eval_start: int) -> dict:
     peak = CAPITAL
     maxdd = 0.0
     skipped = 0
+    eod_curve: list[tuple[int, float]] = []  # (ts, equity) end-of-UTC-day
+    prev_day: int | None = None
+    day_last_eq: float | None = None
+    day_last_ts: int | None = None
 
     def equity(mark: dict[str, float]) -> float:
         eq = cash
@@ -165,6 +225,9 @@ def run(cfg: Cfg, raw_dfs: dict[str, pd.DataFrame], eval_start: int) -> dict:
         mark = {sym: float(bar[sym]["close"]) for sym in symbols}
 
         still = []
+        time_stop_ms = (
+            int(cfg.time_stop_hours * 3600 * 1000) if cfg.time_stop_hours and cfg.time_stop_hours > 0 else None
+        )
         for t in opens:
             b = bar[t["sym"]]
             hi, lo = float(b["high"]), float(b["low"])
@@ -173,6 +236,13 @@ def run(cfg: Cfg, raw_dfs: dict[str, pd.DataFrame], eval_start: int) -> dict:
             tp = up if side == "long" else dn
             if (side == "long" and hi >= tp) or (side == "short" and lo <= tp):
                 close_trade(t, tp, "TP", ts)
+            elif time_stop_ms is not None and (ts - t["entry_ts"]) >= time_stop_ms:
+                px_close = float(b["close"])
+                u_pnl = pnl(side, t["entry"], px_close, t["qty"])
+                if (not cfg.time_stop_underwater_only) or u_pnl <= 0:
+                    close_trade(t, px_close, "TIME", ts)
+                else:
+                    still.append(t)
             else:
                 still.append(t)
         opens = still
@@ -220,6 +290,23 @@ def run(cfg: Cfg, raw_dfs: dict[str, pd.DataFrame], eval_start: int) -> dict:
                 continue
 
             side = "long" if st["trend"] == "up" else "short"
+            # Optional EMA regime filter
+            if cfg.ema_filter:
+                e21, e89, e200 = float(b["ema21"]), float(b["ema89"]), float(b["ema200"])
+                if not (np.isfinite(e21) and np.isfinite(e89) and np.isfinite(e200)):
+                    continue
+                if cfg.ema_filter == "stack":
+                    ok = (e21 > e89 > e200) if side == "long" else (e21 < e89 < e200)
+                    if not ok:
+                        continue
+                elif cfg.ema_filter == "stack_soft":
+                    ok = (e21 > e89) if side == "long" else (e21 < e89)
+                    if not ok:
+                        continue
+                elif cfg.ema_filter == "ema200":
+                    ok = (px > e200) if side == "long" else (px < e200)
+                    if not ok:
+                        continue
             tp_near = up if side == "long" else dn
             sl_opp = dn if side == "long" else up
             pot_rr = abs(tp_near - px) / max(abs(px - sl_opp), 1e-12)
@@ -235,7 +322,7 @@ def run(cfg: Cfg, raw_dfs: dict[str, pd.DataFrame], eval_start: int) -> dict:
                 continue
             eq = max(cash + sum(t["margin"] for t in opens), 1.0)
             base_margin = eq * cfg.margin_pct
-            mult = min(cand["pot_rr"], 2.0) if cfg.size_by_rr else 1.0
+            mult = min(cand["pot_rr"], cfg.size_mult_cap) if cfg.size_by_rr else 1.0
             margin = base_margin * mult
             margin = min(margin, eq * 0.15, cash)
             if margin < 1.0:
@@ -248,6 +335,16 @@ def run(cfg: Cfg, raw_dfs: dict[str, pd.DataFrame], eval_start: int) -> dict:
         eq = equity(mark)
         peak = max(peak, eq)
         maxdd = max(maxdd, (peak - eq) / peak if peak > 0 else 0)
+        if record_eod and ts >= eval_start:
+            day = ts // 86400000
+            if prev_day is not None and day != prev_day and day_last_eq is not None and day_last_ts is not None:
+                eod_curve.append((day_last_ts, day_last_eq))
+            prev_day = day
+            day_last_eq = eq
+            day_last_ts = ts
+
+    if record_eod and day_last_eq is not None and day_last_ts is not None:
+        eod_curve.append((day_last_ts, day_last_eq))
 
     wins = [t for t in trades if t["pnl"] > 0]
     losses = [t for t in trades if t["pnl"] <= 0]
@@ -257,6 +354,8 @@ def run(cfg: Cfg, raw_dfs: dict[str, pd.DataFrame], eval_start: int) -> dict:
     return {
         "name": cfg.name,
         "days": days,
+        "n_syms": len(symbols),
+        "symbols": symbols,
         "n": len(trades),
         "wr": len(wins) / len(trades) * 100 if trades else 0,
         "pf": gw / gl if gl > 0 else float("inf"),
@@ -268,6 +367,7 @@ def run(cfg: Cfg, raw_dfs: dict[str, pd.DataFrame], eval_start: int) -> dict:
         "short_pnl": sum(t["pnl"] for t in trades if t["side"] == "short"),
         "skipped": skipped,
         "final_eq": cash,
+        "eod_curve": eod_curve,
     }
 
 

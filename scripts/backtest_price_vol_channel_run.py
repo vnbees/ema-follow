@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
-"""Fresh backtest — Channel + Counter + Volume (1y / 3y). Cache-only, no reuse."""
+"""Fresh backtest — Channel + Counter + Volume (1y / 3y / 5y / max≈7y).
+
+Binance USDT-M 15m does not have 10y history (BTC futures from ~2019-09).
+Long windows auto-drop coins that lack coverage (SUI/ARB/APT/OP for 5y+).
+
+Usage:
+  .venv/bin/python scripts/backtest_price_vol_channel_run.py
+  .venv/bin/python scripts/backtest_price_vol_channel_run.py --windows 1825,2500
+"""
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import sys
 from datetime import datetime, timezone
@@ -50,7 +59,8 @@ def run_window(days: int) -> list[dict]:
         mark = " ✅" if r["ret_pct"] > 0 else " ❌"
         print(
             f"    ret={r['ret_pct']:+.2f}% ({r['pct_day']:+.3f}%/d) PF={r['pf']:.2f} WR={r['wr']:.1f}% "
-            f"n={r['n']} t/d={r['tpd']:.1f} MaxDD={r['maxdd']:.1f}% L={r['long_pnl']:+.0f} S={r['short_pnl']:+.0f}{mark}",
+            f"n={r['n']} t/d={r['tpd']:.1f} MaxDD={r['maxdd']:.1f}% "
+            f"syms={r['n_syms']} L={r['long_pnl']:+.0f} S={r['short_pnl']:+.0f}{mark}",
             flush=True,
         )
         rows.append(r)
@@ -60,13 +70,19 @@ def run_window(days: int) -> list[dict]:
 def write_md(all_rows: list[dict], out_path: Path) -> None:
     now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
     lines = [
-        "# Channel + Counter + Volume — backtest 1y & ~3y (fresh)",
+        "# Channel + Counter + Volume — backtest 1y / 3y / 5y / max futures",
         "",
         f"- Generated: **{now}**",
         f"- Script: `scripts/backtest_price_vol_channel_run.py`",
-        "- Data: cache `data/bt_klines_15m/` (20 majors, 15m, quote_volume)",
+        "- Data: cache `data/bt_klines_15m/` (Binance USDT-M 15m, quote_volume)",
         "- Strategy: rolling channel 20 · parallel exit · counter candle · body/ATR [0.3,1.2] · pot_rr filter · TP = opposite band",
         "- Fill: entry@close · TP on band touch · no hard SL · shared wallet compound margin",
+        "",
+        "## Giới hạn data",
+        "",
+        "- Futures USDT-M **không có 10 năm** 15m (BTC từ ~2019-09 ≈ 7y).",
+        "- Pool 20 coin đầy đủ chỉ overlap ~3.4y (SUI list 2023-05).",
+        "- Cửa sổ ≥5y **tự drop** coin thiếu lịch sử (thường: SUI, ARB, APT, OP).",
         "",
     ]
     for days in sorted({r["window_days"] for r in all_rows}):
@@ -74,8 +90,13 @@ def write_md(all_rows: list[dict], out_path: Path) -> None:
         if not subset:
             continue
         es, ee = subset[0]["eval_start"], subset[0]["eval_end"]
+        actual = subset[0]["days"]
+        n_syms = subset[0]["n_syms"]
+        syms = ",".join(subset[0].get("symbols") or [])
         lines += [
-            f"## {days} ngày ({fmt_ts(es)} → {fmt_ts(ee)})",
+            f"## {days} ngày yêu cầu · thực tế **{actual:.0f}d** · **{n_syms} coin** ({fmt_ts(es)} → {fmt_ts(ee)})",
+            "",
+            f"- Symbols: `{syms}`",
             "",
             "| Config | Return | %/ngày | PF | WR | Trades | t/d | MaxDD | Long PnL | Short PnL | Final eq |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -91,8 +112,8 @@ def write_md(all_rows: list[dict], out_path: Path) -> None:
     lines += [
         "## Ghi chú",
         "",
-        "- Return % tính trên vốn ban đầu $1000, **compound** theo margin_pct (không rút lời).",
-        "- ~3y = 1095 ngày eval (cache có ~1100 ngày từ 2023-08-23).",
+        "- Return % trên vốn $1000, **compound** (không rút lời) — số tuyệt đối phình trên cửa sổ dài.",
+        "- Metric so sánh ổn định hơn: **%/ngày, PF, WR, MaxDD, t/d**.",
         "- Paper only.",
         "",
     ]
@@ -101,11 +122,23 @@ def write_md(all_rows: list[dict], out_path: Path) -> None:
 
 
 def main() -> int:
-    windows = [365, 1095]
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--windows",
+        default="365,1095,1825,2100",
+        help="comma days: 365=1y, 1095=3y, 1825=5y, 2100≈max multi-coin (~5.8y; futures cap)",
+    )
+    parser.add_argument(
+        "--out",
+        default="docs/backtest_channel_vol_1y_3y_5y_max.md",
+        help="markdown output path",
+    )
+    args = parser.parse_args()
+    windows = [int(x.strip()) for x in args.windows.split(",") if x.strip()]
     all_rows: list[dict] = []
     for d in windows:
         all_rows.extend(run_window(d))
-    out = DOCS / "backtest_channel_vol_dual_1y_3y.md"
+    out = ROOT / args.out
     write_md(all_rows, out)
     return 0
 
