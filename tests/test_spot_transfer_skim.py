@@ -60,16 +60,19 @@ def test_apply_manual_net_adjusts_sod_and_peak(tmp_path, monkeypatch):
     db.init_db()
     db.set_spot_sod_equity(1000.0)
     db.set_equity_peak(1200.0)
+    db.set_baseline_equity(1000.0)
 
     from src.spot_transfer import apply_manual_net_to_markers
 
     apply_manual_net_to_markers(100.0)  # deposit
     assert abs(db.get_spot_sod_equity() - 1100.0) < 1e-9
     assert abs(db.get_equity_peak() - 1300.0) < 1e-9
+    assert abs(db.get_baseline_equity() - 1100.0) < 1e-9
 
     apply_manual_net_to_markers(-50.0)  # manual withdraw
     assert abs(db.get_spot_sod_equity() - 1050.0) < 1e-9
     assert abs(db.get_equity_peak() - 1250.0) < 1e-9
+    assert abs(db.get_baseline_equity() - 1050.0) < 1e-9
 
 
 def test_deposit_then_decide_no_false_profit():

@@ -128,6 +128,84 @@
         {{ rsi_rev.summary.closed_realized | dash_pnl }}
       </div>
     </div>
+    <div class="summary-card">
+      <div class="label">Đã rút → Spot</div>
+      <div id="totalSkimmed" class="value green">
+        {% set skim_tot = spot_transfer.total_skimmed if spot_transfer else 0 %}
+        {{ "%.2f"|format(skim_tot or 0) }}
+      </div>
+      <div class="label" id="skimCountMeta" style="margin-top:4px;">
+        {% set skim_n = spot_transfer.skim_count if spot_transfer else 0 %}
+        {{ skim_n or 0 }} lần success
+      </div>
+    </div>
+    {% set cs = spot_transfer.capital_safety if spot_transfer else none %}
+    <div class="summary-card">
+      <div class="label">Total vs vốn gốc</div>
+      <div id="totalWealth"
+           class="value {% if cs and cs.above_principal %}green{% elif cs %}red{% else %}{% endif %}">
+        {% if cs and cs.total_wealth is not none %}{{ "%.2f"|format(cs.total_wealth) }}{% else %}—{% endif %}
+      </div>
+      <div class="label" id="capitalSafetyMeta" style="margin-top:4px;">
+        {% if cs and cs.principal is not none %}
+          {% if cs.above_principal %}≥{% else %}&lt;{% endif %}
+          vốn {{ "%.0f"|format(cs.principal) }}
+          ({{ "%+.0f"|format(cs.vs_principal or 0) }})
+        {% else %}
+          equity + rút spot
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  {% set cs2 = spot_transfer.capital_safety if spot_transfer else none %}
+  {% if cs2 and cs2.principal is not none %}
+  <p class="meta" id="capitalSafetyLine" style="margin-top:10px;">
+    An toàn vốn:
+    futures <span id="csFutures">{{ "%.2f"|format(cs2.futures_equity or 0) }}</span>
+    + rút spot <span id="csSkim">{{ "%.2f"|format(cs2.total_skimmed or 0) }}</span>
+    = <strong id="csTotal" class="{% if cs2.above_principal %}green{% else %}red{% endif %}">{{ "%.2f"|format(cs2.total_wealth or 0) }}</strong>
+    {% if cs2.above_principal %}
+      <span class="green" id="csVerdict">≥ vốn gốc {{ "%.2f"|format(cs2.principal) }} (ổn)</span>
+    {% else %}
+      <span class="red" id="csVerdict">&lt; vốn gốc {{ "%.2f"|format(cs2.principal) }} (dưới vốn)</span>
+    {% endif %}
+    <span class="meta" id="csPrincipalNote"> · vốn gốc theo dõi nạp/rút tay futures</span>
+  </p>
+  {% else %}
+  <p class="meta" id="capitalSafetyLine" style="margin-top:10px;" hidden></p>
+  {% endif %}
+
+  {% set pc = perf_compare if perf_compare else none %}
+  <div class="panel" id="perfComparePanel">
+    <h2 style="margin-top:0;">Live vs Backtest</h2>
+    <p class="meta" style="margin-top:0;" id="perfCompareMeta">
+      {% if pc %}{{ pc.live_label }} · tham chiếu {{ pc.bt_label }}{% else %}—{% endif %}
+    </p>
+    <div class="table-wrap">
+      <table id="perfCompareTable">
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th id="perfLiveCol">{% if pc %}{{ pc.live_label }}{% else %}Live{% endif %}</th>
+            <th>BT Config A (365d, live skim)</th>
+            <th>Đánh giá</th>
+          </tr>
+        </thead>
+        <tbody id="perfCompareBody">
+          {% for r in (pc.rows if pc else []) %}
+          <tr>
+            <td>{{ r.metric }}</td>
+            <td><strong>{{ r.live_txt }}</strong></td>
+            <td>{{ r.bt_txt }}</td>
+            <td>{{ r.verdict }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" class="empty">Chưa đủ dữ liệu so sánh.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   </div>
 
   <div class="panel">
@@ -293,6 +371,15 @@
       · SOD={{ "%.2f"|format(st.sod_equity) if st and st.sod_equity is not none else "—" }}
       · peak={{ "%.2f"|format(st.peak_equity) if st and st.peak_equity is not none else "—" }}
       · hôm nay: {{ st.latest_status or "chưa chạy" }}{% if st and st.latest_reason %} — {{ st.latest_reason }}{% endif %}
+    </p>
+    <p class="meta" style="margin:0 0 8px;" id="spotSkimTotalMeta">
+      Tổng đã rút về spot:
+      <strong class="green" id="spotSkimTotalValue">
+        {{ "%.2f"|format((spot_transfer.total_skimmed if spot_transfer else 0) or 0) }}
+      </strong>
+      USDT
+      · <span id="spotSkimCountValue">{{ (spot_transfer.skim_count if spot_transfer else 0) or 0 }}</span> lần success
+      (toàn bộ lịch sử bot)
     </p>
     <p class="meta" style="margin:0 0 8px;">Lịch sử từ hôm nay (+07)</p>
     <div class="table-wrap">
@@ -529,7 +616,62 @@
             ' · peak=' + peak +
             ' · hôm nay: ' + today;
         }
+        const totalSkimmed = (data.total_skimmed != null)
+          ? Number(data.total_skimmed)
+          : Number(st.total_skimmed || 0);
+        const skimCount = (data.skim_count != null)
+          ? Number(data.skim_count)
+          : Number(st.skim_count || 0);
+        const totEl = document.getElementById('spotSkimTotalValue');
+        const cntEl = document.getElementById('spotSkimCountValue');
+        const cardEl = document.getElementById('totalSkimmed');
+        const cardMeta = document.getElementById('skimCountMeta');
+        if (totEl) totEl.textContent = totalSkimmed.toFixed(2);
+        if (cntEl) cntEl.textContent = String(skimCount);
+        if (cardEl) cardEl.textContent = totalSkimmed.toFixed(2);
+        if (cardMeta) cardMeta.textContent = skimCount + ' lần success';
+        updateCapitalSafety(data.capital_safety || {});
       } catch (_) {}
+    }
+
+    function updateCapitalSafety(cs) {
+      if (!cs || cs.principal == null) return;
+      const wealth = Number(cs.total_wealth || 0);
+      const principal = Number(cs.principal || 0);
+      const vs = Number(cs.vs_principal || 0);
+      const above = !!cs.above_principal;
+      const wealthEl = document.getElementById('totalWealth');
+      const metaEl = document.getElementById('capitalSafetyMeta');
+      if (wealthEl) {
+        wealthEl.textContent = wealth.toFixed(2);
+        wealthEl.className = 'value ' + (above ? 'green' : 'red');
+      }
+      if (metaEl) {
+        metaEl.textContent =
+          (above ? '≥' : '<') +
+          ' vốn ' + principal.toFixed(2) +
+          ' (' + (vs >= 0 ? '+' : '') + vs.toFixed(2) + ')';
+      }
+      const line = document.getElementById('capitalSafetyLine');
+      if (line) {
+        line.hidden = false;
+        const f = document.getElementById('csFutures');
+        const s = document.getElementById('csSkim');
+        const t = document.getElementById('csTotal');
+        const v = document.getElementById('csVerdict');
+        if (f) f.textContent = Number(cs.futures_equity || 0).toFixed(2);
+        if (s) s.textContent = Number(cs.total_skimmed || 0).toFixed(2);
+        if (t) {
+          t.textContent = wealth.toFixed(2);
+          t.className = above ? 'green' : 'red';
+        }
+        if (v) {
+          v.className = above ? 'green' : 'red';
+          v.textContent = above
+            ? '≥ vốn gốc ' + principal.toFixed(2) + ' (ổn)'
+            : '< vốn gốc ' + principal.toFixed(2) + ' (dưới vốn)';
+        }
+      }
     }
 
     function renderDaily(rows) {
@@ -614,7 +756,38 @@
         } else {
           rl.hidden = true;
         }
+        if (data.spot_transfer && data.spot_transfer.capital_safety) {
+          updateCapitalSafety(data.spot_transfer.capital_safety);
+        }
+        if (data.perf_compare) {
+          renderPerfCompare(data.perf_compare);
+        }
       } catch (_) {}
+    }
+
+    function renderPerfCompare(pc) {
+      const meta = document.getElementById('perfCompareMeta');
+      const liveCol = document.getElementById('perfLiveCol');
+      const tbody = document.getElementById('perfCompareBody');
+      if (!tbody || !pc) return;
+      if (meta) {
+        meta.textContent = (pc.live_label || 'Live') + ' · tham chiếu ' + (pc.bt_label || 'BT');
+      }
+      if (liveCol) liveCol.textContent = pc.live_label || 'Live';
+      const rows = pc.rows || [];
+      if (!rows.length) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">Chưa đủ dữ liệu so sánh.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = rows.map(r => {
+        const verdict = (r.verdict || '—').replace(/</g, '&lt;');
+        return `<tr>
+          <td>${r.metric || '—'}</td>
+          <td><strong>${r.live_txt || '—'}</strong></td>
+          <td>${r.bt_txt || '—'}</td>
+          <td>${verdict}</td>
+        </tr>`;
+      }).join('');
     }
 
     async function loadEquityChart(range) {

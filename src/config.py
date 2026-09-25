@@ -252,6 +252,10 @@ REST_WEIGHT_SAFE_MAX = int(os.getenv("REST_WEIGHT_SAFE_MAX", "800"))
 # Skip ALL REST including orders at this used weight.
 REST_WEIGHT_HARD_MAX = int(os.getenv("REST_WEIGHT_HARD_MAX", "1800"))
 
+# Vốn gốc để so sánh total wealth (futures equity + đã rút spot) trên dashboard.
+# Ưu tiên settings.baseline_equity nếu đã set; không thì dùng env này.
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "1000"))
+
 SPOT_TRANSFER_ENABLED = os.getenv("SPOT_TRANSFER_ENABLED", "true").lower() in ("1", "true", "yes")
 # skim (default): green-day profit skim | pct/hwm: legacy modes retained for env compat
 _SPOT_TRANSFER_MODE_RAW = os.getenv("SPOT_TRANSFER_MODE", "skim").strip().lower()

@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from src import database as db
 from src.config import (
     EXCHANGE,
+    INITIAL_CAPITAL,
     MARGIN_COIN,
     SPOT_TRANSFER_DAY_CAP_PCT,
     SPOT_TRANSFER_DD_PAUSE_PCT,
@@ -114,7 +115,11 @@ def _bot_transfer_filters() -> tuple[set[str], set[tuple[str, float]]]:
 
 
 def apply_manual_net_to_markers(net_manual: float) -> None:
-    """Adjust SOD + peak by net manual TRANSFER (deposit +, withdraw −)."""
+    """Adjust SOD + peak + vốn gốc by net manual TRANSFER (deposit +, withdraw −).
+
+    Bot skim futures→spot is excluded by sync_manual_transfers; only true
+    top-ups / cash-outs change invested capital.
+    """
     if abs(net_manual) < 0.01:
         return
     sod = db.get_spot_sod_equity()
@@ -123,13 +128,18 @@ def apply_manual_net_to_markers(net_manual: float) -> None:
     peak = db.get_equity_peak()
     if peak is not None:
         db.set_equity_peak(max(0.0, peak + net_manual))
+    baseline = db.get_baseline_equity()
+    if baseline is not None and baseline > 0:
+        db.set_baseline_equity(max(0.0, baseline + net_manual))
     logging.info(
-        "  Spot markers adjusted %+.2f for manual transfer(s): sod %.2f -> %.2f, peak %.2f -> %.2f",
+        "  Spot markers adjusted %+.2f for manual transfer(s): sod %.2f -> %.2f, peak %.2f -> %.2f, baseline %.2f -> %.2f",
         net_manual,
         sod if sod is not None else float("nan"),
         (sod + net_manual) if sod is not None else float("nan"),
         peak if peak is not None else float("nan"),
         (peak + net_manual) if peak is not None else float("nan"),
+        baseline if baseline is not None else float("nan"),
+        (baseline + net_manual) if baseline is not None else float("nan"),
     )
 
 
@@ -568,6 +578,7 @@ def today_transfer_status() -> dict:
     latest = rows[0] if rows else None
     peak = db.get_equity_peak()
     sod = db.get_spot_sod_equity()
+    total_skimmed, skim_count = db.sum_successful_spot_transfers()
     return {
         "date": transfer_date,
         "enabled": is_enabled(),
@@ -581,6 +592,8 @@ def today_transfer_status() -> dict:
         "latest_status": str(latest["status"]) if latest else None,
         "latest_reason": str(latest["reason"] or latest["error"] or "") if latest else None,
         "latest_amount": float(latest["amount"]) if latest else None,
+        "total_skimmed": total_skimmed,
+        "skim_count": skim_count,
     }
 
 
@@ -634,6 +647,23 @@ def dashboard_payload(
         "warn_maint": (account.maint_margin_pct or 0) > SPOT_WARN_MAINT_PCT,
         "suggest_topup": max(0.0, peak - equity) if dd > SPOT_WARN_DD_PCT * 100 else 0.0,
     }
+    total_skimmed = float(status.get("total_skimmed") or 0)
+    skim_count = int(status.get("skim_count") or 0)
+    baseline = db.get_baseline_equity()
+    principal = float(baseline) if baseline is not None and baseline > 0 else float(INITIAL_CAPITAL)
+    total_wealth = equity + total_skimmed
+    vs_principal = total_wealth - principal
+    capital_safety = {
+        "principal": principal,
+        "principal_source": "baseline" if baseline is not None and baseline > 0 else "initial_capital",
+        "futures_equity": equity,
+        "total_skimmed": total_skimmed,
+        "total_wealth": total_wealth,
+        "vs_principal": vs_principal,
+        "above_principal": total_wealth >= principal,
+        # Hint for UI: vốn gốc = baseline; nạp/rút tay futures sẽ tự cộng/trừ
+        "note": "vốn gốc = baseline (+ nạp / − rút tay futures; không tính bot skim)",
+    }
     return {
         "status": status,
         "rows": rows,
@@ -643,4 +673,7 @@ def dashboard_payload(
         "pages": pages,
         "total": total,
         "since": since,
+        "total_skimmed": total_skimmed,
+        "skim_count": skim_count,
+        "capital_safety": capital_safety,
     }

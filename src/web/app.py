@@ -353,6 +353,15 @@ def _donchian_trades_payload(*, status: str, page: int, page_size: int) -> dict:
     }
 
 
+def _perf_compare_payload() -> dict:
+    try:
+        from src.web.perf_compare import build_live_vs_bt
+
+        return build_live_vs_bt()
+    except Exception:  # noqa: BLE001
+        return {"bt_label": "BT Config A", "live_label": "Live", "live_days": 0, "rows": []}
+
+
 def _dashboard_context() -> dict:
     account = get_account_balance()
     open_payload = _donchian_trades_payload(status="open", page=1, page_size=50)
@@ -374,6 +383,9 @@ def _dashboard_context() -> dict:
             "total": 0,
             "page_size": 20,
             "since": None,
+            "total_skimmed": 0.0,
+            "skim_count": 0,
+            "capital_safety": {},
         }
     return {
         "exchange_name": EXCHANGE_DISPLAY_NAME,
@@ -382,6 +394,7 @@ def _dashboard_context() -> dict:
         "last_cycle_at": get_last_cycle_at(),
         "trading_enabled": is_trading_enabled(),
         "spot_transfer": spot,
+        "perf_compare": _perf_compare_payload(),
         "rsi_rev": {
             "open_count": open_payload["open_count"],
             "closed_count": open_payload["closed_count"],
@@ -427,6 +440,7 @@ def api_status() -> dict:
         "last_cycle_at": format_vn_time(get_last_cycle_at()),
         "rsi_rev": donchian,
         "spot_transfer": _spot_api_payload(),
+        "perf_compare": _perf_compare_payload(),
         "rate_limited": rate_limited,
         "rate_limit_remaining_sec": rate_limit_remaining_sec,
     }
@@ -447,6 +461,9 @@ def _spot_api_payload(*, page: int = 1, page_size: int = 20) -> dict:
             "total": 0,
             "page_size": page_size,
             "since": None,
+            "total_skimmed": 0.0,
+            "skim_count": 0,
+            "capital_safety": {},
         }
 
 

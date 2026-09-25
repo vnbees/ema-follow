@@ -318,6 +318,19 @@ def get_spot_transfers_paged(
     return rows, total
 
 
+def sum_successful_spot_transfers() -> tuple[float, int]:
+    """Lifetime total amount + count of successful futures→spot skims."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS cnt
+            FROM spot_transfers
+            WHERE status = 'success'
+            """
+        ).fetchone()
+        return float(row["total"] or 0), int(row["cnt"] or 0)
+
+
 def has_successful_transfer_on_date(transfer_date: str) -> bool:
     with get_connection() as conn:
         row = conn.execute(
