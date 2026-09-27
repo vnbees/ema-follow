@@ -1,8 +1,8 @@
 """Donchian close watcher — runs every WATCHER_INTERVAL_SEC.
 
-TP matches backtest: long when price touches the *current* Donchian upper,
-short when price touches the *current* lower. Live difference: check every
-WATCHER_INTERVAL_SEC on mark + forming-candle high/low — do not wait for 15m close.
+TP is the live Donchian band (upper for long, lower for short), including the
+forming bar. On Binance a resting GTC limit sits at that price and is replaced
+only when the band price changes. Other exchanges still market-close on touch.
 """
 
 from __future__ import annotations
@@ -10,11 +10,12 @@ from __future__ import annotations
 import logging
 import threading
 
+from src.config import EXCHANGE
 from src.notify import notify_error
 from src.donchian import store
 from src.donchian.config import CANDLE_LIMIT, DONCHIAN_PERIOD, INTERVAL, WATCHER_INTERVAL_SEC
 from src.donchian.signals import rolling_channel
-from src.donchian.trading import close_lot, reconcile_flat_lots
+from src.donchian.trading import close_lot, reconcile_flat_lots, sync_tp_limit
 
 _stop = threading.Event()
 _thread: threading.Thread | None = None
@@ -72,6 +73,22 @@ def _tp_hit(side: str, *, upper: float, lower: float, high: float, low: float, m
     return bar_low <= lower
 
 
+def _target_band(lot) -> float | None:
+    """Live TP price, or None while the entry candle is still forming."""
+    symbol = str(lot["symbol"])
+    side = str(lot["side"])
+    live = _live_channel(symbol)
+    if live is None:
+        return None
+    upper, lower, _high, _low = live
+    last_bar_ts = _last_candle_ts(symbol)
+    entry_ts = lot["entry_ts"]
+    # Backtest không TP nến vào lệnh — chỉ nến sau.
+    if entry_ts is not None and last_bar_ts is not None and int(last_bar_ts) <= int(entry_ts):
+        return None
+    return upper if side == "long" else lower
+
+
 def check_open_lots() -> None:
     reconcile_flat_lots()
     lots = store.get_open_lots()
@@ -82,26 +99,29 @@ def check_open_lots() -> None:
             watch_symbols([str(lot["symbol"]) for lot in lots])
         except Exception:  # noqa: BLE001
             pass
+    use_limit = EXCHANGE == "binance"
     for lot in lots:
         symbol = str(lot["symbol"])
         side = str(lot["side"])
+        target = _target_band(lot)
+        if use_limit:
+            if target is None or target <= 0:
+                continue
+            sync_tp_limit(lot, target)
+            continue
+        if target is None or target <= 0:
+            continue
         mark = _mark_for(symbol)
         live = _live_channel(symbol)
         if live is None:
-            tp_band = float(lot["tp_band"])
             if mark <= 0:
                 continue
-            hit = (side == "long" and mark >= tp_band) or (side == "short" and mark <= tp_band)
+            hit = (side == "long" and mark >= target) or (side == "short" and mark <= target)
             close_px = mark
         else:
             upper, lower, high, low = live
-            last_bar_ts = _last_candle_ts(symbol)
-            entry_ts = lot["entry_ts"]
-            # Backtest không TP nến vào lệnh — chỉ nến sau.
-            if entry_ts is not None and last_bar_ts is not None and int(last_bar_ts) <= int(entry_ts):
-                continue
             hit = _tp_hit(side, upper=upper, lower=lower, high=high, low=low, mark=mark)
-            close_px = mark if mark > 0 else (upper if side == "long" else lower)
+            close_px = mark if mark > 0 else target
         if not hit:
             continue
         close_lot(lot, reason=store.REASON_TP, close_price=close_px)
@@ -123,7 +143,11 @@ def start_watcher() -> None:
     _stop.clear()
     _thread = threading.Thread(target=_loop, name="donchian-watcher", daemon=True)
     _thread.start()
-    logging.info("Donchian close watcher started (%.1fs) — live Donchian band", WATCHER_INTERVAL_SEC)
+    logging.info(
+        "Donchian close watcher started (%.1fs) — %s",
+        WATCHER_INTERVAL_SEC,
+        "resting TP limit at live band" if EXCHANGE == "binance" else "market close on band touch",
+    )
 
 
 def stop_watcher() -> None:

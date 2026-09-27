@@ -1696,6 +1696,66 @@ def close_position_side(symbol: str, hold_side: str, size: str) -> dict:
     )
 
 
+def place_limit_close_order(
+    symbol: str,
+    hold_side: str,
+    size: str,
+    price: str,
+) -> dict:
+    """Resting GTC limit that closes a hedge-mode position at `price`."""
+    order_side, position_side = market_order_params(hold_side, "close")
+    client_oid = f"btp_{uuid.uuid4().hex[:16]}"
+    params: dict[str, str | int | float | bool] = {
+        "symbol": symbol.upper(),
+        "side": order_side,
+        "positionSide": position_side,
+        "type": "LIMIT",
+        "timeInForce": "GTC",
+        "quantity": size,
+        "price": price,
+        "newClientOrderId": client_oid,
+    }
+    result = _private_post("/fapi/v1/order", params)
+    _invalidate_position_cache(symbol)
+    try:
+        from src.exchange.binance_ws import on_order_placed
+
+        on_order_placed(symbol)
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Binance WS post-limit reconcile skipped: %s", exc)
+    return {
+        "orderId": str(result.get("orderId", "")),
+        "clientOid": str(result.get("clientOrderId", client_oid)),
+        "avgPrice": result.get("avgPrice"),
+        "status": str(result.get("status", "")).lower(),
+    }
+
+
+def cancel_limit_order(symbol: str, order_id: str) -> dict:
+    """Cancel a regular LIMIT order. Unknown-order is treated as already gone."""
+    if not order_id:
+        return {"status": "canceled"}
+    try:
+        result = _private_delete(
+            "/fapi/v1/order",
+            {"symbol": symbol.upper(), "orderId": int(order_id)},
+        )
+    except (TypeError, ValueError):
+        result = _private_delete(
+            "/fapi/v1/order",
+            {"symbol": symbol.upper(), "origClientOrderId": order_id},
+        )
+    except ExchangeClientError as exc:
+        msg = str(exc).lower()
+        if "-2011" in msg or "unknown order" in msg:
+            return {"status": "canceled"}
+        raise
+    return {
+        "orderId": str(result.get("orderId", order_id)),
+        "status": str(result.get("status", "")).lower(),
+    }
+
+
 def place_algo_close_order(
     symbol: str,
     *,
@@ -1796,8 +1856,10 @@ class BinanceExchange:
     fetch_order_detail = staticmethod(fetch_order_detail)
     configure_symbol_trading = staticmethod(configure_symbol_trading)
     place_market_order = staticmethod(place_market_order)
+    place_limit_close_order = staticmethod(place_limit_close_order)
     place_algo_close_order = staticmethod(place_algo_close_order)
     cancel_order = staticmethod(cancel_order)
+    cancel_limit_order = staticmethod(cancel_limit_order)
     close_position_side = staticmethod(close_position_side)
     transfer_futures_to_spot = staticmethod(transfer_futures_to_spot)
     fetch_spot_balance = staticmethod(fetch_spot_balance)

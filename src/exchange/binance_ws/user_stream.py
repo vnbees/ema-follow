@@ -183,6 +183,12 @@ def apply_user_payload(payload: dict[str, Any]) -> None:
             on_order_update(detail)
         except Exception as exc:  # noqa: BLE001
             logging.debug("RSI-rev order-update hook skipped: %s", exc)
+        try:
+            from src.donchian.trading import on_tp_limit_order_update
+
+            on_tp_limit_order_update(detail)
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("Donchian TP-limit hook skipped: %s", exc)
 
 
 class UserStream:

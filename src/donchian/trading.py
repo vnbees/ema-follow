@@ -16,7 +16,8 @@ from src.exchange import (
     place_market_order,
 )
 from src.exchange.fills import resolve_order_commission, resolve_order_fill
-from src.exchange.sizing import format_size
+from src.exchange.fills import commission_usdt_from_detail, parse_fill_price
+from src.exchange.sizing import format_price, format_size
 from src.notify import notify_error
 from src.signal_publish import publish_close, publish_open
 from src.donchian import store
@@ -36,6 +37,8 @@ from src.donchian.config import (
 
 _open_lock = threading.Lock()
 _close_lock = threading.Lock()
+_partial_lock = threading.Lock()
+_partial_tp_orders: set[str] = set()
 
 
 def realized_pnl(side: str, entry: float, close_price: float, size: float) -> float:
@@ -421,6 +424,182 @@ def _finalize_close(lot, *, reason: str, fill: float, fee_close: float, close_oi
     return True
 
 
+def _tp_prices_match(old_px: float | None, new_px: float, price_place: int) -> bool:
+    if old_px is None:
+        return False
+    tick = 10 ** (-price_place) if price_place > 0 else 1e-8
+    return abs(float(old_px) - float(new_px)) <= tick / 2
+
+
+def _row_text(row, key: str) -> str:
+    try:
+        value = row[key]
+    except (KeyError, IndexError):
+        return ""
+    return str(value or "")
+
+
+def _is_partial_tp(order_id: str) -> bool:
+    with _partial_lock:
+        return order_id in _partial_tp_orders
+
+
+def _mark_partial_tp(order_id: str, partial: bool) -> None:
+    with _partial_lock:
+        if partial:
+            _partial_tp_orders.add(order_id)
+        else:
+            _partial_tp_orders.discard(order_id)
+
+
+def _limit_fill_price(detail: dict, fallback: float) -> float:
+    parsed = parse_fill_price(detail)
+    if parsed is not None:
+        return parsed
+    return fallback if fallback > 0 else 0.0
+
+
+def _fee_from_order(order_id: str, detail: dict) -> float:
+    try:
+        from src.exchange.binance_ws import get_order_detail_from_ws
+
+        cached = get_order_detail_from_ws(order_id)
+    except Exception:  # noqa: BLE001
+        cached = None
+    fee = commission_usdt_from_detail(cached)
+    if fee > 0:
+        return fee
+    return commission_usdt_from_detail(detail)
+
+
+def sync_tp_limit(lot, target_px: float) -> None:
+    """Park a reduce-side GTC limit at the live Donchian band. Replace only when the price changes."""
+    if target_px <= 0:
+        return
+    lot_id = int(lot["id"])
+    with _close_lock:
+        current = store.get_lot(lot_id)
+        if current is None or str(current["status"]) != "open":
+            return
+        if not is_trading_enabled() or not has_credentials():
+            return
+        symbol = str(current["symbol"])
+        side = str(current["side"])
+        try:
+            spec = fetch_contract_spec(symbol)
+        except ExchangeClientError as exc:
+            logging.warning("  [%s] TP limit spec failed: %s", symbol, exc)
+            return
+        px_str = format_price(target_px, spec)
+        try:
+            px = float(px_str)
+        except ValueError:
+            return
+        if px <= 0:
+            return
+        old_id = _row_text(current, "tp_limit_order_id")
+        old_px_raw = None
+        try:
+            old_px_raw = current["tp_limit_px"]
+        except (KeyError, IndexError):
+            old_px_raw = None
+        old_px = float(old_px_raw) if old_px_raw not in (None, "") else None
+        if old_id and _tp_prices_match(old_px, px, spec.price_place):
+            return
+        if old_id and _is_partial_tp(old_id):
+            return
+
+        from src.exchange.binance import cancel_limit_order, place_limit_close_order
+
+        if old_id:
+            try:
+                cancel_limit_order(symbol, old_id)
+            except ExchangeClientError as exc:
+                logging.warning("  [%s] TP limit cancel %s failed: %s", symbol, old_id, exc)
+                return
+            _mark_partial_tp(old_id, False)
+            store.clear_tp_limit(lot_id)
+            current = store.get_lot(lot_id)
+            if current is None or str(current["status"]) != "open":
+                return
+
+        held = _held_size(symbol, side)
+        if held is not None and held <= 1e-12:
+            return
+        qty = held if held and held > 0 else float(current["size"] or 0)
+        if qty <= 0:
+            return
+        size_str = format_size(qty, spec)
+        try:
+            result = place_limit_close_order(symbol, side, size_str, px_str)
+        except ExchangeClientError as exc:
+            logging.warning("  [%s] TP limit place @ %s failed: %s", symbol, px_str, exc)
+            notify_error(f"Donchian TP limit {symbol}", str(exc), cooldown_sec=120)
+            return
+        oid = _real_order_id(result)
+        status = str(result.get("status") or "").lower()
+        if status == "filled" and oid:
+            fill = _limit_fill_price(result, px)
+            logging.info("  [%s] TP limit %s filled immediately @ %s", symbol, side.upper(), px_str)
+            _finalize_close(
+                current,
+                reason=store.REASON_TP,
+                fill=fill if fill > 0 else px,
+                fee_close=_fee_from_order(oid, result),
+                close_oid=oid,
+                opened_at=str(current["opened_at"] or ""),
+            )
+            return
+        if not oid:
+            logging.warning("  [%s] TP limit place returned no orderId", symbol)
+            return
+        store.set_tp_limit(lot_id, oid, px)
+        logging.info(
+            "  [%s] TP limit %s @ %s%s",
+            symbol,
+            side.upper(),
+            px_str,
+            f" (was {old_px})" if old_px is not None else "",
+        )
+
+
+def on_tp_limit_order_update(detail: dict | None) -> None:
+    """Close the lot when its resting TP limit fills. Clear the id if the order dies unfilled."""
+    if not detail:
+        return
+    oid = str(detail.get("orderId") or "")
+    if not oid:
+        return
+    status = str(detail.get("status") or detail.get("state") or "").lower()
+    if status == "partially_filled":
+        _mark_partial_tp(oid, True)
+        return
+    lot = store.find_open_lot_by_tp_order(oid)
+    if lot is None:
+        return
+    if status == "filled":
+        _mark_partial_tp(oid, False)
+        fill = _limit_fill_price(detail, float(lot["tp_limit_px"] or 0))
+        if fill <= 0:
+            fill = float(lot["entry_px"] or 0)
+        with _close_lock:
+            current = store.get_lot(int(lot["id"]))
+            if current is None or str(current["status"]) != "open":
+                return
+            _finalize_close(
+                current,
+                reason=store.REASON_TP,
+                fill=fill,
+                fee_close=_fee_from_order(oid, detail),
+                close_oid=oid,
+                opened_at=str(current["opened_at"] or ""),
+            )
+        return
+    if status in {"canceled", "cancelled", "expired", "rejected"}:
+        _mark_partial_tp(oid, False)
+        store.clear_tp_limit(int(lot["id"]))
+
+
 def reconcile_flat_lots() -> None:
     """If DB says open but exchange size is 0, close the lot (ghost after failed persist)."""
     for lot in store.get_open_lots():
@@ -446,6 +625,17 @@ def reconcile_flat_lots() -> None:
             continue
         mark = _get_mark(symbol)
         fill = mark if mark > 0 else float(lot["entry_px"])
+        oid = _row_text(lot, "tp_limit_order_id")
+        if oid:
+            try:
+                from src.exchange.binance_ws import get_order_detail_from_ws
+
+                cached = get_order_detail_from_ws(oid) or {}
+                parsed = parse_fill_price(cached)
+                if parsed is not None:
+                    fill = parsed
+            except Exception:  # noqa: BLE001
+                pass
         logging.warning("  [%s] lot %s flat on exchange — closing in DB", symbol, lot["id"])
         _finalize_close(lot, reason=store.REASON_TP, fill=fill, fee_close=0.0, close_oid="", opened_at=str(lot["opened_at"] or ""))
 

@@ -108,6 +108,13 @@ def _migrate_donchian_lots(conn: sqlite3.Connection) -> None:
     ):
         if col not in cols:
             conn.execute(f"ALTER TABLE donchian_lots ADD COLUMN {col} {decl}")
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(donchian_lots)")}
+    for col, decl in (
+        ("tp_limit_order_id", "TEXT"),
+        ("tp_limit_px", "REAL"),
+    ):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE donchian_lots ADD COLUMN {col} {decl}")
 
 
 def save_state(
@@ -210,6 +217,50 @@ def insert_lot(
             ),
         )
         return int(cur.lastrowid)
+
+
+def set_tp_limit(lot_id: int, order_id: str, price: float) -> None:
+    now = _utc_now()
+    with _lock, get_connection() as conn:
+        ensure_schema(conn)
+        conn.execute(
+            """
+            UPDATE donchian_lots
+            SET tp_limit_order_id = ?, tp_limit_px = ?, updated_at = ?
+            WHERE id = ? AND status = 'open'
+            """,
+            (str(order_id), float(price), now, int(lot_id)),
+        )
+
+
+def clear_tp_limit(lot_id: int) -> None:
+    now = _utc_now()
+    with _lock, get_connection() as conn:
+        ensure_schema(conn)
+        conn.execute(
+            """
+            UPDATE donchian_lots
+            SET tp_limit_order_id = NULL, tp_limit_px = NULL, updated_at = ?
+            WHERE id = ? AND status = 'open'
+            """,
+            (now, int(lot_id)),
+        )
+
+
+def find_open_lot_by_tp_order(order_id: str) -> sqlite3.Row | None:
+    oid = str(order_id or "").strip()
+    if not oid:
+        return None
+    with _lock, get_connection() as conn:
+        ensure_schema(conn)
+        return conn.execute(
+            """
+            SELECT * FROM donchian_lots
+            WHERE status = 'open' AND tp_limit_order_id = ?
+            LIMIT 1
+            """,
+            (oid,),
+        ).fetchone()
 
 
 def close_lot(
