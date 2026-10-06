@@ -180,7 +180,7 @@
   <div class="panel" id="perfComparePanel">
     <h2 style="margin-top:0;">Live vs Backtest</h2>
     <p class="meta" style="margin-top:0;" id="perfCompareMeta">
-      {% if pc %}{{ pc.live_label }} · tham chiếu {{ pc.bt_label }}{% else %}—{% endif %}
+      {% if pc %}{{ pc.live_label }} · {{ pc.limit_label }} · tham chiếu {{ pc.bt_label }} · đánh giá theo cột Từ limit{% else %}—{% endif %}
     </p>
     <div class="table-wrap">
       <table id="perfCompareTable">
@@ -188,6 +188,7 @@
           <tr>
             <th>Metric</th>
             <th id="perfLiveCol">{% if pc %}{{ pc.live_label }}{% else %}Live{% endif %}</th>
+            <th id="perfLimitCol">{% if pc %}{{ pc.limit_label }}{% else %}Từ limit{% endif %}</th>
             <th>BT Config A (365d, live skim)</th>
             <th>Đánh giá</th>
           </tr>
@@ -196,12 +197,13 @@
           {% for r in (pc.rows if pc else []) %}
           <tr>
             <td>{{ r.metric }}</td>
-            <td><strong>{{ r.live_txt }}</strong></td>
+            <td>{{ r.live_txt }}</td>
+            <td><strong>{{ r.limit_txt }}</strong></td>
             <td>{{ r.bt_txt }}</td>
             <td>{{ r.verdict }}</td>
           </tr>
           {% else %}
-          <tr><td colspan="4" class="empty">Chưa đủ dữ liệu so sánh.</td></tr>
+          <tr><td colspan="5" class="empty">Chưa đủ dữ liệu so sánh.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -768,22 +770,28 @@
     function renderPerfCompare(pc) {
       const meta = document.getElementById('perfCompareMeta');
       const liveCol = document.getElementById('perfLiveCol');
+      const limitCol = document.getElementById('perfLimitCol');
       const tbody = document.getElementById('perfCompareBody');
       if (!tbody || !pc) return;
       if (meta) {
-        meta.textContent = (pc.live_label || 'Live') + ' · tham chiếu ' + (pc.bt_label || 'BT');
+        meta.textContent = (pc.live_label || 'Live')
+          + ' · ' + (pc.limit_label || 'Từ limit')
+          + ' · tham chiếu ' + (pc.bt_label || 'BT')
+          + ' · đánh giá theo cột Từ limit';
       }
       if (liveCol) liveCol.textContent = pc.live_label || 'Live';
+      if (limitCol) limitCol.textContent = pc.limit_label || 'Từ limit';
       const rows = pc.rows || [];
       if (!rows.length) {
-        tbody.innerHTML = '<tr><td colspan="4" class="empty">Chưa đủ dữ liệu so sánh.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" class="empty">Chưa đủ dữ liệu so sánh.</td></tr>';
         return;
       }
       tbody.innerHTML = rows.map(r => {
         const verdict = (r.verdict || '—').replace(/</g, '&lt;');
         return `<tr>
           <td>${r.metric || '—'}</td>
-          <td><strong>${r.live_txt || '—'}</strong></td>
+          <td>${r.live_txt || '—'}</td>
+          <td><strong>${r.limit_txt || '—'}</strong></td>
           <td>${r.bt_txt || '—'}</td>
           <td>${verdict}</td>
         </tr>`;

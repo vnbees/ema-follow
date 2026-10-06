@@ -359,7 +359,14 @@ def _perf_compare_payload() -> dict:
 
         return build_live_vs_bt()
     except Exception:  # noqa: BLE001
-        return {"bt_label": "BT Config A", "live_label": "Live", "live_days": 0, "rows": []}
+        return {
+            "bt_label": "BT Config A",
+            "live_label": "Live",
+            "limit_label": "Từ limit",
+            "live_days": 0,
+            "limit_days": 0,
+            "rows": [],
+        }
 
 
 def _dashboard_context() -> dict:
