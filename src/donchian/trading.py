@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 
 from src.bot_state import is_trading_enabled
 from src.exchange import (
@@ -32,11 +33,16 @@ from src.donchian.config import (
     MIN_BODY_ATR,
     MIN_POT_RR,
     SIZE_BY_RR,
+    STALE_OPP_HOURS,
     mark_untradable,
 )
+from src.donchian.favorable_add import ENTRY_FAVORABLE_ADD
+from src.donchian.stale_opposite import ENTRY_STALE_OPPOSITE, ENTRY_STANDARD, qualifies_stale_opposite
 
 _open_lock = threading.Lock()
 _close_lock = threading.Lock()
+_tp_retry_after: dict[int, tuple[float, float]] = {}
+_TP_PLACE_BACKOFF_SEC = 60.0
 _partial_lock = threading.Lock()
 _partial_tp_orders: set[str] = set()
 
@@ -128,13 +134,26 @@ def _notify_open(
     pot_rr: float | None = None,
     size_mult: float | None = None,
     why: str = "",
+    entry_rule: str = ENTRY_STANDARD,
 ) -> None:
     try:
         from src.notify import discord_configured, _send_discord, _fmt_px
         if not discord_configured():
             return
+        rule = entry_rule == ENTRY_STALE_OPPOSITE
+        add = entry_rule == ENTRY_FAVORABLE_ADD
         title = f"{symbol.upper()} {side.upper()} mở — trend {trend.upper()}"
+        if rule:
+            title = f"{symbol.upper()} {side.upper()} mở — quy tắc ngược"
+        elif add:
+            title = f"{symbol.upper()} {side.upper()} mở — lệnh 2"
+        elif entry_rule == "dual_limit":
+            title = f"{symbol.upper()} {side.upper()} khớp limit — vào 2 chiều (trend {trend.upper()})"
         lines: list[str] = []
+        if rule:
+            lines.append(
+                f"quy tắc mới: vào ngược chiều vì lệnh cùng coin đang lỗ sau ≥ {STALE_OPP_HOURS:g} giờ"
+            )
         if why:
             lines.append(f"lý do: {why}")
         if body_atr is not None and pot_rr is not None:
@@ -142,13 +161,15 @@ def _notify_open(
                 f"lọc: body_atr={body_atr:.2f} (ok {MIN_BODY_ATR:g}–{MAX_BODY_ATR:g}) · "
                 f"pot_rr={pot_rr:.2f} (≥{MIN_POT_RR:g})"
             )
-        if size_mult is not None:
+        if size_mult is not None and not add:
             base_pct = MARGIN_PCT * 100.0
             lines.append(
                 f"size: size_mult={size_mult:.2f}× · margin_pct={base_pct:.2f}% "
                 f"→ margin={margin_usdt:.2f} USDT"
                 + (f" (equity≈{equity:.0f})" if equity > 0 else "")
             )
+        elif add:
+            lines.append(f"size: margin={margin_usdt:.2f} USDT (copy lệnh 1)")
         lines.append(f"entry={_fmt_px(entry)}")
         opp_part = f" · opp band={_fmt_px(opp_band)}" if opp_band is not None else ""
         lines.append(f"target band={_fmt_px(tp_band)}{opp_part}")
@@ -169,13 +190,17 @@ def _notify_close(
     pnl_usdt: float,
     opened_at: str = "",
     size_mult: float | None = None,
+    entry_rule: str = ENTRY_STANDARD,
 ) -> None:
     try:
         from src.notify import discord_configured, _send_discord, _fmt_px, _hold_label
         if not discord_configured():
             return
         reason_label = store.REASON_LABELS.get(reason, reason)
+        rule = entry_rule == ENTRY_STALE_OPPOSITE
         title = f"{symbol.upper()} {side.upper()} đóng — {reason_label}"
+        if rule:
+            title = f"{symbol.upper()} {side.upper()} đóng — {reason_label} · quy tắc ngược"
         body = (
             f"entry={_fmt_px(entry)}  target band={_fmt_px(tp_band)}\n"
             f"đóng={_fmt_px(close_price)}\n"
@@ -184,6 +209,8 @@ def _notify_close(
         )
         if size_mult is not None:
             body += f"\nsize_mult={float(size_mult):.2f}×"
+        if rule:
+            body += "\nquy tắc mới: lệnh này được vào ngược chiều (lệnh cũ cùng coin đang lỗ ≥ 6 giờ)"
         _send_discord(title, body)
     except Exception as exc:  # noqa: BLE001
         logging.warning("Discord notify_close failed: %s", exc)
@@ -202,20 +229,44 @@ def open_lot(
     body_atr: float | None = None,
     pot_rr: float | None = None,
     why: str = "",
+    entry_atr: float | None = None,
+    add_on: bool = False,
+    margin_fixed: float | None = None,
 ) -> str:
     """Open a Donchian lot. Returns opened | cap_skip | error | disabled."""
     if not is_trading_enabled() or not has_credentials():
         return "disabled"
 
     with _open_lock:
+        open_rows = store.get_open_lots(symbol)
+        entry_rule = ENTRY_FAVORABLE_ADD if add_on else ENTRY_STANDARD
+        if open_rows and not add_on:
+            if any(str(row["side"]).lower() == side.lower() for row in open_rows):
+                logging.info("  [%s] Skip Donchian — already open %s", symbol, side)
+                return "hold_wait"
+            mark_px = _get_mark(symbol)
+            if STALE_OPP_HOURS > 0 and qualifies_stale_opposite(
+                open_rows,
+                side,
+                mark_px,
+                datetime.now(timezone.utc),
+                min_hours=STALE_OPP_HOURS,
+            ):
+                entry_rule = ENTRY_STALE_OPPOSITE
+                logging.info(
+                    "  [%s] Stale-opposite %s allowed — open lot losing ≥ %.0fh",
+                    symbol,
+                    side,
+                    STALE_OPP_HOURS,
+                )
+            else:
+                logging.info("  [%s] Skip opposite %s — open lot not stale-red", symbol, side)
+                return "hold_wait"
+
         if store.count_open() >= MAX_OPEN:
             logging.info("  [%s] Skip Donchian — max open %d reached", symbol, MAX_OPEN)
             store.record_skip(symbol, "max_open")
-            return "cap_skip"
-
-        if store.has_open_lot_for_symbol(symbol):
-            logging.debug("  [%s] Skip Donchian — already has open lot", symbol)
-            return "cap_skip"
+            return "hold_wait" if entry_rule == ENTRY_STALE_OPPOSITE else "cap_skip"
 
         try:
             configure_symbol_trading(symbol)
@@ -228,10 +279,14 @@ def open_lot(
                 return "cap_skip"
 
             mult = 1.0
-            if SIZE_BY_RR:
-                mult = min(2.0, max(0.5, float(size_mult)))
-            margin = max(0.0, equity * MARGIN_PCT * mult)
-            margin = min(margin, equity * MARGIN_CAP_PCT)
+            if add_on and margin_fixed is not None:
+                margin = float(margin_fixed)
+                mult = float(size_mult)
+            else:
+                if SIZE_BY_RR:
+                    mult = min(2.0, max(0.5, float(size_mult)))
+                margin = max(0.0, equity * MARGIN_PCT * mult)
+                margin = min(margin, equity * MARGIN_CAP_PCT)
             if margin < MARGIN_MIN_USDT:
                 logging.info("  [%s] Skip Donchian — margin %.4f below min %.2f", symbol, margin, MARGIN_MIN_USDT)
                 store.record_skip(symbol, "margin_too_small")
@@ -286,6 +341,8 @@ def open_lot(
                 pot_rr=pot_rr,
                 size_mult=mult,
                 opp_band=opp_band,
+                entry_rule=entry_rule,
+                entry_atr=entry_atr,
             )
             _notify_open(
                 symbol,
@@ -301,6 +358,7 @@ def open_lot(
                 pot_rr=pot_rr,
                 size_mult=mult,
                 why=why,
+                entry_rule=entry_rule,
             )
             opened_row = store.get_lot(lot_id)
             publish_open(
@@ -358,6 +416,19 @@ def _held_size(symbol: str, side: str) -> float | None:
         return None
 
 
+def _tp_held_size(symbol: str, side: str) -> float | None:
+    """Position size the shared TP must cover: WS hedge size, else the sum of open DB lots on that side."""
+    held = _held_size(symbol, side)
+    if held is not None:
+        return held
+    total = sum(
+        float(row["size"] or 0)
+        for row in store.get_open_lots(symbol)
+        if str(row["side"]).lower() == side.lower()
+    )
+    return total if total > 0 else None
+
+
 def _already_flat_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return "-2022" in msg or "reduceonly" in msg or "reduce only" in msg
@@ -392,6 +463,12 @@ def _finalize_close(lot, *, reason: str, fill: float, fee_close: float, close_oi
             size_mult_meta = float(raw_sm)
     except (KeyError, IndexError, TypeError):
         pass
+    entry_rule = ENTRY_STANDARD
+    try:
+        if "entry_rule" in current.keys() and current["entry_rule"]:
+            entry_rule = str(current["entry_rule"])
+    except (KeyError, IndexError, TypeError, AttributeError):
+        pass
     _notify_close(
         symbol,
         side,
@@ -402,6 +479,7 @@ def _finalize_close(lot, *, reason: str, fill: float, fee_close: float, close_oi
         pnl_usdt=pnl,
         opened_at=opened_at,
         size_mult=size_mult_meta,
+        entry_rule=entry_rule,
     )
     margin_meta = None
     try:
@@ -472,6 +550,75 @@ def _fee_from_order(order_id: str, detail: dict) -> float:
     return commission_usdt_from_detail(detail)
 
 
+def _close_limit_side(hold_side: str) -> str:
+    return "sell" if str(hold_side).lower() == "long" else "buy"
+
+
+def _matching_close_limit(symbol: str, side: str, px: float, price_place: int, *, rest: bool):
+    """A resting close limit at this price. REST only after a place was rejected.
+
+    Hedge mode: a short entry limit is also a SELL, so positionSide must match and
+    our own pending entry orders are never adopted as TP.
+    """
+    from src.exchange.binance import fetch_open_limit_orders_rest, fetch_pending_orders
+    from src.exchange.types import PendingOrder
+
+    want = _close_limit_side(side)
+    entry_ids = store.pending_entry_order_ids()
+    orders: list[PendingOrder]
+    if rest:
+        orders = fetch_open_limit_orders_rest(symbol)
+    else:
+        orders = fetch_pending_orders(symbol)
+    for order in orders:
+        if str(order.side).lower() != want or not order.order_id:
+            continue
+        if order.order_id in entry_ids:
+            continue
+        pos_side = str(getattr(order, "position_side", "") or "").lower()
+        if pos_side and pos_side not in (side.lower(), "both"):
+            continue
+        if _tp_prices_match(order.price, px, price_place):
+            return order
+    return None
+
+
+def _remember_tp(lot_id: int, order_id: str, px: float, *, adopted: bool, qty: float | None = None) -> None:
+    store.set_tp_limit(lot_id, order_id, px, qty)
+    _tp_retry_after.pop(lot_id, None)
+    if adopted:
+        logging.info("  TP limit adopted order %s @ %s", order_id, px)
+
+
+_TP_DEAD = frozenset({"filled", "canceled", "cancelled", "expired", "rejected"})
+
+
+def _tp_order_dead(order_id: str) -> bool:
+    """UDS saw this TP order end. Unknown stays alive (no REST)."""
+    try:
+        from src.exchange.binance_ws import get_order_detail_from_ws
+
+        detail = get_order_detail_from_ws(order_id)
+    except Exception:  # noqa: BLE001
+        return False
+    if not detail:
+        return False
+    return str(detail.get("status") or "").lower() in _TP_DEAD
+
+
+def _row_float_or_none(row, key: str) -> float | None:
+    try:
+        raw = row[key]
+    except (KeyError, IndexError):
+        return None
+    if raw in (None, ""):
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def sync_tp_limit(lot, target_px: float) -> None:
     """Park a reduce-side GTC limit at the live Donchian band. Replace only when the price changes."""
     if target_px <= 0:
@@ -497,6 +644,9 @@ def sync_tp_limit(lot, target_px: float) -> None:
             return
         if px <= 0:
             return
+        retry = _tp_retry_after.get(lot_id)
+        if retry is not None and time.monotonic() < retry[0] and _tp_prices_match(retry[1], px, spec.price_place):
+            return
         old_id = _row_text(current, "tp_limit_order_id")
         old_px_raw = None
         try:
@@ -504,13 +654,29 @@ def sync_tp_limit(lot, target_px: float) -> None:
         except (KeyError, IndexError):
             old_px_raw = None
         old_px = float(old_px_raw) if old_px_raw not in (None, "") else None
+        if old_id and not _is_partial_tp(old_id) and _tp_order_dead(old_id):
+            store.clear_tp_limit(lot_id)
+            old_id = ""
+        held = _tp_held_size(symbol, side)
+        step = 10 ** (-spec.volume_place) if spec.volume_place > 0 else 1.0
         if old_id and _tp_prices_match(old_px, px, spec.price_place):
-            return
+            # Same band, but another lot on this side may have grown the position.
+            old_qty = _row_float_or_none(current, "tp_limit_qty")
+            if old_qty is None:
+                old_qty = float(current["size"] or 0)
+            if held is None or held <= old_qty + step / 2:
+                return
+            if _is_partial_tp(old_id):
+                return
+            logging.info("  [%s] TP limit %s resize %g → %g", symbol, side.upper(), old_qty, held)
         if old_id and _is_partial_tp(old_id):
             return
 
         from src.exchange.binance import cancel_limit_order, place_limit_close_order
 
+        siblings = [
+            int(row["id"]) for row in store.find_open_lots_by_tp_order(old_id) if int(row["id"]) != lot_id
+        ] if old_id else []
         if old_id:
             try:
                 cancel_limit_order(symbol, old_id)
@@ -523,16 +689,33 @@ def sync_tp_limit(lot, target_px: float) -> None:
             if current is None or str(current["status"]) != "open":
                 return
 
-        held = _held_size(symbol, side)
         if held is not None and held <= 1e-12:
             return
         qty = held if held and held > 0 else float(current["size"] or 0)
         if qty <= 0:
             return
         size_str = format_size(qty, spec)
+        resting = _matching_close_limit(symbol, side, px, spec.price_place, rest=False)
+        if resting is not None:
+            if held is None or float(resting.size or 0) + step / 2 >= held:
+                _remember_tp(lot_id, resting.order_id, px, adopted=True, qty=float(resting.size or 0) or None)
+                return
+            try:
+                cancel_limit_order(symbol, resting.order_id)
+            except ExchangeClientError as exc:
+                logging.warning("  [%s] TP limit cancel short %s failed: %s", symbol, resting.order_id, exc)
+                return
+            store.clear_tp_limit_by_order(resting.order_id)
         try:
             result = place_limit_close_order(symbol, side, size_str, px_str)
         except ExchangeClientError as exc:
+            adopted = None
+            if _already_flat_error(exc) or "-4116" in str(exc):
+                adopted = _matching_close_limit(symbol, side, px, spec.price_place, rest=True)
+            if adopted is not None:
+                _remember_tp(lot_id, adopted.order_id, px, adopted=True, qty=float(adopted.size or 0) or None)
+                return
+            _tp_retry_after[lot_id] = (time.monotonic() + _TP_PLACE_BACKOFF_SEC, px)
             logging.warning("  [%s] TP limit place @ %s failed: %s", symbol, px_str, exc)
             notify_error(f"Donchian TP limit {symbol}", str(exc), cooldown_sec=120)
             return
@@ -553,7 +736,11 @@ def sync_tp_limit(lot, target_px: float) -> None:
         if not oid:
             logging.warning("  [%s] TP limit place returned no orderId", symbol)
             return
-        store.set_tp_limit(lot_id, oid, px)
+        store.set_tp_limit(lot_id, oid, px, float(size_str))
+        for sibling_id in siblings:
+            sibling = store.get_lot(sibling_id)
+            if sibling is not None and str(sibling["status"]) == "open":
+                store.set_tp_limit(sibling_id, oid, px, float(size_str))
         logging.info(
             "  [%s] TP limit %s @ %s%s",
             symbol,
@@ -574,30 +761,70 @@ def on_tp_limit_order_update(detail: dict | None) -> None:
     if status == "partially_filled":
         _mark_partial_tp(oid, True)
         return
-    lot = store.find_open_lot_by_tp_order(oid)
-    if lot is None:
+    lots = store.find_open_lots_by_tp_order(oid)
+    if not lots:
         return
+    lot = lots[0]
     if status == "filled":
         _mark_partial_tp(oid, False)
         fill = _limit_fill_price(detail, float(lot["tp_limit_px"] or 0))
         if fill <= 0:
             fill = float(lot["entry_px"] or 0)
         with _close_lock:
-            current = store.get_lot(int(lot["id"]))
-            if current is None or str(current["status"]) != "open":
+            targets = [
+                cur for cur in (store.get_lot(int(row["id"])) for row in lots)
+                if cur is not None and str(cur["status"]) == "open"
+            ]
+            if not targets:
                 return
-            _finalize_close(
-                current,
-                reason=store.REASON_TP,
-                fill=fill,
-                fee_close=_fee_from_order(oid, detail),
-                close_oid=oid,
-                opened_at=str(current["opened_at"] or ""),
-            )
+            try:
+                filled_qty = float(detail.get("executedQty") or 0)
+            except (TypeError, ValueError):
+                filled_qty = 0.0
+            if filled_qty > 0:
+                # Position-level TP: the fill also flattened same-side lots that had no TP id yet.
+                taken = {int(cur["id"]) for cur in targets}
+                others = [
+                    row for row in store.get_open_lots(str(lot["symbol"]))
+                    if str(row["side"]).lower() == str(lot["side"]).lower() and int(row["id"]) not in taken
+                ]
+                total = sum(float(row["size"] or 0) for row in targets + others)
+                if others and filled_qty >= total * 0.999:
+                    targets.extend(others)
+                # An undersized shared TP only flattened part of the position: close what it covered.
+                covered, remaining = [], filled_qty * 1.001
+                for cur in sorted(targets, key=lambda r: int(r["id"])):
+                    size = float(cur["size"] or 0)
+                    if size <= remaining:
+                        covered.append(cur)
+                        remaining -= size
+                    else:
+                        store.clear_tp_limit(int(cur["id"]))
+                if len(covered) < len(targets):
+                    logging.warning(
+                        "  [%s] TP %s filled %g < lots %g — closing %d/%d lots, rest re-arm TP",
+                        lot["symbol"], oid, filled_qty,
+                        sum(float(c["size"] or 0) for c in targets), len(covered), len(targets),
+                    )
+                targets = covered
+                if not targets:
+                    return
+            fee_total = _fee_from_order(oid, detail)
+            size_total = sum(float(cur["size"] or 0) for cur in targets) or 1.0
+            for current in targets:
+                share = float(current["size"] or 0) / size_total
+                _finalize_close(
+                    current,
+                    reason=store.REASON_TP,
+                    fill=fill,
+                    fee_close=fee_total * share,
+                    close_oid=oid,
+                    opened_at=str(current["opened_at"] or ""),
+                )
         return
     if status in {"canceled", "cancelled", "expired", "rejected"}:
         _mark_partial_tp(oid, False)
-        store.clear_tp_limit(int(lot["id"]))
+        store.clear_tp_limit_by_order(oid)
 
 
 def reconcile_flat_lots() -> None:

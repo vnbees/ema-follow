@@ -24,6 +24,7 @@ class FuturesAccountBalance:
     usdt_equity: float
     total_maint_margin: float = 0.0
     total_initial_margin: float = 0.0
+    wallet_balance: float | None = None
 
     @property
     def maint_margin_pct(self) -> float:
@@ -64,3 +65,4 @@ class PendingOrder:
     side: str
     price: float
     size: float
+    position_side: str = ""

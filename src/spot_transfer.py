@@ -1,4 +1,4 @@
-"""Daily futures → spot skim transfer (07:00 +07) + risk warnings."""
+"""Futures → spot withdraw: cuối tháng, hết lãi, trần 8% mốc đầu tháng."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from src.config import (
     SPOT_TRANSFER_ENABLED,
     SPOT_TRANSFER_EXECUTE_HHMM,
     SPOT_TRANSFER_MODE,
+    SPOT_TRANSFER_MONTH_CAP_PCT,
     SPOT_TRANSFER_PCT,
     SPOT_TRANSFER_SKIM,
     SPOT_WARN_COOLDOWN_SEC,
@@ -131,6 +132,10 @@ def apply_manual_net_to_markers(net_manual: float) -> None:
     baseline = db.get_baseline_equity()
     if baseline is not None and baseline > 0:
         db.set_baseline_equity(max(0.0, baseline + net_manual))
+    month_start = db.get_month_start_equity()
+    month_ym = db.get_month_start_ym()
+    if month_start is not None and month_ym:
+        db.set_month_start(max(0.0, month_start + net_manual), year_month=month_ym)
     logging.info(
         "  Spot markers adjusted %+.2f for manual transfer(s): sod %.2f -> %.2f, peak %.2f -> %.2f, baseline %.2f -> %.2f",
         net_manual,
@@ -188,6 +193,94 @@ def sync_manual_transfers() -> bool:
 
     apply_manual_net_to_markers(net_manual)
     db.set_spot_manual_synced_at_ms(now_ms)
+    return True
+
+
+@dataclass(frozen=True)
+class MonthDecision:
+    amount: float
+    reason: str
+    month_pnl: float
+    month_start: float
+    equity: float
+    cap_amount: float
+    available: float
+
+
+def decide_month_withdraw(
+    *,
+    month_start: float,
+    equity: float,
+    available: float,
+    cap_pct: float = SPOT_TRANSFER_MONTH_CAP_PCT,
+    min_usdt: float = _MIN_TRANSFER_USDT,
+) -> MonthDecision:
+    """Withdraw all month profit, capped at cap_pct of month-start equity."""
+    pnl = equity - month_start
+    cap_amount = math.floor(max(0.0, month_start) * cap_pct * 100 + 1e-9) / 100.0
+    base = MonthDecision(
+        amount=0.0,
+        reason="no_profit",
+        month_pnl=pnl,
+        month_start=month_start,
+        equity=equity,
+        cap_amount=cap_amount,
+        available=available,
+    )
+    if month_start <= 0:
+        return MonthDecision(**{**base.__dict__, "reason": "no_marker"})
+    if pnl <= 1e-9:
+        return base
+    target = min(pnl, cap_amount)
+    target = math.floor(max(0.0, target) * 100 + 1e-9) / 100.0
+    if target < min_usdt:
+        return MonthDecision(**{**base.__dict__, "amount": target, "reason": "below_min"})
+    take = min(target, max(available, 0.0))
+    take = math.floor(take * 100 + 1e-9) / 100.0
+    if take < min_usdt:
+        return MonthDecision(**{**base.__dict__, "amount": take, "reason": "no_cash"})
+    return MonthDecision(**{**base.__dict__, "amount": take, "reason": "transfer"})
+
+
+def _month_reason_label(decision: MonthDecision) -> str:
+    if decision.reason == "transfer":
+        return (
+            f"rút cuối tháng: lãi={decision.month_pnl:+.2f} "
+            f"trần={decision.cap_amount:.2f} "
+            f"({SPOT_TRANSFER_MONTH_CAP_PCT:.0%} × mốc {decision.month_start:.2f}) "
+            f"→ {decision.amount:.2f}"
+        )
+    if decision.reason == "no_profit":
+        return f"không rút — lãi tháng={decision.month_pnl:+.2f} ≤ 0"
+    if decision.reason == "no_cash":
+        return f"chưa rút — available={decision.available:.2f} < số cần rút"
+    if decision.reason == "below_min":
+        return f"không rút — số tính được {decision.amount:.4f} < {_MIN_TRANSFER_USDT}"
+    if decision.reason == "no_marker":
+        return "chưa có mốc đầu tháng"
+    return decision.reason
+
+
+def next_month_withdraw_at(now: datetime | None = None) -> datetime:
+    """07:00 +07 on the 1st. Same morning if it is still before 07:00 on the 1st."""
+    current = now or _vn_now()
+    hour, minute = _parse_hhmm(SPOT_TRANSFER_EXECUTE_HHMM, (7, 0))
+    if current.day == 1 and (current.hour, current.minute) < (hour, minute):
+        return current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    year = current.year + (1 if current.month == 12 else 0)
+    month = 1 if current.month == 12 else current.month + 1
+    return current.replace(year=year, month=month, day=1, hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def _due_for_month_settle(now: datetime, anchor_ym: str) -> bool:
+    current_ym = now.strftime("%Y-%m")
+    if not anchor_ym or anchor_ym >= current_ym:
+        return False
+    if db.has_month_settlement(current_ym):
+        return False
+    hour, minute = _parse_hhmm(SPOT_TRANSFER_EXECUTE_HHMM, (7, 0))
+    if now.day == 1 and (now.hour, now.minute) < (hour, minute):
+        return False
     return True
 
 
@@ -454,9 +547,139 @@ def _execute_pct(ref_symbol: str, transfer_date: str) -> None:
         )
 
 
+def _execute_month(ref_symbol: str, now: datetime) -> None:
+    """Settle the previous month once, then anchor the new month."""
+    current_ym = now.strftime("%Y-%m")
+    transfer_date = _vn_date_str(now)
+    anchor = db.get_month_start_equity()
+    anchor_ym = db.get_month_start_ym()
+    if anchor is None or not anchor_ym:
+        return
+    if not _due_for_month_settle(now, anchor_ym):
+        return
+    if not sync_manual_transfers():
+        if not db.has_transfer_decision_on_date(transfer_date):
+            db.insert_spot_transfer(
+                transfer_date=transfer_date,
+                amount=0.0,
+                status="skipped",
+                reason="month_sync_failed",
+                error="manual TRANSFER sync failed — sẽ thử lại",
+            )
+        logging.warning("  Month withdraw deferred — manual sync failed")
+        return
+
+    anchor = db.get_month_start_equity() or anchor
+    balance = fetch_futures_balance(ref_symbol)
+    equity = float(balance.account_equity or 0)
+    available = float(balance.available or 0)
+    peak = note_equity_peak(equity)
+    decision = decide_month_withdraw(
+        month_start=anchor, equity=equity, available=available
+    )
+    detail = _month_reason_label(decision)
+    notify = SkimDecision(
+        amount=decision.amount,
+        reason=decision.reason,
+        day_pnl=decision.month_pnl,
+        dd_pct=0.0,
+        sod=decision.month_start,
+        equity=equity,
+        peak=peak,
+        available=available,
+    )
+
+    if decision.reason == "no_cash":
+        logging.info("  Month withdraw %s — %s", current_ym, detail)
+        return
+
+    if decision.reason != "transfer":
+        db.insert_spot_transfer(
+            transfer_date=transfer_date,
+            amount=0.0,
+            status="skipped",
+            available_before=available,
+            sod_equity=anchor,
+            eod_equity=equity,
+            day_pnl=decision.month_pnl,
+            peak_equity=peak,
+            reason="month_no_profit" if decision.reason == "no_profit" else "month_below_min",
+            error=detail,
+        )
+        db.set_month_start(equity, year_month=current_ym)
+        logging.info("  Month withdraw %s — %s", current_ym, detail)
+        _notify_decision(transfer_date, "skipped", notify, detail)
+        return
+
+    amount = decision.amount
+    try:
+        result = transfer_futures_to_spot(MARGIN_COIN, amount)
+        spot_after: float | None
+        try:
+            spot_after = fetch_spot_balance(MARGIN_COIN)
+        except ExchangeClientError as exc:
+            logging.warning("  Spot balance after transfer failed: %s", exc)
+            spot_after = None
+        db.insert_spot_transfer(
+            transfer_date=transfer_date,
+            amount=amount,
+            status="success",
+            tran_id=str(result.get("tranId") or "") or None,
+            available_before=available,
+            spot_after=spot_after,
+            sod_equity=anchor,
+            eod_equity=equity,
+            day_pnl=decision.month_pnl,
+            peak_equity=peak,
+            reason="month_transfer",
+            error=detail,
+        )
+        new_eq = max(0.0, equity - amount)
+        db.set_month_start(new_eq, year_month=current_ym)
+        note_equity_peak(new_eq)
+        logging.info(
+            "  Month withdraw success %s: %.2f %s futures→spot (tranId=%s) — %s",
+            current_ym,
+            amount,
+            MARGIN_COIN,
+            result.get("tranId"),
+            detail,
+        )
+        _notify_decision(transfer_date, "success", notify, detail)
+    except ExchangeClientError as exc:
+        if not db.has_transfer_decision_on_date(transfer_date):
+            db.insert_spot_transfer(
+                transfer_date=transfer_date,
+                amount=amount,
+                status="failed",
+                available_before=available,
+                sod_equity=anchor,
+                eod_equity=equity,
+                day_pnl=decision.month_pnl,
+                peak_equity=peak,
+                reason="month_transfer",
+                error=str(exc),
+            )
+        logging.error("  Month withdraw failed %s: %s", current_ym, exc)
+        _notify_decision(transfer_date, "failed", notify, str(exc))
+
+
 def process_daily_spot_transfer(ref_symbol: str = "BTCUSDT") -> None:
-    """Run once per VN day at/after EXECUTE_HHMM (default 07:00)."""
+    """Month mode settles once per VN month. Legacy skim still runs once per day."""
     if not is_enabled() or not has_credentials():
+        return
+    if SPOT_TRANSFER_MODE == "month":
+        now = _vn_now()
+        anchor = db.get_month_start_equity()
+        anchor_ym = db.get_month_start_ym()
+        if anchor is None or not anchor_ym:
+            return
+        if not _due_for_month_settle(now, anchor_ym):
+            return
+        try:
+            _execute_month(ref_symbol, now)
+        except ExchangeClientError as exc:
+            logging.warning("  Month withdraw skipped — balance/API error: %s", exc)
         return
 
     now = _vn_now()
@@ -568,6 +791,64 @@ def check_risk_warnings(
     return warns
 
 
+def month_withdraw_preview(*, equity: float | None = None, available: float | None = None) -> dict:
+    """Projected month-end withdraw from the stored anchor and current equity."""
+    now = _vn_now()
+    anchor = db.get_month_start_equity()
+    anchor_ym = db.get_month_start_ym()
+    when = next_month_withdraw_at(now)
+    due_now = bool(anchor_ym) and _due_for_month_settle(now, anchor_ym)
+    when_label = (
+        "trong vòng quét tới"
+        if due_now
+        else when.strftime("%d/%m/%Y %H:%M +07")
+    )
+    preview = {
+        "mode": "month",
+        "cap_pct": SPOT_TRANSFER_MONTH_CAP_PCT * 100,
+        "month_start": anchor,
+        "month_start_ym": anchor_ym or None,
+        "equity": equity,
+        "available": available,
+        "month_pnl": None,
+        "cap_amount": None,
+        "amount": None,
+        "when": when_label,
+        "due_now": due_now,
+        "reason": "no_equity" if equity is None or equity <= 0 else "waiting",
+    }
+    if anchor is None or anchor <= 0 or equity is None or equity <= 0:
+        return preview
+    decision = decide_month_withdraw(
+        month_start=anchor,
+        equity=equity,
+        available=max(equity, 0.0),
+    )
+    preview.update(
+        {
+            "month_pnl": decision.month_pnl,
+            "cap_amount": decision.cap_amount,
+            "amount": decision.amount if decision.reason == "transfer" else 0.0,
+            "reason": decision.reason,
+        }
+    )
+    return preview
+
+
+def month_withdraw_history() -> list[dict]:
+    rows = []
+    for row in db.list_spot_withdraw_months():
+        rows.append(
+            {
+                "month": str(row["month"]),
+                "amount": float(row["amount"] or 0),
+                "n": int(row["n"] or 0),
+                "last_date": str(row["last_date"] or ""),
+            }
+        )
+    return rows
+
+
 def today_transfer_status() -> dict:
     transfer_date = _vn_date_str()
     rows = [
@@ -585,9 +866,12 @@ def today_transfer_status() -> dict:
         "mode": SPOT_TRANSFER_MODE,
         "skim": SPOT_TRANSFER_SKIM,
         "day_cap_pct": SPOT_TRANSFER_DAY_CAP_PCT * 100,
+        "month_cap_pct": SPOT_TRANSFER_MONTH_CAP_PCT * 100,
         "dd_pause_pct": SPOT_TRANSFER_DD_PAUSE_PCT * 100,
         "execute_hhmm": SPOT_TRANSFER_EXECUTE_HHMM,
         "sod_equity": sod,
+        "month_start": db.get_month_start_equity(),
+        "month_start_ym": db.get_month_start_ym() or None,
         "peak_equity": peak,
         "latest_status": str(latest["status"]) if latest else None,
         "latest_reason": str(latest["reason"] or latest["error"] or "") if latest else None,
@@ -647,23 +931,29 @@ def dashboard_payload(
         "warn_maint": (account.maint_margin_pct or 0) > SPOT_WARN_MAINT_PCT,
         "suggest_topup": max(0.0, peak - equity) if dd > SPOT_WARN_DD_PCT * 100 else 0.0,
     }
-    total_skimmed = float(status.get("total_skimmed") or 0)
+    signed = db.signed_spot_flow()
+    skim_left = max(0.0, signed)
+    manual_excluded = max(0.0, -signed)
+    total_skimmed = skim_left
     skim_count = int(status.get("skim_count") or 0)
     baseline = db.get_baseline_equity()
     principal = float(baseline) if baseline is not None and baseline > 0 else float(INITIAL_CAPITAL)
-    total_wealth = equity + total_skimmed
+    # Manual spot→futures is inside equity. Subtract it so it is not profit.
+    total_wealth = equity + signed
     vs_principal = total_wealth - principal
     capital_safety = {
         "principal": principal,
         "principal_source": "baseline" if baseline is not None and baseline > 0 else "initial_capital",
         "futures_equity": equity,
         "total_skimmed": total_skimmed,
+        "manual_excluded": manual_excluded,
         "total_wealth": total_wealth,
         "vs_principal": vs_principal,
         "above_principal": total_wealth >= principal,
         # Hint for UI: vốn gốc = baseline; nạp/rút tay futures sẽ tự cộng/trừ
         "note": "vốn gốc = baseline (+ nạp / − rút tay futures; không tính bot skim)",
     }
+    months = month_withdraw_history()
     return {
         "status": status,
         "rows": rows,
@@ -676,4 +966,7 @@ def dashboard_payload(
         "total_skimmed": total_skimmed,
         "skim_count": skim_count,
         "capital_safety": capital_safety,
+        "preview": month_withdraw_preview(equity=equity if equity > 0 else None, available=float(account.available or 0)),
+        "months": months,
+        "withdrawn_gross": round(sum(row["amount"] for row in months), 2),
     }

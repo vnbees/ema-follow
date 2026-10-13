@@ -237,6 +237,39 @@ def reconcile_account_state(*, force: bool = False) -> None:
         logging.warning("Binance WS reconcile failed: %s", exc)
 
 
+def refresh_available_margin() -> bool:
+    """One account read plus the open-limit book, then available = equity − margin."""
+    from src.exchange import binance as binance_mod
+    from src.exchange.binance_ws.cache import publish_live_equity
+
+    if binance_mod.is_optional_rest_blocked():
+        return False
+    try:
+        with binance_mod.boot_optional_rest_slot():
+            CACHE.bump_rest("available_margin")
+            balance = binance_mod.fetch_futures_balance_rest()
+            book = binance_mod.fetch_open_limits_by_symbol()
+        CACHE.replace_pending_book(book)
+        CACHE.set_balance(balance)
+        publish_live_equity(force=True)
+        bal = CACHE.get_balance()
+        if bal is not None:
+            logging.info(
+                "Available margin synced: equity=%.2f available=%.2f locked=%.2f limits=%d",
+                bal.account_equity,
+                bal.available,
+                bal.total_initial_margin,
+                sum(len(v) for v in book.values()),
+            )
+        return True
+    except binance_mod.RateLimitError as exc:
+        logging.info("Available margin sync deferred: %s", exc)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Available margin sync failed: %s", exc)
+        return False
+
+
 def _on_user_stream_connected() -> None:
     """UDS connected: never REST on first connect (disk/WS); soft cycle reconciles later.
 
@@ -364,6 +397,10 @@ async def _async_main() -> None:
                 await asyncio.sleep(5)
                 continue
             try:
+                if not getattr(_deferred_rest_after_market, "margin_synced", False):
+                    ok = await asyncio.to_thread(refresh_available_margin)
+                    if ok:
+                        _deferred_rest_after_market.margin_synced = True
                 if CACHE.last_reconcile_at <= 0:
                     logging.info(
                         "Binance WS cold start — deferred REST reconcile (no disk account)"

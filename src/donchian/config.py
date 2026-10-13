@@ -66,6 +66,23 @@ SIZE_BY_RR = os.getenv("DONCHIAN_SIZE_BY_RR", "true").lower() in ("1", "true", "
 MIN_VOL_RATIO = float(os.getenv("DONCHIAN_MIN_VOL_RATIO", "1.2"))
 VOL_RATIO_PERIOD = int(os.getenv("DONCHIAN_VOL_RATIO_PERIOD", "20"))
 
+# While a lot is open, allow one opposite entry on that coin if the open lot
+# is at least this many hours old and underwater. 0 disables the rule.
+STALE_OPP_HOURS = float(os.getenv("DONCHIAN_STALE_OPP_HOURS", "6"))
+
+# One same-side add when a later 15m close has moved this many ATRs in favor
+# of the original entry. 0 disables. The add counts toward MAX_OPEN.
+ADD_ATR_MULT = float(os.getenv("DONCHIAN_ADD_ATR_MULT", "0.4"))
+
+# Dual limit: every Config A candidate places a post-only LONG and SHORT limit.
+# Replaces the market entry, the stale-opposite rule and the favorable add.
+# No lot cap; at most MAX_COINS distinct coins hold lots or pending entries.
+DUAL_LIMIT_ENABLED = os.getenv("DONCHIAN_DUAL_LIMIT", "true").lower() in ("1", "true", "yes", "on")
+MAX_COINS = int(os.getenv("DONCHIAN_MAX_COINS", "10"))
+# Unfilled entry limits are cancelled once this many bars after the signal bar have closed.
+ENTRY_TTL_BARS = max(1, int(os.getenv("DONCHIAN_ENTRY_TTL_BARS", "1")))
+MAKER_FEE_RATE = float(os.getenv("DONCHIAN_MAKER_FEE_RATE", "0.0002"))
+
 # Breadth mid (BT breadth_mid / breadth_flip): pool close ≷ Donchian mid vote
 # Mode: flip (default, live) | hard (skip opposite) | off
 _raw_breadth_mode = os.getenv("DONCHIAN_BREADTH_MODE")

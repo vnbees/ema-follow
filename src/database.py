@@ -318,17 +318,89 @@ def get_spot_transfers_paged(
     return rows, total
 
 
-def sum_successful_spot_transfers() -> tuple[float, int]:
-    """Lifetime total amount + count of successful futures→spot skims."""
+def signed_spot_flow() -> float:
+    """Net USDT the skim ledger moved out of futures. Returns are negative."""
     with get_connection() as conn:
         row = conn.execute(
             """
-            SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS cnt
+            SELECT COALESCE(SUM(
+                CASE WHEN reason = 'return_to_futures' THEN -amount ELSE amount END
+            ), 0) AS total
             FROM spot_transfers
             WHERE status = 'success'
             """
         ).fetchone()
-        return float(row["total"] or 0), int(row["cnt"] or 0)
+        return float(row["total"] or 0)
+
+
+def get_spot_untracked_usdt() -> float:
+    """Spot USDT that is outside the skim ledger (other wallet balance)."""
+    return _get_float_setting("spot_untracked_usdt") or 0.0
+
+
+def set_spot_untracked_usdt(amount: float) -> None:
+    set_setting("spot_untracked_usdt", str(amount))
+
+
+def spot_outside_usdt() -> float:
+    """USDT still in spot: skim ledger plus the synced untracked balance."""
+    return signed_spot_flow() + get_spot_untracked_usdt()
+
+
+def sum_successful_spot_transfers() -> tuple[float, int]:
+    """Net futures→spot still counted as withdrawn.
+
+    Rows with reason return_to_futures are spot→futures top-ups and reduce the total
+    so wealth is not double-counted after money is moved back.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT SUM(
+                CASE WHEN reason = 'return_to_futures' THEN 0 ELSE 1 END
+            ) AS cnt
+            FROM spot_transfers
+            WHERE status = 'success'
+            """
+        ).fetchone()
+        # A spot→futures top-up can exceed the skim ledger (other spot USDT).
+        # "Đã rút" is money still out, so it does not go negative.
+        return max(0.0, signed_spot_flow()), int(row["cnt"] or 0)
+
+
+def list_spot_withdraw_months() -> list[sqlite3.Row]:
+    """Successful futures→spot amounts grouped by YYYY-MM, newest first."""
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT substr(transfer_date, 1, 7) AS month,
+                   SUM(amount) AS amount,
+                   COUNT(*) AS n,
+                   MAX(transfer_date) AS last_date
+            FROM spot_transfers
+            WHERE status = 'success'
+              AND amount > 0
+              AND COALESCE(reason, '') != 'return_to_futures'
+            GROUP BY substr(transfer_date, 1, 7)
+            ORDER BY month DESC
+            """
+        ).fetchall()
+
+
+def has_month_settlement(year_month: str) -> bool:
+    """True when this VN month already has a finished month-withdraw decision."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM spot_transfers
+            WHERE transfer_date LIKE ?
+              AND status IN ('success', 'skipped')
+              AND reason IN ('month_transfer', 'month_no_profit', 'month_below_min')
+            LIMIT 1
+            """,
+            (f"{year_month}%",),
+        ).fetchone()
+        return row is not None
 
 
 def has_successful_transfer_on_date(transfer_date: str) -> bool:
@@ -398,6 +470,20 @@ def set_spot_sod_equity(value: float, *, day: str | None = None) -> None:
 
 def get_spot_sod_day() -> str:
     return get_setting("spot_sod_day", "")
+
+
+def get_month_start_equity() -> float | None:
+    return _get_float_setting("month_start_equity")
+
+
+def get_month_start_ym() -> str:
+    return get_setting("month_start_ym", "")
+
+
+def set_month_start(equity: float, *, year_month: str) -> None:
+    set_setting("month_start_equity", str(equity))
+    set_setting("month_start_ym", year_month)
+    set_setting("month_start_updated_at", _utc_now())
 
 
 def get_spot_manual_synced_at_ms() -> int | None:

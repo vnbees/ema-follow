@@ -180,6 +180,12 @@ class Cfg:
     top_k: int = 5
     # none | stack (21>89>200) | ema200 (close vs 200) | stack_soft (21>89 only)
     ema_filter: str | None = None
+    # none | bounce (long near support, short near resistance) | room | both
+    sr_mode: str | None = None
+    sr_tol: float = 0.5  # ATR units from swing S/R
+    sr_room_atr: float = 1.0  # min distance to the opposing swing level
+    # If set, require precomputed smc_long / smc_short columns on the bar.
+    smc_mode: str | None = None
 
 
 def run(cfg: Cfg, raw_dfs: dict[str, pd.DataFrame], eval_start: int, *, record_eod: bool = False) -> dict:
@@ -307,6 +313,27 @@ def run(cfg: Cfg, raw_dfs: dict[str, pd.DataFrame], eval_start: int, *, record_e
                     ok = (px > e200) if side == "long" else (px < e200)
                     if not ok:
                         continue
+            if cfg.sr_mode:
+                sup = float(b["support"]) if "support" in b.index else float("nan")
+                res = float(b["resistance"]) if "resistance" in b.index else float("nan")
+                if not (np.isfinite(sup) and np.isfinite(res) and a > 0):
+                    continue
+                near_sup = float(b["low"]) <= sup + cfg.sr_tol * a or abs(px - sup) <= cfg.sr_tol * a
+                near_res = float(b["high"]) >= res - cfg.sr_tol * a or abs(res - px) <= cfg.sr_tol * a
+                if cfg.sr_mode in ("bounce", "both"):
+                    if side == "long" and not near_sup:
+                        continue
+                    if side == "short" and not near_res:
+                        continue
+                if cfg.sr_mode in ("room", "both"):
+                    if side == "long" and (res - px) < cfg.sr_room_atr * a:
+                        continue
+                    if side == "short" and (px - sup) < cfg.sr_room_atr * a:
+                        continue
+            if cfg.smc_mode:
+                flag = "smc_long" if side == "long" else "smc_short"
+                if flag not in b.index or not bool(b[flag]):
+                    continue
             tp_near = up if side == "long" else dn
             sl_opp = dn if side == "long" else up
             pot_rr = abs(tp_near - px) / max(abs(px - sl_opp), 1e-12)

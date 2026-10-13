@@ -444,6 +444,7 @@ class TestDonchianTrading(unittest.TestCase):
         bal.available = 1000.0
         balance.return_value = bal
         store.count_open.return_value = 0
+        store.get_open_lots.return_value = []
         store.has_open_lot_for_symbol.return_value = False
         store.insert_lot.return_value = 1
         _spec.return_value = MagicMock()

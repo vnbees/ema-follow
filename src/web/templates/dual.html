@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ exchange_name }} {{ bot_title }}</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #0f1117; color: #e6edf3; }
+    h1 { margin-top: 0; font-size: 22px; }
+    h2 { font-size: 16px; margin: 0 0 12px; }
+    .meta { color: #8b949e; font-size: 13px; margin: 4px 0 12px; }
+    .green { color: #3fb950; }
+    .red { color: #f85149; }
+    .muted { color: #8b949e; }
+    .controls { display: flex; align-items: center; gap: 10px; margin: 12px 0 16px; flex-wrap: wrap; }
+    .status-pill { border: 1px solid #30363d; border-radius: 999px; padding: 4px 10px; font-size: 12px; }
+    .status-pill.running { color: #3fb950; }
+    .status-pill.stopped { color: #f85149; }
+    .status-pill.warn { color: #d29922; border-color: #9e6a03; }
+    form { margin: 0; }
+    button { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 7px 12px; cursor: pointer; }
+    button:hover { background: #30363d; }
+    .panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+    .summary-card { background: #0f1117; border: 1px solid #30363d; border-radius: 8px; padding: 12px; }
+    .summary-card .label { color: #8b949e; font-size: 12px; }
+    .summary-card .value { font-size: 18px; margin-top: 4px; }
+    .summary-card .sub { color: #8b949e; font-size: 12px; margin-top: 4px; }
+    .summary-card.anchor { border-color: #388bfd; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #30363d; text-align: left; white-space: nowrap; }
+    th { color: #8b949e; font-size: 11px; text-transform: uppercase; }
+    .table-wrap { overflow-x: auto; }
+    .empty { color: #8b949e; font-size: 13px; padding: 8px 0; }
+    .side { font-size: 12px; font-weight: 700; padding: 2px 7px; border-radius: 4px; color: #fff; }
+    .side.long { background: #238636; }
+    .side.short { background: #da3633; }
+    .pill { background: #21262d; color: #8b949e; border-radius: 999px; padding: 2px 8px; font-size: 11px; }
+    .pill.rule { color: #d2a8ff; border: 1px solid #6e40c9; }
+    .chart-wrap { position: relative; height: 260px; }
+    .coin-chip { display: inline-block; background: #21262d; border: 1px solid #30363d; border-radius: 999px; padding: 2px 9px; font-size: 12px; margin: 2px 4px 2px 0; }
+  </style>
+</head>
+<body>
+  <h1>{{ exchange_name }} {{ bot_title }}</h1>
+  <p class="meta">Bản tham khảo. Bot live đang chạy SMC ở <a href="/">trang chính</a>.</p>
+  <p class="meta" id="modeLine"></p>
+
+  <div class="controls">
+    <span id="tradingPill" class="status-pill"></span>
+    <span id="ratePill" class="status-pill warn" hidden></span>
+    <form method="post" action="/settings/trading/start"><button type="submit">Bật trading</button></form>
+    <form method="post" action="/settings/trading/stop"><button type="submit">Tắt trading</button></form>
+    <form method="post" action="/logout"><button type="submit">Đăng xuất</button></form>
+    <span class="meta" style="margin:0;">Cycle gần nhất: <span id="lastCycle"></span> · cập nhật <span id="refreshedAt"></span></span>
+  </div>
+
+  <div class="panel">
+    <h2>Từ mốc số dư futures</h2>
+    <p class="meta" id="anchorNote"></p>
+    <div class="summary-grid">
+      <div class="summary-card anchor"><div class="label">Mốc (equity lúc bắt đầu)</div><div class="value" id="cAnchor"></div><div class="sub" id="cAnchorAt"></div></div>
+      <div class="summary-card"><div class="label">Equity futures hiện tại</div><div class="value" id="cEquity"></div><div class="sub" id="cAvailable"></div></div>
+      <div class="summary-card"><div class="label">So với mốc</div><div class="value" id="cVs"></div><div class="sub" id="cWithdrawn"></div></div>
+      <div class="summary-card"><div class="label">Đã chốt (lệnh 2 chiều)</div><div class="value" id="cRealized"></div><div class="sub" id="cWr"></div></div>
+      <div class="summary-card"><div class="label">Tạm tính (lệnh 2 chiều)</div><div class="value" id="cUnreal"></div><div class="sub" id="cOpenN"></div></div>
+      <div class="summary-card"><div class="label">Coin đang dùng</div><div class="value" id="cCoins"></div><div class="sub" id="cPending"></div></div>
+      <div class="summary-card"><div class="label">Lệnh limit vào từ mốc</div><div class="value" id="cPlaced"></div><div class="sub" id="cFillRate"></div></div>
+    </div>
+    <div id="coinList" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Equity futures từ mốc</h2>
+    <p class="meta" style="margin-top:0;">Đường xanh dương = equity · đường xám = mốc.</p>
+    <div class="chart-wrap"><canvas id="equityChart"></canvas></div>
+    <div id="equityEmpty" class="empty" hidden>Chưa có snapshot equity sau mốc (bot ghi mỗi 15 phút).</div>
+  </div>
+
+  <div class="panel">
+    <h2>Lệnh limit đang chờ khớp (<span id="pendingN">0</span>)</h2>
+    <p class="meta" style="margin-top:0;" id="pendingNote"></p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Coin</th><th>Chiều</th><th>Giá limit</th><th>Mark</th><th>Cách</th><th>Size</th><th>Margin</th><th>TP band</th><th>Đặt lúc</th><th>Hết hạn</th></tr></thead>
+      <tbody id="pendingBody"></tbody>
+    </table></div>
+  </div>
+
+  <div class="panel">
+    <h2>Vị thế gộp như sàn (<span id="posN">0</span>)</h2>
+    <p class="meta" style="margin-top:0;">Gộp các lot cùng coin + chiều (Binance hedge mode chỉ có 1 vị thế mỗi chiều). Entry = trung bình theo size. Margin và ROI tính như Binance: margin = size × mark ÷ đòn bẩy, ROI = lãi/lỗ ÷ margin đó (PnL theo Mark price). Cột "ROI vốn vào" = lãi/lỗ ÷ margin đã bỏ ra lúc vào lệnh. Cột Sàn so size với vị thế thực trong WebSocket.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Coin</th><th>Chiều</th><th>Số lot</th><th>Size</th><th>Entry TB</th><th>Mark</th><th>TP band</th><th>Margin</th><th>Lãi/lỗ</th><th>ROI</th><th>ROI vốn vào</th><th>Sàn</th></tr></thead>
+      <tbody id="posBody"></tbody>
+    </table></div>
+  </div>
+
+  <div class="panel">
+    <h2>Lệnh đang mở — từng lot (<span id="openN">0</span>)</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Coin</th><th>Chiều</th><th>Loại</th><th>Entry</th><th>Mark</th><th>TP band</th><th>Size</th><th>Margin</th><th>Lãi/lỗ</th><th>ROI</th><th>Giữ</th><th>Mở lúc</th></tr></thead>
+      <tbody id="openBody"></tbody>
+    </table></div>
+  </div>
+
+  <div class="panel">
+    <h2>Theo ngày — chỉ lệnh 2 chiều</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Ngày</th><th>Mở</th><th>Đóng</th><th>Chạm band</th><th>PnL</th></tr></thead>
+      <tbody id="dailyBody"></tbody>
+    </table></div>
+  </div>
+
+  <div class="panel">
+    <h2>Lệnh 2 chiều đã đóng (<span id="closedN">0</span>)</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Coin</th><th>Chiều</th><th>Loại</th><th>Entry</th><th>Đóng</th><th>PnL</th><th>ROI</th><th>Phí</th><th>Giữ</th><th>Đóng lúc</th></tr></thead>
+      <tbody id="closedBody"></tbody>
+    </table></div>
+  </div>
+
+  <script>
+    let DATA = {{ payload | tojson }};
+    let chart = null;
+
+    const fmt = (v, d = 2) => (v === null || v === undefined || isNaN(v)) ? '—' : Number(v).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+    const px = (v) => {
+      if (v === null || v === undefined || !v) return '—';
+      const a = Math.abs(v);
+      const d = a >= 1000 ? 2 : a >= 1 ? 4 : 6;
+      return Number(v).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+    };
+    const signed = (v, d = 2) => (v === null || v === undefined) ? '—' : ((v > 0 ? '+' : '') + fmt(v, d));
+    const cls = (v) => (v === null || v === undefined || v === 0) ? '' : (v > 0 ? 'green' : 'red');
+    const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const sideTag = (s) => `<span class="side ${s === 'long' ? 'long' : 'short'}">${s === 'long' ? 'LONG' : 'SHORT'}</span>`;
+    const set = (id, html, klass) => { const el = document.getElementById(id); el.innerHTML = html; if (klass !== undefined) el.className = 'value ' + klass; };
+
+    function ruleTag(lot) {
+      const parts = [];
+      if (lot.entry_rule_label) parts.push(`<span class="pill rule">${esc(lot.entry_rule_label)}</span>`);
+      if (lot.legacy) parts.push('<span class="pill">trước mốc</span>');
+      return parts.join(' ') || '<span class="pill">Market</span>';
+    }
+
+    function syncTag(p) {
+      if (p.sync === 'ok') return '<span class="green">✓ khớp</span>';
+      if (p.sync === 'unknown') return '<span class="muted">chưa có WS</span>';
+      const ex = p.exchange_size ? `sàn ${p.exchange_size} @ ${px(p.exchange_entry)}` : 'sàn không có vị thế';
+      return `<span class="red">lệch: ${esc(ex)}</span>`;
+    }
+
+    function render(d) {
+      const a = d.account, p = d.pnl, s = d.entry_stats;
+      document.getElementById('modeLine').textContent = d.enabled
+        ? `Mỗi tín hiệu Config A → đặt limit post-only LONG ở best bid + SHORT ở best ask. Hủy nếu chưa khớp sau ${d.ttl_bars} nến 15m. Không giới hạn số lệnh, tối đa ${d.coins.max} coin. TP: Long ở band trên, Short ở band dưới.`
+        : 'Chế độ limit 2 chiều đang TẮT (DONCHIAN_DUAL_LIMIT=false) — bot vào market theo logic cũ.';
+      const tp = document.getElementById('tradingPill');
+      tp.textContent = d.trading_enabled ? 'Trading: BẬT' : 'Trading: TẮT';
+      tp.className = 'status-pill ' + (d.trading_enabled ? 'running' : 'stopped');
+      const rp = document.getElementById('ratePill');
+      rp.hidden = !d.rate_limited;
+      if (d.rate_limited) rp.textContent = `REST cooldown ${Math.ceil(d.rate_limit_remaining_sec || 0)}s`;
+      document.getElementById('lastCycle').textContent = d.last_cycle_at || '—';
+      document.getElementById('refreshedAt').textContent = new Date().toLocaleTimeString('vi-VN');
+
+      document.getElementById('anchorNote').textContent = d.anchor.set
+        ? 'Mốc = equity futures lúc chế độ mới chạy lần đầu. Lệnh mở trước mốc vẫn hiện trong danh sách (nhãn "trước mốc") vì chúng vẫn ảnh hưởng equity.'
+        : 'Chưa chốt mốc — sẽ chốt khi bot đọc được số dư futures lần đầu.';
+      set('cAnchor', fmt(d.anchor.equity) + ' USDT');
+      document.getElementById('cAnchorAt').textContent = d.anchor.at || '—';
+      set('cEquity', fmt(a.equity) + ' USDT');
+      document.getElementById('cAvailable').textContent = 'available ' + fmt(a.available);
+      set('cVs', a.vs_anchor === null ? '—' : `${signed(a.vs_anchor)} (${signed(a.vs_anchor_pct, 2)}%)`, cls(a.vs_anchor));
+      document.getElementById('cWithdrawn').textContent = a.withdrawn ? `gồm ${fmt(a.withdrawn)} đã rút sang spot` : 'equity + đã rút spot − mốc';
+      set('cRealized', signed(p.realized), cls(p.realized));
+      document.getElementById('cWr').textContent = `${p.closed_n} lệnh · WR ${p.win_rate === null ? '—' : fmt(p.win_rate, 1) + '%'} · PF ${p.pf === null ? '—' : fmt(p.pf, 2)}`;
+      set('cUnreal', signed(p.unrealized), cls(p.unrealized));
+      document.getElementById('cOpenN').textContent = `${p.dual_open_n} lệnh 2 chiều mở` + (p.legacy_open_n ? ` · lệnh cũ ${signed(p.legacy_unrealized)} (${p.legacy_open_n} lot)` : '');
+      set('cCoins', `${d.coins.used} / ${d.coins.max}`, d.coins.used >= d.coins.max ? 'red' : '');
+      document.getElementById('cPending').textContent = `${d.pending.length} limit đang chờ`;
+      set('cPlaced', String(s.placed));
+      const done = s.filled + s.canceled;
+      const fills = s.filled + s.partial;
+      document.getElementById('cFillRate').textContent = `khớp ${s.filled} · một phần ${s.partial} · hủy ${s.canceled - s.partial}` + (done ? ` · tỉ lệ khớp ${fmt(fills / done * 100, 0)}%` : '');
+      document.getElementById('coinList').innerHTML = d.coins.list.map((c) => `<span class="coin-chip">${esc(c.replace('USDT', ''))}</span>`).join('');
+
+      document.getElementById('pendingN').textContent = d.pending.length;
+      document.getElementById('pendingNote').textContent = 'Post-only (maker). Khớp được ghi nhận qua WebSocket, không gọi REST.';
+      document.getElementById('pendingBody').innerHTML = d.pending.length ? d.pending.map((o) => `
+        <tr><td>${esc(o.symbol)}</td><td>${sideTag(o.side)}</td><td>${px(o.price)}</td><td>${px(o.mark)}</td>
+        <td>${o.gap_pct === null ? '—' : signed(o.gap_pct, 3) + '%'}</td><td>${o.size}</td><td>${fmt(o.margin_usdt)}</td>
+        <td>${px(o.tp_band)}</td><td>${esc(o.placed_at)}</td><td>${esc(o.expires_at)}</td></tr>`).join('')
+        : '<tr><td colspan="10" class="empty">Không có lệnh chờ.</td></tr>';
+
+      const positions = d.positions || [];
+      document.getElementById('posN').textContent = positions.length;
+      document.getElementById('posBody').innerHTML = positions.length ? positions.map((p) => `
+        <tr><td>${esc(p.symbol)}</td><td>${sideTag(p.side)}</td><td>${p.lots}</td><td>${fmt(p.size, 4).replace(/\.?0+$/, '')}</td>
+        <td>${px(p.entry)}</td><td>${px(p.mark)}</td><td>${px(p.tp_band)}</td><td>${fmt(p.mark_margin_usdt)}</td>
+        <td class="${cls(p.unrealized_pnl)}">${signed(p.unrealized_pnl)}</td><td class="${cls(p.roi_pct)}">${p.roi_pct === null ? '—' : signed(p.roi_pct, 1) + '%'}</td>
+        <td class="${cls(p.roi_entry_pct)}">${p.roi_entry_pct === null ? '—' : signed(p.roi_entry_pct, 1) + '%'}</td>
+        <td>${syncTag(p)}</td></tr>`).join('')
+        : '<tr><td colspan="12" class="empty">Không có vị thế.</td></tr>';
+
+      document.getElementById('openN').textContent = d.open_lots.length;
+      document.getElementById('openBody').innerHTML = d.open_lots.length ? d.open_lots.map((l) => `
+        <tr><td>${esc(l.symbol)}</td><td>${sideTag(l.side)}</td><td>${ruleTag(l)}</td><td>${px(l.entry)}</td><td>${px(l.mark)}</td>
+        <td>${px(l.tp_band)}</td><td>${l.size}</td><td>${fmt(l.margin_usdt)}</td>
+        <td class="${cls(l.unrealized_pnl)}">${signed(l.unrealized_pnl)}</td><td class="${cls(l.pnl_pct)}">${l.pnl_pct === null ? '—' : signed(l.pnl_pct, 1) + '%'}</td>
+        <td>${esc(l.duration_label)}</td><td>${esc(l.opened_at)}</td></tr>`).join('')
+        : '<tr><td colspan="12" class="empty">Chưa có lệnh mở.</td></tr>';
+
+      document.getElementById('dailyBody').innerHTML = d.daily.length ? d.daily.map((r) => `
+        <tr><td>${esc(r.day)}</td><td>${r.opened}</td><td>${r.closed}</td><td>${r.tp}</td><td class="${cls(r.pnl)}">${signed(r.pnl)}</td></tr>`).join('')
+        : '<tr><td colspan="5" class="empty">Chưa có dữ liệu.</td></tr>';
+
+      document.getElementById('closedN').textContent = d.closed_total;
+      document.getElementById('closedBody').innerHTML = d.closed.length ? d.closed.map((l) => `
+        <tr><td>${esc(l.symbol)}</td><td>${sideTag(l.side)}</td><td>${ruleTag(l)}</td><td>${px(l.entry)}</td><td>${px(l.close_price)}</td>
+        <td class="${cls(l.pnl_usdt)}">${signed(l.pnl_usdt)}</td><td class="${cls(l.pnl_pct)}">${l.pnl_pct === null ? '—' : signed(l.pnl_pct, 1) + '%'}</td>
+        <td>${fmt(l.fee_usdt, 4)}</td><td>${esc(l.duration_label)}</td><td>${esc(l.closed_at)}</td></tr>`).join('')
+        : '<tr><td colspan="10" class="empty">Chưa có lệnh 2 chiều nào đóng.</td></tr>';
+
+      renderChart(d);
+    }
+
+    function renderChart(d) {
+      const pts = d.equity_points || [];
+      const empty = document.getElementById('equityEmpty');
+      const canvas = document.getElementById('equityChart');
+      empty.hidden = pts.length > 0;
+      canvas.hidden = pts.length === 0;
+      if (!pts.length || typeof Chart === 'undefined') return;
+      const labels = pts.map((p) => p.t);
+      const eq = pts.map((p) => p.equity);
+      const base = pts.map(() => d.anchor.equity);
+      if (chart) {
+        chart.data.labels = labels;
+        chart.data.datasets[0].data = eq;
+        chart.data.datasets[1].data = base;
+        chart.update('none');
+        return;
+      }
+      chart = new Chart(canvas, {
+        type: 'line',
+        data: { labels, datasets: [
+          { label: 'Equity', data: eq, borderColor: '#388bfd', pointRadius: 0, borderWidth: 2, tension: 0.2 },
+          { label: 'Mốc', data: base, borderColor: '#6e7681', borderDash: [6, 4], pointRadius: 0, borderWidth: 1 },
+        ] },
+        options: {
+          responsive: true, maintainAspectRatio: false, animation: false,
+          plugins: { legend: { labels: { color: '#8b949e' } } },
+          scales: {
+            x: { ticks: { color: '#8b949e', maxTicksLimit: 8 }, grid: { color: '#21262d' } },
+            y: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } },
+          },
+        },
+      });
+    }
+
+    async function refresh() {
+      try {
+        const res = await fetch('/api/dual/status');
+        if (res.status === 401) { window.location = '/login'; return; }
+        if (!res.ok) return;
+        DATA = await res.json();
+        render(DATA);
+      } catch (e) { /* keep last data */ }
+    }
+
+    render(DATA);
+    setInterval(refresh, 15000);
+  </script>
+</body>
+</html>

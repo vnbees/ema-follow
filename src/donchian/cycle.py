@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from src.config import (
     SPOT_TRANSFER_DD_PAUSE_PCT,
     SPOT_TRANSFER_EXECUTE_HHMM,
     SPOT_TRANSFER_MODE,
+    SPOT_TRANSFER_MONTH_CAP_PCT,
     SPOT_TRANSFER_SKIM,
     WEB_PORT,
 )
@@ -30,15 +32,19 @@ from src.exchange.types import Candle
 from src.notify import notify_error, install_error_hooks
 from src.donchian import store
 from src.donchian.config import (
+    ADD_ATR_MULT,
     ATR_PERIOD,
     CANDLE_LIMIT,
     DONCHIAN_PERIOD,
+    DUAL_LIMIT_ENABLED,
+    ENTRY_TTL_BARS,
     FIXED_SCAN_SYMBOLS,
     INTERVAL,
     LEVERAGE,
     MARGIN_CAP_PCT,
     MARGIN_PCT,
     MAX_BODY_ATR,
+    MAX_COINS,
     MAX_OPEN,
     MIN_BODY_ATR,
     MIN_POT_RR,
@@ -47,6 +53,7 @@ from src.donchian.config import (
     SCAN_MODE,
     SIZE_BY_RR,
     SLOPE_LOOKBACK,
+    STALE_OPP_HOURS,
     SYMBOL_FILTER_ENABLED,
     TOP_K_PER_CYCLE,
     TOP_N_SYMBOLS,
@@ -206,8 +213,7 @@ def _sync_watched(symbols: list[str]) -> None:
         if EXCHANGE != "binance" or not is_ws_enabled():
             return
         watched = list(dict.fromkeys(symbols))
-        for lot in store.get_open_lots():
-            sym = str(lot["symbol"]).upper()
+        for sym in sorted(store.active_coins()):
             if sym not in watched:
                 watched.append(sym)
         set_watched_symbols(watched)
@@ -547,7 +553,7 @@ def _evaluate_symbol(symbol: str, now_ms: int) -> EntrySignal | None:
         period=DONCHIAN_PERIOD,
         slope_lookback=SLOPE_LOOKBACK,
         tol=PARALLEL_TOL,
-        allow_entry=not store.has_open_lot_for_symbol(symbol),
+        allow_entry=DUAL_LIMIT_ENABLED or STALE_OPP_HOURS > 0 or not store.has_open_lot_for_symbol(symbol),
         apply_quality_filter=True,
         atr_period=ATR_PERIOD,
         min_body_atr=MIN_BODY_ATR,
@@ -558,12 +564,123 @@ def _evaluate_symbol(symbol: str, now_ms: int) -> EntrySignal | None:
         vol_ratio_period=VOL_RATIO_PERIOD,
     )
 
+    held = [] if DUAL_LIMIT_ENABLED else store.get_open_lots(symbol)
+    if entry is not None and held:
+        held_sides = {str(row["side"]).lower() for row in held}
+        if entry.side.lower() in held_sides:
+            # Same side already open — keep waiting for a later opposite candle.
+            state.waiting_entry = True
+            _persist_state(symbol, state)
+            return None
+        from src.donchian.stale_opposite import qualifies_stale_opposite
+        from src.donchian.trading import _get_mark
+
+        if not qualifies_stale_opposite(
+            held,
+            entry.side,
+            _get_mark(symbol),
+            datetime.now(timezone.utc),
+            min_hours=STALE_OPP_HOURS,
+        ):
+            state.waiting_entry = True
+            _persist_state(symbol, state)
+            return None
+
     if entry is not None:
         # Backtest clears waiting only on actual open — keep waiting if not selected in top_k.
         state.waiting_entry = True
 
     _persist_state(symbol, state)
     return entry
+
+
+def _entry_atr(bars: list, entry_ts: int | None) -> float | None:
+    from src.donchian.signals import compute_atr
+
+    if not bars:
+        return None
+    atrs = compute_atr(bars, ATR_PERIOD)
+    if entry_ts is None:
+        val = atrs[-1]
+        return float(val) if val else None
+    for bar, atr in zip(bars, atrs):
+        if int(bar.ts) == int(entry_ts) and atr:
+            return float(atr)
+    return None
+
+
+def _open_favorable_adds(symbols: list[str], now_ms: int) -> int:
+    """Same-side add when the latest closed 15m is ≥ ADD_ATR_MULT ATR in favor.
+
+    Counts toward MAX_OPEN. A full book skips the add and retries a later cycle
+    while the close is still past the threshold. One add per original lot.
+    """
+    if DUAL_LIMIT_ENABLED or ADD_ATR_MULT <= 0 or not is_trading_enabled() or not has_credentials():
+        return 0
+    from src.donchian.favorable_add import add_parents, favorable_move
+    from src.donchian.signals import rolling_channel
+
+    opened = 0
+    for symbol in symbols:
+        if store.count_open() >= MAX_OPEN:
+            break
+        held = store.get_open_lots(symbol)
+        if not held:
+            continue
+        bars = _closed_bars_for_symbol(symbol, now_ms)
+        if bars is None:
+            continue
+        last = bars[-1]
+        channel = rolling_channel(
+            [bar.high for bar in bars],
+            [bar.low for bar in bars],
+            DONCHIAN_PERIOD,
+        )
+        if channel is None:
+            continue
+        upper, lower = channel
+        for parent in add_parents(held):
+            if store.count_open() >= MAX_OPEN:
+                break
+            entry_ts = parent["entry_ts"]
+            if entry_ts is not None and int(last.ts) <= int(entry_ts):
+                continue
+            atr = parent["entry_atr"] if "entry_atr" in parent.keys() else None
+            if not atr or float(atr) <= 0:
+                atr = _entry_atr(bars, int(entry_ts) if entry_ts is not None else None)
+            if not atr:
+                continue
+            side = str(parent["side"]).lower()
+            entry_px = float(parent["entry_px"])
+            if not favorable_move(side, entry_px, float(last.close), float(atr), ADD_ATR_MULT):
+                continue
+            margin = float(parent["margin_usdt"] or 0)
+            if margin <= 0:
+                continue
+            size_mult = float(parent["size_mult"] or 1.0)
+            tp_band = upper if side == "long" else lower
+            opp_band = lower if side == "long" else upper
+            move = float(last.close) - entry_px if side == "long" else entry_px - float(last.close)
+            status = open_lot(
+                symbol,
+                side=side,
+                trend=str(parent["trend"] or side),
+                trend_ts=parent["trend_ts"],
+                entry_ts=int(last.ts),
+                tp_band=tp_band,
+                size_mult=size_mult,
+                opp_band=opp_band,
+                why=(
+                    f"lệnh 2: close thuận {move:.6g} ≥ {ADD_ATR_MULT:g}×ATR "
+                    f"({float(atr):.6g}) so với lệnh #{int(parent['id'])} entry={entry_px:.6g}"
+                ),
+                entry_atr=float(atr),
+                add_on=True,
+                margin_fixed=margin,
+            )
+            if status == "opened":
+                opened += 1
+    return opened
 
 
 def _open_candidate(symbol: str, entry: EntrySignal, now_ms: int) -> bool:
@@ -589,13 +706,22 @@ def _open_candidate(symbol: str, entry: EntrySignal, now_ms: int) -> bool:
         body_atr=entry.body_atr,
         pot_rr=entry.pot_rr,
         why=entry.why,
+        entry_atr=_entry_atr(bars, last_bar.ts),
     )
     if status == "opened":
         state.waiting_entry = False
         _persist_state(symbol, state)
         return True
 
-    if status == "error" and not store.has_open_lot_for_symbol(symbol):
+    if status == "hold_wait":
+        state.waiting_entry = True
+        _persist_state(symbol, state)
+        return False
+
+    same_open = any(
+        str(row["side"]).lower() == entry.side.lower() for row in store.get_open_lots(symbol)
+    )
+    if status == "error" and not same_open:
         state.waiting_entry = True
         state.last_processed_ts = int(bars[-2].ts) if len(bars) >= 2 else None
         logging.info(
@@ -614,6 +740,44 @@ def _open_candidate(symbol: str, entry: EntrySignal, now_ms: int) -> bool:
         )
     _persist_state(symbol, state)
     return False
+
+
+def _place_dual_candidate(symbol: str, entry: EntrySignal, now_ms: int, reserved: float) -> tuple[bool, float]:
+    """Post-only LONG + SHORT for one signal. Returns (placed, margin committed)."""
+    from src.donchian.dual_limit import DualSignal, place_pair
+
+    if not is_trading_enabled() or not has_credentials():
+        return False, 0.0
+    bars = _closed_bars_for_symbol(symbol, now_ms)
+    if bars is None:
+        return False, 0.0
+    state = _load_state(symbol)
+    last_bar = bars[-1]
+    sig = DualSignal(
+        symbol=symbol,
+        trend=state.trend or ("up" if entry.side == "long" else "down"),
+        trend_ts=state.trend_ts,
+        entry_ts=int(last_bar.ts),
+        close=float(entry.entry_px),
+        upper=max(float(entry.tp_band), float(entry.opp_band)),
+        lower=min(float(entry.tp_band), float(entry.opp_band)),
+        size_mult=float(entry.size_mult),
+        body_atr=entry.body_atr,
+        pot_rr=entry.pot_rr,
+        atr=_entry_atr(bars, last_bar.ts),
+        why=entry.why,
+    )
+    status, committed = place_pair(sig, reserved_usdt=reserved)
+    if status == "placed":
+        state.waiting_entry = False
+    elif status in ("coin_cap", "cap_skip"):
+        state.waiting_entry = False
+        logging.info("  [%s] Dual limit not placed (%s) — signal discarded", symbol, status)
+    elif status in ("error", "rate_limited"):
+        state.waiting_entry = True
+        logging.info("  [%s] Dual limit not placed (%s) — wait for next counter candle", symbol, status)
+    _persist_state(symbol, state)
+    return status == "placed", committed
 
 
 def _log_balance() -> None:
@@ -642,12 +806,23 @@ def _log_balance() -> None:
             initial_margin_pct=bal.initial_margin_pct,
         )
         insert_equity_snapshot(bal.account_equity, bal.available, maint_margin_pct=bal.maint_margin_pct)
+        if DUAL_LIMIT_ENABLED:
+            from src.web.book import ensure_dual_book
+
+            ensure_dual_book(float(bal.account_equity or 0))
         open_n = store.count_open()
-        cap = str(MAX_OPEN) if MAX_OPEN > 0 else "∞"
-        logging.info(
-            "Futures equity=%.2f %s | maint=%.2f%% | open=%d/%s",
-            bal.account_equity, bal.margin_coin, bal.maint_margin_pct, open_n, cap,
-        )
+        if DUAL_LIMIT_ENABLED:
+            logging.info(
+                "Futures equity=%.2f %s | maint=%.2f%% | open=%d lots | coins=%d/%d | pending=%d",
+                bal.account_equity, bal.margin_coin, bal.maint_margin_pct, open_n,
+                len(store.active_coins()), MAX_COINS, len(store.get_pending_entries()),
+            )
+        else:
+            cap = str(MAX_OPEN) if MAX_OPEN > 0 else "∞"
+            logging.info(
+                "Futures equity=%.2f %s | maint=%.2f%% | open=%d/%s",
+                bal.account_equity, bal.margin_coin, bal.maint_margin_pct, open_n, cap,
+            )
         try:
             from src.spot_transfer import check_risk_warnings, note_equity_peak
 
@@ -690,6 +865,16 @@ def run_cycle() -> None:
     _wait_for_just_closed(symbols)
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
+    if DUAL_LIMIT_ENABLED and has_credentials():
+        from src.donchian.dual_limit import expire_pending
+
+        try:
+            expired = expire_pending(now_ms)
+            if expired:
+                logging.info("Dual limit: %d entry order(s) closed out after %d bar(s)", expired, ENTRY_TTL_BARS)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Dual limit expiry failed: %s", exc)
+
     candidates: list[tuple[str, EntrySignal]] = []
     for symbol in symbols:
         if _candle_cache_stale(symbol):
@@ -699,19 +884,36 @@ def run_cycle() -> None:
         if entry is not None:
             candidates.append((symbol, entry))
 
+    added = _open_favorable_adds(symbols, now_ms)
+    opened += added
+
     candidates.sort(key=lambda item: item[1].pot_rr, reverse=True)
-    if candidates:
-        logging.info(
-            "Entry candidates: %d — opening top %d by pot_rr (max_open=%d)",
-            len(candidates),
-            TOP_K_PER_CYCLE,
-            MAX_OPEN,
-        )
-    for symbol, entry in candidates[:TOP_K_PER_CYCLE]:
-        if store.count_open() >= MAX_OPEN:
-            break
-        if _open_candidate(symbol, entry, now_ms):
-            opened += 1
+    if DUAL_LIMIT_ENABLED:
+        if candidates:
+            logging.info(
+                "Entry candidates: %d — dual post-only limit LONG+SHORT for all (max_coins=%d)",
+                len(candidates),
+                MAX_COINS,
+            )
+        reserved = 0.0
+        for symbol, entry in candidates:
+            placed, committed = _place_dual_candidate(symbol, entry, now_ms, reserved)
+            reserved += committed
+            if placed:
+                opened += 1
+    else:
+        if candidates:
+            logging.info(
+                "Entry candidates: %d — opening top %d by pot_rr (max_open=%d)",
+                len(candidates),
+                TOP_K_PER_CYCLE,
+                MAX_OPEN,
+            )
+        for symbol, entry in candidates[:TOP_K_PER_CYCLE]:
+            if store.count_open() >= MAX_OPEN:
+                break
+            if _open_candidate(symbol, entry, now_ms):
+                opened += 1
 
     if stale_symbols:
         logging.info("Gap detected for %d symbol(s) — triggering re-warmup", len(stale_symbols))
@@ -726,7 +928,10 @@ def run_cycle() -> None:
     except Exception as exc:  # noqa: BLE001
         logging.warning("Daily spot transfer check failed: %s", exc)
     if opened:
-        logging.info("Cycle done — %d new lot(s) opened", opened)
+        if DUAL_LIMIT_ENABLED:
+            logging.info("Cycle done — %d signal(s) got dual limit orders", opened)
+        else:
+            logging.info("Cycle done — %d new lot(s) opened", opened)
 
 
 def main() -> None:
@@ -772,7 +977,9 @@ def main() -> None:
         logging.warning("Binance WS start skipped: %s", exc)
         notify_error("Binance WS start", str(exc))
 
-    start_watcher()
+    smc_on = os.getenv("SMC_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+    if not smc_on:
+        start_watcher()
 
     logging.info("%s Donchian Parallel-Trend bot started", EXCHANGE_DISPLAY_NAME)
     logging.info("Dashboard: http://localhost:%d", WEB_PORT)
@@ -784,18 +991,45 @@ def main() -> None:
         MARGIN_PCT * 100, MARGIN_CAP_PCT * 100, LEVERAGE, MAX_OPEN, TOP_K_PER_CYCLE,
         MIN_VOL_RATIO, VOL_RATIO_PERIOD,
     )
+    if DUAL_LIMIT_ENABLED:
+        logging.info(
+            "Dual limit: every signal → post-only LONG + SHORT, cancel after %d bar(s), "
+            "no lot cap, max %d coins. Market entry, stale-opposite and lệnh 2 are off.",
+            ENTRY_TTL_BARS,
+            MAX_COINS,
+        )
+    elif STALE_OPP_HOURS > 0:
+        logging.info(
+            "Stale opposite: allow one reverse entry when the open lot is losing for ≥ %.0fh",
+            STALE_OPP_HOURS,
+        )
     if is_trading_enabled():
         logging.info("Trading: LIVE")
     else:
         logging.info("Trading: DISABLED — analysis and dashboard only")
-    logging.info(
-        "Spot transfer: mode=%s skim=%.0f%% day_cap=%.2f%% dd_pause=%.0f%% at %s +07",
-        SPOT_TRANSFER_MODE,
-        SPOT_TRANSFER_SKIM * 100,
-        SPOT_TRANSFER_DAY_CAP_PCT * 100,
-        SPOT_TRANSFER_DD_PAUSE_PCT * 100,
-        SPOT_TRANSFER_EXECUTE_HHMM,
-    )
+    if SPOT_TRANSFER_MODE == "month":
+        logging.info(
+            "Spot transfer: cuối tháng rút hết lãi, trần %.0f%% mốc đầu tháng, %s +07 ngày 1",
+            SPOT_TRANSFER_MONTH_CAP_PCT * 100,
+            SPOT_TRANSFER_EXECUTE_HHMM,
+        )
+    else:
+        logging.info(
+            "Spot transfer: mode=%s skim=%.0f%% day_cap=%.2f%% dd_pause=%.0f%% at %s +07",
+            SPOT_TRANSFER_MODE,
+            SPOT_TRANSFER_SKIM * 100,
+            SPOT_TRANSFER_DAY_CAP_PCT * 100,
+            SPOT_TRANSFER_DD_PAUSE_PCT * 100,
+            SPOT_TRANSFER_EXECUTE_HHMM,
+        )
+
+    if smc_on:
+        logging.info("%s SMC liquidity-sweep bot started", EXCHANGE_DISPLAY_NAME)
+        logging.info("Dashboard: http://localhost:%d  (Donchian cũ: /donchian)", WEB_PORT)
+        from src.smc.runtime import run_forever
+
+        run_forever()
+        return
 
     while True:
         try:

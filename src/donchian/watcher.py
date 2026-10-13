@@ -13,7 +13,13 @@ import threading
 from src.config import EXCHANGE
 from src.notify import notify_error
 from src.donchian import store
-from src.donchian.config import CANDLE_LIMIT, DONCHIAN_PERIOD, INTERVAL, WATCHER_INTERVAL_SEC
+from src.donchian.config import (
+    CANDLE_LIMIT,
+    DONCHIAN_PERIOD,
+    DUAL_LIMIT_ENABLED,
+    INTERVAL,
+    WATCHER_INTERVAL_SEC,
+)
 from src.donchian.signals import rolling_channel
 from src.donchian.trading import close_lot, reconcile_flat_lots, sync_tp_limit
 
@@ -90,6 +96,10 @@ def _target_band(lot) -> float | None:
 
 
 def check_open_lots() -> None:
+    if DUAL_LIMIT_ENABLED:
+        from src.donchian.dual_limit import poll_ws_fills
+
+        poll_ws_fills()
     reconcile_flat_lots()
     lots = store.get_open_lots()
     if lots:

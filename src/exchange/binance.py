@@ -729,6 +729,44 @@ def _spot_private_request(
     raise ExchangeClientError(f"{method} {path} failed after {max_retries} attempts: {last_error}")
 
 
+def transfer_spot_to_futures(asset: str, amount: float) -> dict:
+    """Transfer from spot wallet to USDT-M futures (MAIN_UMFUTURE)."""
+    if amount <= 0:
+        raise ExchangeClientError("Transfer amount must be positive")
+    result = _spot_private_request(
+        "POST",
+        "/sapi/v1/asset/transfer",
+        {
+            "type": "MAIN_UMFUTURE",
+            "asset": asset.upper(),
+            "amount": amount,
+        },
+    )
+    return {
+        "tranId": str(result.get("tranId", "")),
+        "clientOid": str(result.get("clientTranId", "") or result.get("tranId", "")),
+        "raw": result,
+    }
+
+
+def fetch_spot_free(asset: str = "USDT") -> float:
+    """Free (not locked) spot balance."""
+    asset = asset.upper()
+    rows = _spot_private_request(
+        "POST",
+        "/sapi/v3/asset/getUserAsset",
+        {"asset": asset},
+    )
+    if isinstance(rows, list):
+        for row in rows:
+            if str(row.get("asset", "")).upper() == asset:
+                return float(row.get("free") or 0)
+        return 0.0
+    if isinstance(rows, dict):
+        return float(rows.get("free") or 0)
+    return 0.0
+
+
 def transfer_futures_to_spot(asset: str, amount: float) -> dict:
     """Transfer from USDT-M futures wallet to spot (UMFUTURE_MAIN)."""
     if amount <= 0:
@@ -1233,7 +1271,8 @@ def fetch_futures_balance_rest(symbol: str = SYMBOL) -> FuturesAccountBalance:
 
     data = _private_get("/fapi/v2/account", {})
     available = float(data.get("availableBalance", 0))
-    equity = float(data.get("totalMarginBalance", data.get("totalWalletBalance", 0)))
+    wallet = float(data.get("totalWalletBalance", 0) or 0)
+    equity = float(data.get("totalMarginBalance", wallet))
     maint = float(data.get("totalMaintMargin", 0) or 0)
     initial = float(data.get("totalInitialMargin", 0) or 0)
     balance = FuturesAccountBalance(
@@ -1243,6 +1282,7 @@ def fetch_futures_balance_rest(symbol: str = SYMBOL) -> FuturesAccountBalance:
         usdt_equity=equity,
         total_maint_margin=maint,
         total_initial_margin=initial,
+        wallet_balance=wallet,
     )
     with _rest_cache_lock:
         _account_cache = (now, balance)
@@ -1541,6 +1581,73 @@ def fetch_algo_order_detail(symbol: str, algo_id: str) -> dict:
     }
 
 
+def _limit_orders_from_rows(rows: object) -> list[PendingOrder]:
+    if not isinstance(rows, list):
+        return []
+    orders: list[PendingOrder] = []
+    for item in rows:
+        if not isinstance(item, dict) or str(item.get("type", "")).upper() != "LIMIT":
+            continue
+        orders.append(
+            PendingOrder(
+                order_id=str(item.get("orderId", "")),
+                client_oid=str(item.get("clientOrderId", "")),
+                side=str(item.get("side", "")).lower(),
+                price=float(item.get("price", 0) or 0),
+                size=float(item.get("origQty", 0) or 0),
+                position_side=str(item.get("positionSide", "") or "").lower(),
+            )
+        )
+    return orders
+
+
+def fetch_open_limits_by_symbol() -> dict[str, list[PendingOrder]]:
+    """All resting LIMIT orders, one openOrders call (weight 40)."""
+    if is_optional_rest_blocked():
+        raise RateLimitError(
+            "REST resume/ban — optional GET /fapi/v1/openOrders skipped "
+            f"({optional_rest_blocked_sec():.0f}s remaining)"
+        )
+    rows = _private_get("/fapi/v1/openOrders", {}, max_retries=1, priority="optional")
+    grouped: dict[str, list[PendingOrder]] = {}
+    if not isinstance(rows, list):
+        return grouped
+    for item in rows:
+        if not isinstance(item, dict) or str(item.get("type", "")).upper() != "LIMIT":
+            continue
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        try:
+            orig = float(item.get("origQty") or 0)
+            done = float(item.get("executedQty") or 0)
+            order = PendingOrder(
+                order_id=str(item.get("orderId") or ""),
+                client_oid=str(item.get("clientOrderId") or ""),
+                side=str(item.get("side") or "").lower(),
+                price=float(item.get("price") or 0),
+                size=max(0.0, orig - done),
+                position_side=str(item.get("positionSide") or "").lower(),
+            )
+        except (TypeError, ValueError):
+            continue
+        grouped.setdefault(symbol, []).append(order)
+    return grouped
+
+
+def fetch_open_limit_orders_rest(symbol: str) -> list[PendingOrder]:
+    """One openOrders read. Used when a close limit was rejected as already resting."""
+    if is_optional_rest_blocked():
+        return []
+    symbol_u = symbol.upper()
+    rows = _private_get("/fapi/v1/openOrders", {"symbol": symbol_u}, max_retries=1, priority="optional")
+    orders = _limit_orders_from_rows(rows)
+    with _pending_orders_rest_lock:
+        _pending_orders_rest_at_mono[symbol_u] = time.monotonic()
+        _pending_orders_rest_cache[symbol_u] = list(orders)
+    return orders
+
+
 def fetch_pending_orders(symbol: str) -> list[PendingOrder]:
     """LIMIT orders for dashboard/status. Not on the RSI market-order trade path.
 
@@ -1569,21 +1676,7 @@ def fetch_pending_orders(symbol: str) -> list[PendingOrder]:
             return list(_pending_orders_rest_cache.get(symbol_u, []))
 
     rows = _private_get("/fapi/v1/openOrders", {"symbol": symbol_u}, priority="optional")
-    if not isinstance(rows, list):
-        rows = []
-    orders: list[PendingOrder] = []
-    for item in rows:
-        if str(item.get("type", "")).upper() != "LIMIT":
-            continue
-        orders.append(
-            PendingOrder(
-                order_id=str(item.get("orderId", "")),
-                client_oid=str(item.get("clientOrderId", "")),
-                side=str(item.get("side", "")).lower(),
-                price=float(item.get("price", 0)),
-                size=float(item.get("origQty", 0)),
-            )
-        )
+    orders = _limit_orders_from_rows(rows)
     with _pending_orders_rest_lock:
         _pending_orders_rest_at_mono[symbol_u] = time.monotonic()
         _pending_orders_rest_cache[symbol_u] = list(orders)
@@ -1669,7 +1762,7 @@ def place_market_order(
         params["side"] = side.upper()
         if reduce_only:
             params["reduceOnly"] = "true"
-    result = _private_post("/fapi/v1/order", params)
+    result = _private_post("/fapi/v1/order", params, max_retries=1)
     _invalidate_position_cache(symbol)
     try:
         from src.exchange.binance_ws import on_order_placed
@@ -1715,7 +1808,18 @@ def place_limit_close_order(
         "price": price,
         "newClientOrderId": client_oid,
     }
-    result = _private_post("/fapi/v1/order", params)
+    try:
+        # One shot. A retry reuses this client id and Binance answers -4116
+        # after the first request already landed.
+        result = _private_post("/fapi/v1/order", params, max_retries=1)
+    except ExchangeClientError as exc:
+        if "-4116" not in str(exc):
+            raise
+        result = _private_get(
+            "/fapi/v1/order",
+            {"symbol": symbol.upper(), "origClientOrderId": client_oid},
+            max_retries=1,
+        )
     _invalidate_position_cache(symbol)
     try:
         from src.exchange.binance_ws import on_order_placed
@@ -1754,6 +1858,104 @@ def cancel_limit_order(symbol: str, order_id: str) -> dict:
         "orderId": str(result.get("orderId", order_id)),
         "status": str(result.get("status", "")).lower(),
     }
+
+
+def _order_fields(result: dict, client_oid: str = "") -> dict:
+    return {
+        "orderId": str(result.get("orderId", "")),
+        "clientOid": str(result.get("clientOrderId", client_oid)),
+        "status": str(result.get("status", "")).lower(),
+        "price": result.get("price"),
+        "avgPrice": result.get("avgPrice"),
+        "origQty": result.get("origQty"),
+        "executedQty": result.get("executedQty"),
+        "positionSide": str(result.get("positionSide", "") or "").lower(),
+    }
+
+
+def place_limit_open_order(
+    symbol: str,
+    hold_side: str,
+    size: str,
+    price: str,
+    *,
+    post_only: bool = True,
+) -> dict:
+    """Hedge-mode LIMIT that opens `hold_side`. GTX = post-only, rejected (-5022) if it would take."""
+    order_side, position_side = market_order_params(hold_side, "open")
+    client_oid = f"bde_{uuid.uuid4().hex[:16]}"
+    params: dict[str, str | int | float | bool] = {
+        "symbol": symbol.upper(),
+        "side": order_side,
+        "positionSide": position_side,
+        "type": "LIMIT",
+        "timeInForce": "GTX" if post_only else "GTC",
+        "quantity": size,
+        "price": price,
+        "newClientOrderId": client_oid,
+    }
+    try:
+        result = _private_post("/fapi/v1/order", params, max_retries=1)
+    except ExchangeClientError as exc:
+        if "-4116" not in str(exc):
+            raise
+        result = _private_get(
+            "/fapi/v1/order",
+            {"symbol": symbol.upper(), "origClientOrderId": client_oid},
+            max_retries=1,
+        )
+    try:
+        from src.exchange.binance_ws import watch_symbols
+
+        watch_symbols([symbol])
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Binance WS watch after limit open skipped: %s", exc)
+    return _order_fields(result, client_oid)
+
+
+def cancel_limit_order_detail(symbol: str, order_id: str) -> dict | None:
+    """Cancel and return the final order (status, executedQty, avgPrice). None = unknown order."""
+    try:
+        result = _private_delete(
+            "/fapi/v1/order",
+            {"symbol": symbol.upper(), "orderId": int(order_id)},
+        )
+    except ExchangeClientError as exc:
+        msg = str(exc).lower()
+        if "-2011" in msg or "unknown order" in msg:
+            return None
+        raise
+    return _order_fields(result)
+
+
+def fetch_order_full(symbol: str, order_id: str) -> dict:
+    """One GET /order with fill fields. Optional weight — skipped during ban/resume."""
+    if is_optional_rest_blocked():
+        raise RateLimitError(
+            f"REST blocked ({optional_rest_blocked_sec():.0f}s) — GET /fapi/v1/order skipped"
+        )
+    result = _private_get(
+        "/fapi/v1/order",
+        {"symbol": symbol.upper(), "orderId": int(order_id)},
+        max_retries=1,
+        priority="optional",
+    )
+    return _order_fields(result)
+
+
+def fetch_book_ticker(symbol: str) -> tuple[float, float] | None:
+    """(best bid, best ask) from one public bookTicker read (weight 2). None if blocked/failed."""
+    if is_optional_rest_blocked():
+        return None
+    try:
+        data = _public_get("/fapi/v1/ticker/bookTicker", {"symbol": symbol.upper()}, max_retries=1)
+        bid = float(data.get("bidPrice") or 0)
+        ask = float(data.get("askPrice") or 0)
+    except (ExchangeClientError, TypeError, ValueError, AttributeError):
+        return None
+    if bid <= 0 or ask <= 0:
+        return None
+    return bid, ask
 
 
 def place_algo_close_order(

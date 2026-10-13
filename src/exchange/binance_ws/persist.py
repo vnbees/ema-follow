@@ -135,6 +135,7 @@ def save_account_snapshot() -> None:
                 "usdt_equity": bal.usdt_equity,
                 "total_maint_margin": bal.total_maint_margin,
                 "total_initial_margin": bal.total_initial_margin,
+                "wallet_balance": bal.wallet_balance,
             }
     try:
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -192,6 +193,11 @@ def load_account_snapshot() -> bool:
                     usdt_equity=float(bal.get("usdt_equity") or 0),
                     total_maint_margin=float(bal.get("total_maint_margin") or 0),
                     total_initial_margin=float(bal.get("total_initial_margin") or 0),
+                    wallet_balance=(
+                        float(bal["wallet_balance"])
+                        if bal.get("wallet_balance") not in (None, "")
+                        else None
+                    ),
                 )
             )
             bal_ok = True
@@ -204,6 +210,9 @@ def load_account_snapshot() -> bool:
     if loaded:
         # Treat disk restore as a successful reconcile so boot skips force REST.
         CACHE.mark_reconciled()
+        from src.exchange.binance_ws.cache import publish_live_equity
+
+        publish_live_equity(force=True)
     return loaded
 
 

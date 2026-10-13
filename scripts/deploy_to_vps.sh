@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
+# !!! NGUY HIỂM — CHỈ dùng cho FRESH INSTALL VPS mới. KHÔNG dùng để cập nhật code PROD. !!!
+# Script này:
+#   - chạy reset_donchian_fresh_start.py --yes (local + VPS) → đóng TẤT CẢ lot đang mở trong DB (RESET_FRESH)
+#   - upload cả data/ (bot.db local) + .env local → GHI ĐÈ DB và secret của PROD
+#   - chạy vps-remote-setup.sh (apt upgrade, ufw, systemd)
+# Cập nhật code PROD → dùng scripts/deploy_code_only.sh (xem docs/DEPLOY.md).
+#
 # Deploy bot lên VPS DigitalOcean (SG) từ máy local.
 #
 # Usage:
+#   export I_UNDERSTAND_THIS_WIPES_PROD=yes   # bắt buộc, xem cảnh báo trên
 #   export VPS_HOST=123.45.67.89          # IP Droplet
 #   export VPS_USER=root                  # default root
 #   ./scripts/deploy_to_vps.sh
@@ -17,6 +25,13 @@ VPS_HOST="${VPS_HOST:?Set VPS_HOST= droplet IP}"
 VPS_USER="${VPS_USER:-root}"
 REMOTE="${VPS_USER}@${VPS_HOST}"
 APP="/home/bot/app"
+
+if [[ "${I_UNDERSTAND_THIS_WIPES_PROD:-}" != "yes" ]]; then
+  echo "REFUSED: script này reset lot + ghi đè bot.db/.env PROD." >&2
+  echo "Cập nhật code → ./scripts/deploy_code_only.sh (docs/DEPLOY.md)." >&2
+  echo "Chỉ fresh install VPS mới, có user đồng ý rõ ràng: I_UNDERSTAND_THIS_WIPES_PROD=yes $0" >&2
+  exit 1
+fi
 
 echo "=== Reset Donchian state (fresh start) ==="
 .venv/bin/python scripts/reset_donchian_fresh_start.py --yes || true

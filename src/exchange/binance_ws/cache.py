@@ -13,6 +13,47 @@ def _now() -> float:
     return time.monotonic()
 
 
+def _order_locks_margin(order: PendingOrder) -> bool:
+    """Opening orders lock initial margin. Hedge closes do not."""
+    side = (order.side or "").lower()
+    held = (order.position_side or "").lower()
+    if held == "long":
+        return side == "buy"
+    if held == "short":
+        return side == "sell"
+    return side in ("buy", "sell")
+
+
+_last_dash_publish = 0.0
+
+
+def publish_live_equity(*, force: bool = False) -> None:
+    """Push margin equity into the dashboard process. Throttled; no REST."""
+    global _last_dash_publish
+    now = time.monotonic()
+    if not force and now - _last_dash_publish < 1.0:
+        return
+    bal = CACHE.get_balance()
+    if bal is None or float(bal.account_equity or 0) <= 0:
+        return
+    _last_dash_publish = now
+    try:
+        from datetime import datetime, timezone
+
+        from src.bot_state import update_account_balance
+
+        update_account_balance(
+            available=float(bal.available),
+            equity=float(bal.account_equity),
+            margin_coin=bal.margin_coin or "USDT",
+            last_updated=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            maint_margin_pct=bal.maint_margin_pct,
+            initial_margin_pct=bal.initial_margin_pct,
+        )
+    except Exception:  # noqa: BLE001
+        return
+
+
 @dataclass
 class BinanceWsCache:
     lock: threading.RLock = field(default_factory=threading.RLock)
@@ -32,6 +73,10 @@ class BinanceWsCache:
     positions_by_symbol: dict[str, dict[str, Position]] = field(default_factory=dict)
     all_positions: list[Position] = field(default_factory=list)
     balance: FuturesAccountBalance | None = None
+    wallet_usdt: float | None = None
+    # True after the full open-order book is loaded. Until then, available
+    # follows wallet changes only — the exchange number is not knowable yet.
+    orders_synced: bool = False
     pending_by_symbol: dict[str, list[PendingOrder]] = field(default_factory=dict)
     order_details: dict[str, dict] = field(default_factory=dict)
     account_updated_at: float = 0.0
@@ -199,17 +244,118 @@ class BinanceWsCache:
     def set_mark(self, symbol: str, mark: float) -> None:
         if mark <= 0:
             return
+        symbol = symbol.upper()
+        publish = False
         with self.lock:
-            self.marks[symbol.upper()] = float(mark)
+            self.marks[symbol] = float(mark)
+            has_position = any(p.symbol.upper() == symbol and p.size > 0 for p in self.all_positions)
+            if self.orders_synced and (symbol in self.pending_by_symbol or has_position):
+                self._recompute_equity_locked()
+                publish = True
+        if publish:
+            publish_live_equity()
 
     def get_mark(self, symbol: str) -> float | None:
         with self.lock:
             mark = self.marks.get(symbol.upper())
             return float(mark) if mark and mark > 0 else None
 
+    def _sum_upnl_locked(self) -> float:
+        total = 0.0
+        for pos in self.all_positions:
+            if pos.size > 0:
+                total += float(pos.unrealized_pnl or 0)
+        return total
+
+    def _recompute_equity_locked(self) -> None:
+        """Margin equity = wallet + open unrealized. Wallet stays put across mark ticks."""
+        bal = self.balance
+        if bal is None:
+            return
+        upnl = self._sum_upnl_locked()
+        if self.wallet_usdt is None:
+            explicit = bal.wallet_balance
+            if explicit is not None:
+                self.wallet_usdt = float(explicit)
+            else:
+                self.wallet_usdt = float(bal.account_equity) - upnl
+        bal.account_equity = float(self.wallet_usdt) + upnl
+        bal.usdt_equity = bal.account_equity
+        bal.wallet_balance = float(self.wallet_usdt)
+        if self.orders_synced:
+            locked = self._margin_locked()
+            bal.total_initial_margin = locked
+            bal.available = max(0.0, bal.account_equity - locked)
+
+    def _margin_locked(self) -> float:
+        """Position margin plus initial margin of opening limit orders.
+
+        Matches the USDT-M cross reading: notional / leverage, and the extra
+        open-loss when a limit sits through the mark.
+        """
+        from src.config import LEVERAGE
+
+        lev = max(float(LEVERAGE), 1.0)
+        total = 0.0
+        for pos in self.all_positions:
+            if pos.size <= 0:
+                continue
+            px = float(self.marks.get(pos.symbol.upper()) or pos.avg_price or 0)
+            if px <= 0:
+                continue
+            total += pos.size * px / lev
+        for symbol, orders in self.pending_by_symbol.items():
+            mark = float(self.marks.get(symbol) or 0)
+            for order in orders:
+                if order.price <= 0 or order.size <= 0 or not _order_locks_margin(order):
+                    continue
+                ref = mark if mark > 0 else order.price
+                if (order.side or "").lower() == "buy":
+                    open_loss = order.size * abs(min(0.0, ref - order.price))
+                else:
+                    open_loss = order.size * abs(min(0.0, order.price - ref))
+                total += order.size * order.price / lev + open_loss
+        return total
+
     def set_balance(self, balance: FuturesAccountBalance) -> None:
         with self.lock:
             self.balance = balance
+            self.account_updated_at = _now()
+            if balance.wallet_balance is not None:
+                self.wallet_usdt = float(balance.wallet_balance)
+            else:
+                self.wallet_usdt = float(balance.account_equity) - self._sum_upnl_locked()
+            balance.wallet_balance = self.wallet_usdt
+            self._recompute_equity_locked()
+
+    def set_wallet(self, wallet: float) -> None:
+        """Absolute USDT wallet from ACCOUNT_UPDATE; equity = wallet + live unrealized."""
+        with self.lock:
+            bal = self.balance
+            if bal is None:
+                return
+            if self.wallet_usdt is None:
+                self._recompute_equity_locked()
+            delta = float(wallet) - float(self.wallet_usdt or 0)
+            self.wallet_usdt = float(wallet)
+            if not self.orders_synced:
+                bal.available = float(bal.available) + delta
+            self._recompute_equity_locked()
+            self.account_updated_at = _now()
+
+    def apply_wallet_delta(self, delta: float) -> None:
+        if abs(delta) < 1e-12:
+            return
+        with self.lock:
+            bal = self.balance
+            if bal is None:
+                return
+            if self.wallet_usdt is None:
+                self._recompute_equity_locked()
+            self.wallet_usdt = float(self.wallet_usdt or 0) + float(delta)
+            if not self.orders_synced:
+                bal.available = float(bal.available) + float(delta)
+            self._recompute_equity_locked()
             self.account_updated_at = _now()
 
     def get_balance(self) -> FuturesAccountBalance | None:
@@ -245,6 +391,10 @@ class BinanceWsCache:
                         bucket[pos.side] = pos
                 self.positions_by_symbol = rebuilt
             self.positions_updated_at = _now()
+            if self.balance is not None:
+                if self.wallet_usdt is None:
+                    self.wallet_usdt = float(self.balance.account_equity) - self._sum_upnl_locked()
+                self._recompute_equity_locked()
 
     def apply_position_updates(self, updates: list[Position], closed_keys: list[tuple[str, str]]) -> None:
         """Merge UDS position deltas (changed rows only). closed_keys: (symbol, side).
@@ -297,6 +447,7 @@ class BinanceWsCache:
             self.positions_by_symbol = by_symbol
             self.all_positions = all_positions
             self.positions_updated_at = _now()
+            self._recompute_equity_locked()
 
     def get_symbol_positions(self, symbol: str) -> dict[str, Position] | None:
         symbol = symbol.upper()
@@ -340,10 +491,25 @@ class BinanceWsCache:
                     updated_all.append(refreshed)
                 self.positions_by_symbol[symbol] = new_sides
             self.all_positions = updated_all
+            self._recompute_equity_locked()
+        publish_live_equity()
 
     def set_pending(self, symbol: str, orders: list[PendingOrder]) -> None:
         with self.lock:
             self.pending_by_symbol[symbol.upper()] = list(orders)
+            self._recompute_equity_locked()
+        if self.orders_synced:
+            publish_live_equity(force=True)
+
+    def replace_pending_book(self, by_symbol: dict[str, list[PendingOrder]]) -> None:
+        """Replace the open-limit book and turn on available = equity − margin."""
+        with self.lock:
+            self.pending_by_symbol = {
+                symbol.upper(): list(orders) for symbol, orders in by_symbol.items()
+            }
+            self.orders_synced = True
+            self._recompute_equity_locked()
+        publish_live_equity(force=True)
 
     def get_pending(self, symbol: str) -> list[PendingOrder] | None:
         with self.lock:

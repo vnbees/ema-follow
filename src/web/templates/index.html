@@ -23,6 +23,8 @@
     button:hover { background: #30363d; }
     button:disabled { opacity: 0.45; cursor: default; }
     .range-btn.active { background: #238636; border-color: #2ea043; color: #fff; }
+    .book-tabs { display: flex; gap: 8px; margin: 4px 0 8px; flex-wrap: wrap; }
+    .book-tab.active { background: #1f6feb; border-color: #388bfd; color: #fff; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
     th, td { padding: 8px 10px; border-bottom: 1px solid #30363d; text-align: left; white-space: nowrap; }
     th { color: #8b949e; font-size: 11px; text-transform: uppercase; }
@@ -48,6 +50,7 @@
     .side-badge.sell { background: #f85149; }
     .pos-symbol { font-weight: 600; }
     .pill { background: #21262d; color: #8b949e; border-radius: 999px; padding: 2px 8px; font-size: 11px; }
+    .pill.rule { color: #d2a8ff; border: 1px solid #6e40c9; }
     .pos-status { color: #8b949e; font-size: 13px; white-space: nowrap; }
     .pos-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 16px; margin-top: 14px; }
     .pos-metric .k { color: #8b949e; font-size: 12px; }
@@ -61,12 +64,12 @@
 <body>
   <h1>{{ exchange_name }} {{ bot_title }}</h1>
 
-  <p class="balance-line">
+  <p class="balance-line" id="balanceLine">
     Futures:
-    available={{ "%.2f"|format(account.available) }} {{ account.margin_coin }}
-    | equity={{ "%.2f"|format(account.equity) }} {{ account.margin_coin }}
-    | maint={% if account.maint_margin_pct is not none %}{{ "%.2f"|format(account.maint_margin_pct) }}{% else %}—{% endif %}%
-    | initial={% if account.initial_margin_pct is not none %}{{ "%.2f"|format(account.initial_margin_pct) }}{% else %}—{% endif %}%
+    available=<span id="balAvailable">{{ "%.2f"|format(account.available) }}</span> {{ account.margin_coin }}
+    | equity=<span id="balEquity">{{ "%.2f"|format(account.equity) }}</span> {{ account.margin_coin }}
+    | maint=<span id="balMaint">{% if account.maint_margin_pct is not none %}{{ "%.2f"|format(account.maint_margin_pct) }}{% else %}—{% endif %}</span>%
+    | initial=<span id="balInitial">{% if account.initial_margin_pct is not none %}{{ "%.2f"|format(account.initial_margin_pct) }}{% else %}—{% endif %}</span>%
   </p>
 
   {% set risk = spot_transfer.risk if spot_transfer else none %}
@@ -84,6 +87,32 @@
     </ul>
   </div>
   {% endif %}
+
+  <div class="book-tabs">
+    <button type="button" class="book-tab active" id="tabFresh" data-book="fresh">Từ mốc 1051</button>
+    <button type="button" class="book-tab" id="tabHistory" data-book="history">Lịch sử</button>
+  </div>
+  <p class="meta" id="bookTabNote" style="margin-top:0;">
+    Số liệu từ lúc chốt mốc 1051. Tab Lịch sử giữ toàn bộ sổ cũ để tham khảo.
+  </p>
+
+  <div class="panel">
+    <div class="chart-header">
+      <h2 style="margin: 0;">Tăng trưởng theo ngày</h2>
+      <div class="controls" style="margin: 0;">
+        <button type="button" class="range-btn" data-range="7d">7 ngày</button>
+        <button type="button" class="range-btn active" data-range="30d">30 ngày</button>
+        <button type="button" class="range-btn" data-range="all">Tất cả</button>
+      </div>
+    </div>
+    <p class="meta" style="margin: 0 0 8px;" id="wealthChartMeta">
+      Từ mốc 1051 · đường xám = vốn gốc. Tab Lịch sử mới tính cả sổ cũ.
+    </p>
+    <div class="chart-wrap">
+      <canvas id="equityChart"></canvas>
+      <div id="equityEmpty" class="chart-empty" hidden>Chưa có dữ liệu equity.</div>
+    </div>
+  </div>
 
   <p class="meta">Cycle gần nhất: {{ last_cycle_at | vn_time }}</p>
 
@@ -131,12 +160,12 @@
     <div class="summary-card">
       <div class="label">Đã rút → Spot</div>
       <div id="totalSkimmed" class="value green">
-        {% set skim_tot = spot_transfer.total_skimmed if spot_transfer else 0 %}
+        {% set skim_tot = spot_transfer.withdrawn_gross if spot_transfer else 0 %}
         {{ "%.2f"|format(skim_tot or 0) }}
       </div>
       <div class="label" id="skimCountMeta" style="margin-top:4px;">
-        {% set skim_n = spot_transfer.skim_count if spot_transfer else 0 %}
-        {{ skim_n or 0 }} lần success
+        {% set skim_n = (spot_transfer.months|length) if spot_transfer and spot_transfer.months else 0 %}
+        {{ skim_n or 0 }} tháng
       </div>
     </div>
     {% set cs = spot_transfer.capital_safety if spot_transfer else none %}
@@ -152,7 +181,7 @@
           vốn {{ "%.0f"|format(cs.principal) }}
           ({{ "%+.0f"|format(cs.vs_principal or 0) }})
         {% else %}
-          equity + rút spot
+          futures + skim bot − nạp/rút tay
         {% endif %}
       </div>
     </div>
@@ -162,15 +191,16 @@
   {% if cs2 and cs2.principal is not none %}
   <p class="meta" id="capitalSafetyLine" style="margin-top:10px;">
     An toàn vốn:
-    futures <span id="csFutures">{{ "%.2f"|format(cs2.futures_equity or 0) }}</span>
-    + rút spot <span id="csSkim">{{ "%.2f"|format(cs2.total_skimmed or 0) }}</span>
+    <span id="csLead">futures</span> <span id="csFutures">{{ "%.2f"|format(cs2.futures_equity or 0) }}</span>
+    <span id="csMid">+ skim từ mốc</span> <span id="csSkim">{{ "%.2f"|format(cs2.total_skimmed or 0) }}</span>
+    <span id="csManualWrap" hidden>− nạp/rút tay <span id="csManual">{{ "%.2f"|format(cs2.manual_excluded or 0) }}</span></span>
     = <strong id="csTotal" class="{% if cs2.above_principal %}green{% else %}red{% endif %}">{{ "%.2f"|format(cs2.total_wealth or 0) }}</strong>
     {% if cs2.above_principal %}
       <span class="green" id="csVerdict">≥ vốn gốc {{ "%.2f"|format(cs2.principal) }} (ổn)</span>
     {% else %}
       <span class="red" id="csVerdict">&lt; vốn gốc {{ "%.2f"|format(cs2.principal) }} (dưới vốn)</span>
     {% endif %}
-    <span class="meta" id="csPrincipalNote"> · vốn gốc theo dõi nạp/rút tay futures</span>
+    <span class="meta" id="csPrincipalNote"> · so với vốn gốc 1051</span>
   </p>
   {% else %}
   <p class="meta" id="capitalSafetyLine" style="margin-top:10px;" hidden></p>
@@ -208,6 +238,31 @@
         </tbody>
       </table>
     </div>
+  </div>
+
+  <div class="panel" id="ruleReportPanel">
+    <h2 style="margin-top:0;">Lệnh quy tắc ngược</h2>
+    <p class="meta" style="margin-top:0;" id="ruleReportMeta">
+      Mở thêm một lệnh chiều ngược trên cùng coin khi lệnh đang mở đã lỗ ít nhất 6 giờ và có tín hiệu Config A chiều kia. Lệnh cũ vẫn chốt tại band.
+    </p>
+    <div class="table-wrap">
+      <table id="ruleReportTable">
+        <thead>
+          <tr>
+            <th></th>
+            <th>Đã đóng</th>
+            <th>Win rate</th>
+            <th>Profit factor</th>
+            <th>PnL đóng</th>
+            <th>Đang mở</th>
+          </tr>
+        </thead>
+        <tbody id="ruleReportBody">
+          <tr><td colspan="6" class="empty">Chưa có lệnh theo quy tắc ngược.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="ruleReportRecent" class="meta" style="margin-top:8px;"></div>
   </div>
 
   <div class="panel">
@@ -251,6 +306,7 @@
             <span class="pill">Vĩnh cửu</span>
             <span class="pill">{{ t.margin_mode }}</span>
               <span class="pill">{{ t.trend_label or t.zone_label }}</span>
+              {% if t.entry_rule_label %}<span class="pill rule">{{ t.entry_rule_label }}</span>{% endif %}
           </div>
           <span class="pos-status">{{ t.status_label }}</span>
         </div>
@@ -305,6 +361,7 @@
             <span class="pill">Vĩnh cửu</span>
             <span class="pill">{{ t.margin_mode }}</span>
             <span class="pill">{{ t.zone_label }}</span>
+            {% if t.entry_rule_label %}<span class="pill rule">{{ t.entry_rule_label }}</span>{% endif %}
           </div>
           <span class="pos-status">{{ t.status_label }}</span>
         </div>
@@ -347,84 +404,81 @@
     <div class="pager" id="closedPager"></div>
   </div>
 
-  <div class="panel">
-    <div class="chart-header">
-      <h2 style="margin: 0;">Equity</h2>
-      <div class="controls" style="margin: 0;">
-        <button type="button" class="range-btn" data-range="24h">24h</button>
-        <button type="button" class="range-btn active" data-range="7d">7 ngày</button>
-        <button type="button" class="range-btn" data-range="30d">30 ngày</button>
-      </div>
-    </div>
-    <div class="chart-wrap">
-      <canvas id="equityChart"></canvas>
-      <div id="equityEmpty" class="chart-empty" hidden>Chưa có dữ liệu equity.</div>
-    </div>
-  </div>
-
-  <div class="panel">
-    <h2 style="margin-top:0;">Futures → Spot (hàng ngày 07:00 +07)</h2>
-    {% set st = spot_transfer.status if spot_transfer else none %}
-    <p class="meta" style="margin-top:0;" id="spotStatusMeta">
-      mode={{ st.mode if st else "—" }}
-      · skim={% if st and st.skim is not none %}{{ "%.0f"|format(st.skim * 100) }}{% else %}—{% endif %}%
-      · cap={{ "%.1f"|format(st.day_cap_pct) if st and st.day_cap_pct is not none else "—" }}%/ngày
-      · pause DD≥{{ "%.0f"|format(st.dd_pause_pct) if st and st.dd_pause_pct is not none else "—" }}%
-      · SOD={{ "%.2f"|format(st.sod_equity) if st and st.sod_equity is not none else "—" }}
-      · peak={{ "%.2f"|format(st.peak_equity) if st and st.peak_equity is not none else "—" }}
-      · hôm nay: {{ st.latest_status or "chưa chạy" }}{% if st and st.latest_reason %} — {{ st.latest_reason }}{% endif %}
+  <div class="panel" id="monthWithdrawPanel">
+    <h2 style="margin-top:0;">Rút futures → spot cuối tháng</h2>
+    {% set pv = spot_transfer.preview if spot_transfer else none %}
+    <p class="meta" style="margin-top:0;" id="monthWithdrawRule">
+      Cuối tháng rút hết lãi, không quá 8% equity đầu tháng. Chạy 07:00 +07 ngày 1.
     </p>
-    <p class="meta" style="margin:0 0 8px;" id="spotSkimTotalMeta">
-      Tổng đã rút về spot:
-      <strong class="green" id="spotSkimTotalValue">
-        {{ "%.2f"|format((spot_transfer.total_skimmed if spot_transfer else 0) or 0) }}
-      </strong>
-      USDT
-      · <span id="spotSkimCountValue">{{ (spot_transfer.skim_count if spot_transfer else 0) or 0 }}</span> lần success
-      (toàn bộ lịch sử bot)
+    <p class="meta" style="margin:0 0 8px;" id="monthWithdrawPreview">
+      {% if pv and pv.month_start is not none %}
+        Mốc đầu tháng {{ pv.month_start_ym or "—" }}: <strong>{{ "%.2f"|format(pv.month_start) }}</strong>
+        · equity {{ "%.2f"|format(pv.equity or 0) }}
+        · lãi tháng {{ "%+.2f"|format(pv.month_pnl or 0) }}
+        · trần {{ "%.2f"|format(pv.cap_amount or 0) }}
+        · dự kiến rút <strong class="green">{{ "%.2f"|format(pv.amount or 0) }}</strong> USDT
+        · vào <strong>{{ pv.when or "—" }}</strong>
+      {% else %}
+        Chưa có mốc đầu tháng hoặc equity.
+      {% endif %}
     </p>
-    <p class="meta" style="margin:0 0 8px;">Lịch sử từ hôm nay (+07)</p>
+    <p class="meta" style="margin:0 0 8px;">Tháng đã rút</p>
     <div class="table-wrap">
-      <table id="spotTransferTable">
+      <table id="monthWithdrawTable">
         <thead>
           <tr>
-            <th>Ngày</th>
-            <th>Status</th>
-            <th>Amount</th>
-            <th>Day PnL</th>
-            <th>DD%</th>
-            <th>Lý do</th>
+            <th>Tháng</th>
+            <th>Đã rút (USDT)</th>
+            <th>Số lần</th>
+            <th>Lần cuối</th>
           </tr>
         </thead>
-        <tbody id="spotTransferBody">
-          {% for r in (spot_transfer.rows if spot_transfer else []) %}
+        <tbody id="monthWithdrawBody">
+          {% for r in (spot_transfer.months if spot_transfer else []) %}
           <tr>
-            <td>{{ r.date }}</td>
-            <td>{{ r.status }}</td>
-            <td>{{ "%.2f"|format(r.amount) }}</td>
-            <td class="{% if r.day_pnl is not none and r.day_pnl >= 0 %}green{% elif r.day_pnl is not none %}red{% endif %}">
-              {% if r.day_pnl is not none %}{{ "%+.2f"|format(r.day_pnl) }}{% else %}—{% endif %}
-            </td>
-            <td>{% if r.dd_pct is not none %}{{ "%.1f"|format(r.dd_pct) }}{% else %}—{% endif %}</td>
-            <td style="white-space:normal;max-width:420px;">{{ r.detail or r.reason or "—" }}</td>
+            <td>{{ r.month }}</td>
+            <td class="green">{{ "%.2f"|format(r.amount) }}</td>
+            <td>{{ r.n }}</td>
+            <td>{{ r.last_date }}</td>
           </tr>
           {% else %}
-          <tr><td colspan="6" class="empty">Chưa có lịch sử chuyển tiền hôm nay.</td></tr>
+          <tr><td colspan="4" class="empty">Chưa có tháng nào rút về spot.</td></tr>
           {% endfor %}
         </tbody>
       </table>
     </div>
-    <div class="pager" id="spotTransferPager"></div>
   </div>
 
   <script>
     let equityChart = null;
-    let equityRange = '7d';
+    let equityRange = '30d';
+    let book = 'fresh';
     let openPage = 1;
     let closedPage = 1;
     let spotPage = 1;
     const pageSize = 50;
     const spotPageSize = 20;
+
+    function bookQuery(url) {
+      return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'book=' + book;
+    }
+
+    function setBook(next) {
+      book = next === 'history' ? 'history' : 'fresh';
+      document.getElementById('tabFresh').classList.toggle('active', book === 'fresh');
+      document.getElementById('tabHistory').classList.toggle('active', book === 'history');
+      const note = document.getElementById('bookTabNote');
+      if (note) {
+        note.textContent = book === 'fresh'
+          ? 'Số liệu từ lúc chốt mốc 1051. Tab Lịch sử giữ toàn bộ sổ cũ để tham khảo.'
+          : 'Toàn bộ sổ cũ, kể cả nạp rút tay đã loại khỏi lãi. Mở khi cần đối chiếu.';
+      }
+      openPage = 1;
+      closedPage = 1;
+      refreshTables();
+      refreshStatus();
+      loadEquityChart(equityRange);
+    }
 
     function pnlClass(v) {
       return (v || 0) >= 0 ? 'green' : 'red';
@@ -512,6 +566,7 @@
               <span class="pill">Vĩnh cửu</span>
               <span class="pill">${t.margin_mode || ''}</span>
               <span class="pill">${t.trend_label || t.zone_label || t.zone || ''}</span>
+              ${t.entry_rule_label ? `<span class="pill rule">${t.entry_rule_label}</span>` : ''}
             </div>
             <span class="pos-status">${t.status_label || (kind === 'open' ? 'Đang mở' : 'Đã đóng')}</span>
           </div>
@@ -531,6 +586,57 @@
       const buttons = el.querySelectorAll('button');
       buttons[0].addEventListener('click', onPrev);
       buttons[1].addEventListener('click', onNext);
+    }
+
+    function fmtPf(pf) {
+      if (pf === null || pf === undefined || Number.isNaN(Number(pf))) return '—';
+      return Number(pf).toFixed(2);
+    }
+
+    function ruleRow(label, block, openNote) {
+      const b = block || {};
+      const n = b.n || 0;
+      if (!n && !openNote) {
+        return '';
+      }
+      return `<tr>
+        <td>${label}</td>
+        <td>${n}</td>
+        <td>${n ? Number(b.wr || 0).toFixed(1) + '%' : '—'}</td>
+        <td>${fmtPf(b.pf)}</td>
+        <td class="${pnlClass(b.pnl || 0)}">${n ? fmtPnl(b.pnl || 0) : '—'}</td>
+        <td>${openNote || '—'}</td>
+      </tr>`;
+    }
+
+    function renderRuleReport(report) {
+      const body = document.getElementById('ruleReportBody');
+      const recent = document.getElementById('ruleReportRecent');
+      if (!body) return;
+      const stale = (report && report.stale) || {};
+      const standard = (report && report.standard) || {};
+      const openNote = (stale.open_n || 0)
+        ? `${stale.open_n} · uPnL ${fmtPnl(stale.open_upnl || 0)}`
+        : '0';
+      const rows = [
+        ruleRow('Quy tắc ngược', stale, openNote),
+        ruleRow('Lệnh thường', standard, '—'),
+      ].filter(Boolean);
+      body.innerHTML = rows.length
+        ? rows.join('')
+        : '<tr><td colspan="6" class="empty">Chưa có lệnh theo quy tắc ngược.</td></tr>';
+      const items = (report && report.recent) || [];
+      if (!recent) return;
+      if (!items.length) {
+        recent.textContent = '';
+        return;
+      }
+      recent.innerHTML = items.map(t => {
+        const side = (t.side || '').toUpperCase();
+        const pnl = t.pnl === null || t.pnl === undefined ? '—' : fmtPnl(t.pnl);
+        const st = t.status === 'open' ? 'đang mở' : 'đã đóng';
+        return `${t.opened_at || '—'} ${t.symbol} ${side} ${st} ${pnl}`;
+      }).join('<br>');
     }
 
     function renderOpen(trades) {
@@ -555,83 +661,50 @@
       list.innerHTML = trades.map(t => tradeCard(t, 'closed')).join('');
     }
 
-    function renderSpotTransfers(data) {
-      const tbody = document.getElementById('spotTransferBody');
-      const pager = document.getElementById('spotTransferPager');
-      if (!tbody) return;
-      const rows = (data && data.rows) || [];
-      if (!rows.length) {
-        tbody.innerHTML = '<tr><td colspan="6" class="empty">Chưa có lịch sử chuyển tiền hôm nay.</td></tr>';
-      } else {
-        tbody.innerHTML = rows.map(r => {
-          const pnl = r.day_pnl;
-          const pnlCls = (pnl === null || pnl === undefined) ? '' : pnlClass(pnl);
-          const pnlTxt = (pnl === null || pnl === undefined) ? '—' : ((pnl >= 0 ? '+' : '') + Number(pnl).toFixed(2));
-          const dd = (r.dd_pct === null || r.dd_pct === undefined) ? '—' : Number(r.dd_pct).toFixed(1);
-          const detail = (r.detail || r.reason || '—').replace(/</g, '&lt;');
-          return `<tr>
-            <td>${r.date || '—'}</td>
-            <td>${r.status || '—'}</td>
-            <td>${Number(r.amount || 0).toFixed(2)}</td>
-            <td class="${pnlCls}">${pnlTxt}</td>
-            <td>${dd}</td>
-            <td style="white-space:normal;max-width:420px;">${detail}</td>
-          </tr>`;
-        }).join('');
+    function renderMonthWithdraw(data) {
+      const preview = document.getElementById('monthWithdrawPreview');
+      const tbody = document.getElementById('monthWithdrawBody');
+      const pv = (data && data.preview) || {};
+      if (preview) {
+        if (pv.month_start == null) {
+          preview.textContent = 'Chưa có mốc đầu tháng hoặc equity.';
+        } else {
+          const pnl = Number(pv.month_pnl || 0);
+          preview.innerHTML =
+            'Mốc đầu tháng ' + (pv.month_start_ym || '—') + ': <strong>' + Number(pv.month_start).toFixed(2) + '</strong>' +
+            ' · equity ' + Number(pv.equity || 0).toFixed(2) +
+            ' · lãi tháng ' + (pnl >= 0 ? '+' : '') + pnl.toFixed(2) +
+            ' · trần ' + Number(pv.cap_amount || 0).toFixed(2) +
+            ' · dự kiến rút <strong class="green">' + Number(pv.amount || 0).toFixed(2) + '</strong> USDT' +
+            ' · vào <strong>' + (pv.when || '—') + '</strong>';
+        }
       }
-      const page = (data && data.page) || 1;
-      const pages = (data && data.pages) || 1;
-      const total = (data && data.total) || 0;
-      renderPager(
-        pager,
-        page, pages, total,
-        () => { if (spotPage > 1) { spotPage -= 1; refreshSpotTransfers(); } },
-        () => { if (spotPage < pages) { spotPage += 1; refreshSpotTransfers(); } },
-        'bản ghi (từ hôm nay)',
-      );
+      if (!tbody) return;
+      const months = (data && data.months) || [];
+      if (!months.length) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">Chưa có tháng nào rút về spot.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = months.map(r => `<tr>
+        <td>${r.month || '—'}</td>
+        <td class="green">${Number(r.amount || 0).toFixed(2)}</td>
+        <td>${r.n || 0}</td>
+        <td>${r.last_date || '—'}</td>
+      </tr>`).join('');
     }
 
     async function refreshSpotTransfers() {
       try {
-        const res = await fetch(
-          '/api/spot-transfers?page=' + spotPage + '&page_size=' + spotPageSize
-        );
+        const res = await fetch(bookQuery('/api/spot-transfers?page=1&page_size=20'));
         if (!res.ok) return;
         const data = await res.json();
-        renderSpotTransfers(data);
-        const meta = document.getElementById('spotStatusMeta');
-        const st = data.status || {};
-        if (meta && st) {
-          const skim = st.skim != null ? (st.skim * 100).toFixed(0) : '—';
-          const cap = st.day_cap_pct != null ? Number(st.day_cap_pct).toFixed(1) : '—';
-          const ddPause = st.dd_pause_pct != null ? Number(st.dd_pause_pct).toFixed(0) : '—';
-          const sod = st.sod_equity != null ? Number(st.sod_equity).toFixed(2) : '—';
-          const peak = st.peak_equity != null ? Number(st.peak_equity).toFixed(2) : '—';
-          let today = st.latest_status || 'chưa chạy';
-          if (st.latest_reason) today += ' — ' + st.latest_reason;
-          meta.textContent =
-            'mode=' + (st.mode || '—') +
-            ' · skim=' + skim + '%' +
-            ' · cap=' + cap + '%/ngày' +
-            ' · pause DD≥' + ddPause + '%' +
-            ' · SOD=' + sod +
-            ' · peak=' + peak +
-            ' · hôm nay: ' + today;
-        }
-        const totalSkimmed = (data.total_skimmed != null)
-          ? Number(data.total_skimmed)
-          : Number(st.total_skimmed || 0);
-        const skimCount = (data.skim_count != null)
-          ? Number(data.skim_count)
-          : Number(st.skim_count || 0);
-        const totEl = document.getElementById('spotSkimTotalValue');
-        const cntEl = document.getElementById('spotSkimCountValue');
+        renderMonthWithdraw(data);
+        const totalSkimmed = Number(data.withdrawn_gross || 0);
+        const skimCount = ((data.months) || []).length;
         const cardEl = document.getElementById('totalSkimmed');
         const cardMeta = document.getElementById('skimCountMeta');
-        if (totEl) totEl.textContent = totalSkimmed.toFixed(2);
-        if (cntEl) cntEl.textContent = String(skimCount);
         if (cardEl) cardEl.textContent = totalSkimmed.toFixed(2);
-        if (cardMeta) cardMeta.textContent = skimCount + ' lần success';
+        if (cardMeta) cardMeta.textContent = skimCount + ' tháng';
         updateCapitalSafety(data.capital_safety || {});
       } catch (_) {}
     }
@@ -661,8 +734,28 @@
         const s = document.getElementById('csSkim');
         const t = document.getElementById('csTotal');
         const v = document.getElementById('csVerdict');
-        if (f) f.textContent = Number(cs.futures_equity || 0).toFixed(2);
-        if (s) s.textContent = Number(cs.total_skimmed || 0).toFixed(2);
+        const lead = document.getElementById('csLead');
+        const mid = document.getElementById('csMid');
+        const manualWrap = document.getElementById('csManualWrap');
+        const note = document.getElementById('csPrincipalNote');
+        const fresh = cs.book === 'fresh';
+        if (fresh) {
+          if (lead) lead.textContent = 'futures';
+          if (f) f.textContent = Number(cs.futures_equity || 0).toFixed(2);
+          if (mid) mid.textContent = '+ skim từ mốc';
+          if (s) s.textContent = Number(cs.total_skimmed || 0).toFixed(2);
+          if (manualWrap) manualWrap.hidden = true;
+          if (note) note.textContent = ' · so với vốn gốc 1051';
+        } else {
+          if (lead) lead.textContent = 'futures';
+          if (f) f.textContent = Number(cs.futures_equity || 0).toFixed(2);
+          if (mid) mid.textContent = '+ skim còn';
+          if (s) s.textContent = Number(cs.total_skimmed || 0).toFixed(2);
+          if (manualWrap) manualWrap.hidden = false;
+          const m = document.getElementById('csManual');
+          if (m) m.textContent = Number(cs.manual_excluded || 0).toFixed(2);
+          if (note) note.textContent = ' · futures + skim còn − nạp/rút tay';
+        }
         if (t) {
           t.textContent = wealth.toFixed(2);
           t.className = above ? 'green' : 'red';
@@ -693,7 +786,7 @@
     }
 
     async function loadTrades(status, page) {
-      const res = await fetch('/api/donchian/trades?status=' + status + '&page=' + page + '&page_size=' + pageSize);
+      const res = await fetch(bookQuery('/api/donchian/trades?status=' + status + '&page=' + page + '&page_size=' + pageSize));
       if (!res.ok) return null;
       return await res.json();
     }
@@ -702,7 +795,7 @@
       const [openData, closedData, dailyData] = await Promise.all([
         loadTrades('open', openPage),
         loadTrades('closed', closedPage),
-        fetch('/api/donchian/daily?days=30').then(r => r.ok ? r.json() : null),
+        fetch(bookQuery('/api/donchian/daily?days=30')).then(r => r.ok ? r.json() : null),
       ]);
       refreshSpotTransfers();
       if (openData) {
@@ -722,6 +815,7 @@
         const r = document.getElementById('realPnl');
         r.textContent = fmtPnl(openData.summary.closed_realized);
         r.className = 'value ' + pnlClass(openData.summary.closed_realized);
+        if (openData.rule_report) renderRuleReport(openData.rule_report);
       }
       if (closedData) {
         renderClosed(closedData.trades || []);
@@ -736,7 +830,7 @@
     }
 
     async function refreshDaily() {
-      const res = await fetch('/api/donchian/daily?days=30');
+      const res = await fetch(bookQuery('/api/donchian/daily?days=30'));
       if (res.ok) {
         const data = await res.json();
         if (data.rows) renderDaily(data.rows);
@@ -745,7 +839,7 @@
 
     async function refreshStatus() {
       try {
-        const res = await fetch('/api/status');
+        const res = await fetch(bookQuery('/api/status'));
         if (!res.ok) return;
         const data = await res.json();
         const pill = document.getElementById('tradingPill');
@@ -758,6 +852,15 @@
         } else {
           rl.hidden = true;
         }
+        const acct = data.account || {};
+        const availEl = document.getElementById('balAvailable');
+        const eqEl = document.getElementById('balEquity');
+        const maintEl = document.getElementById('balMaint');
+        const initEl = document.getElementById('balInitial');
+        if (availEl && acct.available != null) availEl.textContent = Number(acct.available).toFixed(2);
+        if (eqEl && acct.equity != null) eqEl.textContent = Number(acct.equity).toFixed(2);
+        if (maintEl) maintEl.textContent = acct.maint_margin_pct == null ? '—' : Number(acct.maint_margin_pct).toFixed(2);
+        if (initEl) initEl.textContent = acct.initial_margin_pct == null ? '—' : Number(acct.initial_margin_pct).toFixed(2);
         if (data.spot_transfer && data.spot_transfer.capital_safety) {
           updateCapitalSafety(data.spot_transfer.capital_safety);
         }
@@ -800,15 +903,17 @@
 
     async function loadEquityChart(range) {
       equityRange = range;
-      document.querySelectorAll('.range-btn').forEach(btn => {
+      document.querySelectorAll('.range-btn[data-range]').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.range === range);
       });
-      const res = await fetch('/api/equity-history?range=' + encodeURIComponent(range));
+      const res = await fetch(bookQuery('/api/wealth-daily?range=' + encodeURIComponent(range)));
       if (!res.ok) return;
       const data = await res.json();
       const canvas = document.getElementById('equityChart');
       const empty = document.getElementById('equityEmpty');
-      if (!data.points || !data.points.length) {
+      const meta = document.getElementById('wealthChartMeta');
+      const daily = data.daily || [];
+      if (!daily.length) {
         canvas.hidden = true;
         empty.hidden = false;
         if (equityChart) { equityChart.destroy(); equityChart = null; }
@@ -816,20 +921,50 @@
       }
       canvas.hidden = false;
       empty.hidden = true;
-      const labels = data.points.map(p => p.time_vn);
-      const equity = data.points.map(p => p.equity);
-      const datasets = [{
-        label: 'Equity',
-        data: equity,
-        borderColor: '#58a6ff',
-        backgroundColor: 'rgba(88,166,255,0.1)',
-        fill: true,
-        tension: 0.2,
-        pointRadius: 0,
-      }];
+      const labels = daily.map(p => p.date);
+      const futures = daily.map(p => p.futures);
+      const totals = daily.map(p => p.total);
+      const last = daily[daily.length - 1];
+      const first = daily[0];
+      if (meta && last && first) {
+        const dFut = (last.futures - (last.manual_cum || 0)) - (first.futures - (first.manual_cum || 0));
+        const dTot = last.total - first.total;
+        const manualIn = (last.manual_cum || 0) - (first.manual_cum || 0);
+        const head = book === 'fresh' ? 'Từ mốc 1051 · ' : '';
+        meta.textContent = head + 'Futures '
+          + last.futures.toFixed(2)
+          + ' (giao dịch ' + (dFut >= 0 ? '+' : '') + dFut.toFixed(2)
+          + (book === 'history' && manualIn ? ', không tính nạp/rút tay ' + manualIn.toFixed(2) : '')
+          + ')'
+          + ' · Total '
+          + last.total.toFixed(2)
+          + ' (' + (dTot >= 0 ? '+' : '') + dTot.toFixed(2) + ')'
+          + (book === 'history' ? ' · skim còn ' + (last.skim_cum || 0).toFixed(2) : '')
+          + ' · đường xám = vốn gốc';
+      }
+      const datasets = [
+        {
+          label: 'Futures',
+          data: futures,
+          borderColor: '#58a6ff',
+          backgroundColor: 'rgba(88,166,255,0.08)',
+          fill: false,
+          tension: 0.15,
+          pointRadius: 2,
+        },
+        {
+          label: 'Total (fut + spot)',
+          data: totals,
+          borderColor: '#3fb950',
+          backgroundColor: 'rgba(63,185,80,0.08)',
+          fill: false,
+          tension: 0.15,
+          pointRadius: 2,
+        },
+      ];
       if (data.baseline_equity != null) {
         datasets.push({
-          label: 'Baseline',
+          label: 'Vốn gốc',
           data: labels.map(() => data.baseline_equity),
           borderColor: '#8b949e',
           borderDash: [6, 4],
@@ -845,18 +980,21 @@
           maintainAspectRatio: false,
           plugins: { legend: { labels: { color: '#e6edf3' } } },
           scales: {
-            x: { ticks: { color: '#8b949e', maxTicksLimit: 8 } },
+            x: { ticks: { color: '#8b949e', maxTicksLimit: 10 } },
             y: { ticks: { color: '#8b949e' } },
           },
         },
       });
     }
 
-    document.querySelectorAll('.range-btn').forEach(btn => {
+    document.querySelectorAll('.range-btn[data-range]').forEach(btn => {
       btn.addEventListener('click', () => loadEquityChart(btn.dataset.range));
     });
+    document.querySelectorAll('.book-tab').forEach(btn => {
+      btn.addEventListener('click', () => setBook(btn.dataset.book));
+    });
 
-    loadEquityChart('7d');
+    loadEquityChart('30d');
     refreshStatus();
     refreshTables();
     setInterval(refreshStatus, 15000);

@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ exchange_name }} {{ bot_title }}</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #0f1117; color: #e6edf3; }
+    h1 { margin: 0 0 4px; font-size: 22px; }
+    h2 { font-size: 16px; margin: 0 0 12px; }
+    a { color: #58a6ff; }
+    .meta { color: #8b949e; font-size: 13px; margin: 4px 0 12px; }
+    .green { color: #3fb950; }
+    .red { color: #f85149; }
+    .controls { display: flex; align-items: center; gap: 10px; margin: 12px 0 16px; flex-wrap: wrap; }
+    .status-pill { border: 1px solid #30363d; border-radius: 999px; padding: 4px 10px; font-size: 12px; }
+    .status-pill.running { color: #3fb950; }
+    .status-pill.stopped { color: #f85149; }
+    .status-pill.warn { color: #d29922; border-color: #9e6a03; }
+    form { margin: 0; }
+    button { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 7px 12px; cursor: pointer; }
+    .panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+    .summary-card { background: #0f1117; border: 1px solid #30363d; border-radius: 8px; padding: 12px; }
+    .summary-card .label { color: #8b949e; font-size: 12px; }
+    .summary-card .value { font-size: 18px; margin-top: 4px; }
+    .summary-card .sub { color: #8b949e; font-size: 12px; margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #30363d; text-align: left; white-space: nowrap; }
+    th { color: #8b949e; font-size: 11px; text-transform: uppercase; }
+    .table-wrap { overflow-x: auto; }
+    .side { font-size: 12px; font-weight: 700; padding: 2px 7px; border-radius: 4px; color: #fff; }
+    .side.long { background: #238636; }
+    .side.short { background: #da3633; }
+  </style>
+</head>
+<body>
+  <h1>{{ exchange_name }} {{ bot_title }}</h1>
+  <p class="meta">Vốn chung · 10% equity mỗi lệnh · đòn bẩy 10 · một lệnh mỗi coin. Tham khảo Donchian: <a href="/donchian">/donchian</a> · <a href="/legacy">/legacy</a></p>
+
+  <div class="controls">
+    <span id="tradingPill" class="status-pill"></span>
+    <span id="ratePill" class="status-pill warn" hidden></span>
+    <form method="post" action="/settings/trading/start"><button type="submit">Bật trading</button></form>
+    <form method="post" action="/settings/trading/stop"><button type="submit">Tắt trading</button></form>
+    <form method="post" action="/logout"><button type="submit">Đăng xuất</button></form>
+    <span class="meta" style="margin:0;">Cập nhật <span id="refreshedAt"></span></span>
+  </div>
+
+  <div class="panel">
+    <h2>Tổng sổ</h2>
+    <div class="summary-grid" id="summary"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Theo coin</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Coin</th><th>Lệnh đã đóng</th><th>Thắng</th><th>Winrate</th>
+            <th>Lợi nhuận đã chốt</th><th>Đang mở</th><th>Đang chờ</th><th>Tạm tính</th>
+          </tr>
+        </thead>
+        <tbody id="coins"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Lệnh đang mở và đang chờ</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Coin</th><th>Chiều</th><th>Trạng thái</th><th>Giá vào</th>
+            <th>Cắt lỗ</th><th>Chốt</th><th>Tạm tính</th>
+          </tr>
+        </thead>
+        <tbody id="live"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Lệnh gần nhất</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Coin</th><th>Chiều</th><th>Trạng thái</th><th>Vào</th><th>Đóng</th><th>PnL</th><th>Lý do</th>
+          </tr>
+        </thead>
+        <tbody id="recent"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const money = (n) => {
+      if (n === null || n === undefined || Number.isNaN(Number(n))) return "—";
+      const v = Number(n);
+      const cls = v > 0 ? "green" : v < 0 ? "red" : "";
+      const sign = v > 0 ? "+" : "";
+      return `<span class="${cls}">${sign}${v.toFixed(2)}</span>`;
+    };
+    const pct = (n) => n === null || n === undefined ? "—" : `${Number(n).toFixed(1)}%`;
+    const px = (n) => n === null || n === undefined || n === "" ? "—" : Number(n).toPrecision(6);
+    const sideHtml = (s) => `<span class="side ${s}">${s === "long" ? "LONG" : "SHORT"}</span>`;
+    const reason = { tp: "Chốt giữa vùng", stop: "Cắt lỗ", expire: "Hết 16 nến", size: "Size bằng 0", place: "Không đặt được" };
+
+    function card(label, value, sub) {
+      return `<div class="summary-card"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub || ""}</div></div>`;
+    }
+
+    async function refresh() {
+      const res = await fetch("/api/smc/status");
+      if (!res.ok) return;
+      const data = await res.json();
+      const s = data.summary;
+      const pill = document.getElementById("tradingPill");
+      pill.textContent = data.trading_enabled ? "Trading bật" : "Trading tắt";
+      pill.className = "status-pill " + (data.trading_enabled ? "running" : "stopped");
+      const rate = document.getElementById("ratePill");
+      if (data.rate_limited) {
+        rate.hidden = false;
+        rate.textContent = `Rate limit ${Math.round(data.rate_limit_remaining_sec)}s`;
+      } else {
+        rate.hidden = true;
+      }
+      document.getElementById("refreshedAt").textContent = new Date().toLocaleTimeString("vi-VN");
+      document.getElementById("summary").innerHTML = [
+        card("Equity", money(data.account.equity), `Khả dụng ${Number(data.account.available || 0).toFixed(2)}`),
+        card("Tổng lãi lỗ", money(s.total), "Đã chốt + tạm tính"),
+        card("Đã chốt", money(s.realized), `${s.closed_n} lệnh`),
+        card("Tạm tính", money(s.unrealized), `${s.open_n} lệnh mở`),
+        card("Winrate", pct(s.win_rate), `${s.wins}/${s.closed_n} thắng`),
+        card("Profit factor", s.pf === null ? "—" : Number(s.pf).toFixed(2), "Lãi gộp / lỗ gộp"),
+        card("Đang chờ", String(s.pending_n), `${s.coins} coin trong sổ`),
+      ].join("");
+
+      document.getElementById("coins").innerHTML = data.coins.map((c) => `<tr>
+        <td>${c.symbol.replace("USDT","")}</td>
+        <td>${c.closed_n}</td>
+        <td>${c.wins}</td>
+        <td>${pct(c.win_rate)}</td>
+        <td>${money(c.pnl)}</td>
+        <td>${c.open_n}</td>
+        <td>${c.pending_n}</td>
+        <td>${money(c.upnl)}</td>
+      </tr>`).join("") || `<tr><td colspan="8">Chưa có coin</td></tr>`;
+
+      const live = [...data.open.map((r) => ({...r, kind: "Mở"})), ...data.pending.map((r) => ({...r, kind: "Chờ khớp", upnl: null}))];
+      document.getElementById("live").innerHTML = live.map((r) => `<tr>
+        <td>${r.symbol.replace("USDT","")}</td>
+        <td>${sideHtml(r.side)}</td>
+        <td>${r.kind}</td>
+        <td>${px(r.fill_px || r.entry_px)}</td>
+        <td>${px(r.stop_px)}</td>
+        <td>${px(r.tp_px)}</td>
+        <td>${r.upnl === null || r.upnl === undefined ? "—" : money(r.upnl)}</td>
+      </tr>`).join("") || `<tr><td colspan="7">Không có lệnh</td></tr>`;
+
+      document.getElementById("recent").innerHTML = data.recent.map((r) => `<tr>
+        <td>${r.symbol.replace("USDT","")}</td>
+        <td>${sideHtml(r.side)}</td>
+        <td>${r.status}</td>
+        <td>${px(r.fill_px || r.entry_px)}</td>
+        <td>${px(r.close_px)}</td>
+        <td>${r.pnl_usdt === null ? "—" : money(r.pnl_usdt)}</td>
+        <td>${reason[r.close_reason] || r.close_reason || "—"}</td>
+      </tr>`).join("") || `<tr><td colspan="7">Chưa có lệnh</td></tr>`;
+    }
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

@@ -75,6 +75,50 @@ def test_apply_manual_net_adjusts_sod_and_peak(tmp_path, monkeypatch):
     assert abs(db.get_baseline_equity() - 1050.0) < 1e-9
 
 
+def test_month_withdraw_caps_at_8_percent():
+    from src.spot_transfer import decide_month_withdraw
+
+    # profit 149 > 8% of 1051 = 84.08
+    d = decide_month_withdraw(month_start=1051, equity=1200, available=500, cap_pct=0.08)
+    assert d.reason == "transfer"
+    assert d.amount == 84.08
+
+
+def test_month_withdraw_takes_all_profit_under_cap():
+    from src.spot_transfer import decide_month_withdraw
+
+    d = decide_month_withdraw(month_start=1051, equity=1100, available=500, cap_pct=0.08)
+    assert d.reason == "transfer"
+    assert d.amount == 49.0
+
+
+def test_month_withdraw_skips_loss():
+    from src.spot_transfer import decide_month_withdraw
+
+    d = decide_month_withdraw(month_start=1051, equity=1000, available=500, cap_pct=0.08)
+    assert d.reason == "no_profit"
+    assert d.amount == 0.0
+
+
+def test_month_history_groups_by_month(tmp_path, monkeypatch):
+    import src.database as db
+
+    monkeypatch.setattr(db, "DATABASE_PATH", tmp_path / "t.db")
+    db.init_db()
+    db.insert_spot_transfer(transfer_date="2026-08-02", amount=10, status="success", reason="transfer")
+    db.insert_spot_transfer(transfer_date="2026-08-03", amount=5, status="success", reason="transfer")
+    db.insert_spot_transfer(transfer_date="2026-09-01", amount=20, status="success", reason="month_transfer")
+    db.insert_spot_transfer(transfer_date="2026-10-08", amount=15, status="success", reason="return_to_futures")
+    rows = db.list_spot_withdraw_months()
+    assert [(r["month"], round(r["amount"], 2)) for r in rows] == [
+        ("2026-09", 20.0),
+        ("2026-08", 15.0),
+    ]
+    total, count = db.sum_successful_spot_transfers()
+    assert round(total, 2) == 20.0
+    assert count == 3
+
+
 def test_deposit_then_decide_no_false_profit():
     """After SOD+=deposit, same equity rise should not look like trading profit."""
     d = decide_skim_withdraw(sod=1200, equity=1200, peak=1200, available=500)

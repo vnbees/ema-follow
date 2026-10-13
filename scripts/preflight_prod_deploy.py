@@ -158,7 +158,8 @@ def main() -> int:
         return 1
 
     print("\n=== PRE-FLIGHT PASSED ===")
-    print("Next: VPS_HOST=IP ./scripts/deploy_to_vps.sh")
+    print("Next: update code → ./scripts/deploy_code_only.sh check (docs/DEPLOY.md); "
+          "deploy_to_vps.sh chỉ cho VPS mới tinh")
     print("See docs/DEPLOY_RATE_LIMIT_CHECKLIST.md")
     return 0
 

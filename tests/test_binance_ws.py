@@ -13,7 +13,7 @@ from src.exchange.binance_ws.market_stream import (
     parse_mini_ticker_message,
 )
 from src.exchange.binance_ws.user_stream import apply_user_payload, parse_account_update, parse_order_trade_update
-from src.exchange.types import Candle, FuturesAccountBalance, Position
+from src.exchange.types import Candle, FuturesAccountBalance, PendingOrder, Position
 
 
 class TestMarketParsers(unittest.TestCase):
@@ -381,7 +381,7 @@ class TestVolumeRankFallback(unittest.TestCase):
 
 class TestUserDataParsers(unittest.TestCase):
     def test_account_update_positions(self) -> None:
-        updates, closed, balances = parse_account_update(
+        updates, closed, balances, changes = parse_account_update(
             {
                 "e": "ACCOUNT_UPDATE",
                 "a": {
@@ -394,6 +394,7 @@ class TestUserDataParsers(unittest.TestCase):
             }
         )
         self.assertEqual(balances["USDT"], 1000.0)
+        self.assertEqual(changes, {})
         self.assertEqual(len(updates), 1)
         self.assertEqual(updates[0].side, "long")
         self.assertEqual(closed, [("BTCUSDT", "short")])
@@ -488,12 +489,161 @@ class TestUserDataParsers(unittest.TestCase):
         bal = CACHE.get_balance()
         self.assertIsNotNone(bal)
         assert bal is not None
-        # UDS wb must not overwrite REST equity/available (wallet ≠ margin balance).
-        self.assertEqual(bal.available, 500)
-        self.assertEqual(bal.account_equity, 1000)
-        self.assertEqual(bal.usdt_equity, 1000)
+        # "wb" is the absolute wallet; equity = wallet + unrealized on the new lot.
+        self.assertAlmostEqual(bal.available, 400)
+        self.assertAlmostEqual(bal.account_equity, 900.5)
+        self.assertAlmostEqual(bal.usdt_equity, 900.5)
         self.assertEqual(bal.total_maint_margin, 10)
         self.assertEqual(bal.total_initial_margin, 20)
+
+    def test_transfer_moves_wallet_to_wb(self) -> None:
+        CACHE.set_positions([], {})
+        CACHE.set_balance(
+            FuturesAccountBalance(
+                margin_coin="USDT",
+                available=400,
+                account_equity=1000,
+                usdt_equity=1000,
+            )
+        )
+        apply_user_payload(
+            {
+                "e": "ACCOUNT_UPDATE",
+                "a": {
+                    "B": [{"a": "USDT", "wb": "1025", "bc": "25"}],
+                    "P": [],
+                },
+            }
+        )
+        bal = CACHE.get_balance()
+        assert bal is not None
+        self.assertAlmostEqual(bal.account_equity, 1025)
+        self.assertAlmostEqual(bal.available, 425)
+        self.assertAlmostEqual(float(bal.wallet_balance or 0), 1025)
+
+    def test_realized_loss_moves_wallet_even_without_bc(self) -> None:
+        CACHE.set_positions([], {})
+        CACHE.set_balance(
+            FuturesAccountBalance(
+                margin_coin="USDT",
+                available=757.64,
+                account_equity=994.40,
+                usdt_equity=994.40,
+                wallet_balance=1050.27,
+            )
+        )
+        apply_user_payload(
+            {
+                "e": "ACCOUNT_UPDATE",
+                "a": {
+                    "m": "ORDER",
+                    "B": [{"a": "USDT", "wb": "1018.35", "cw": "1018.35", "bc": "0"}],
+                    "P": [{"s": "DOTUSDT", "pa": "0", "ep": "0", "up": "0", "ps": "SHORT"}],
+                },
+            }
+        )
+        bal = CACHE.get_balance()
+        assert bal is not None
+        self.assertAlmostEqual(float(bal.wallet_balance or 0), 1018.35)
+        self.assertAlmostEqual(bal.account_equity, 1018.35)
+        self.assertAlmostEqual(bal.available, 757.64 - 31.92, places=6)
+
+
+class TestAvailableMargin(unittest.TestCase):
+    def tearDown(self) -> None:
+        CACHE.orders_synced = False
+        CACHE.pending_by_symbol.clear()
+        CACHE.all_positions.clear()
+        CACHE.positions_by_symbol.clear()
+        CACHE.marks.clear()
+
+    def test_resting_open_order_reduces_available(self) -> None:
+        CACHE.set_positions([], {})
+        CACHE.set_balance(
+            FuturesAccountBalance(
+                margin_coin="USDT",
+                available=710.57,
+                account_equity=949.64,
+                usdt_equity=949.64,
+                wallet_balance=949.64,
+            )
+        )
+        CACHE.set_mark("TRXUSDT", 0.33150)
+        CACHE.replace_pending_book(
+            {
+                "TRXUSDT": [
+                    PendingOrder(
+                        order_id="1",
+                        client_oid="",
+                        side="sell",
+                        price=0.33145,
+                        size=2866,
+                        position_side="short",
+                    )
+                ]
+            }
+        )
+        bal = CACHE.get_balance()
+        assert bal is not None
+        notional_margin = 2866 * 0.33145 / 10
+        open_loss = 2866 * (0.33150 - 0.33145)
+        self.assertAlmostEqual(bal.available, 949.64 - notional_margin - open_loss, places=4)
+        self.assertAlmostEqual(bal.account_equity, 949.64, places=4)
+
+    def test_closing_limit_does_not_lock_margin(self) -> None:
+        CACHE.set_positions([], {})
+        CACHE.set_balance(
+            FuturesAccountBalance(
+                margin_coin="USDT",
+                available=100,
+                account_equity=1000,
+                usdt_equity=1000,
+                wallet_balance=1000,
+            )
+        )
+        CACHE.replace_pending_book(
+            {
+                "DOTUSDT": [
+                    PendingOrder(
+                        order_id="2",
+                        client_oid="",
+                        side="buy",
+                        price=1.2,
+                        size=10,
+                        position_side="short",
+                    )
+                ]
+            }
+        )
+        bal = CACHE.get_balance()
+        assert bal is not None
+        self.assertAlmostEqual(bal.available, 1000)
+
+    def test_flat_position_releases_margin_once_book_is_known(self) -> None:
+        CACHE.set_positions([], {})
+        CACHE.set_balance(
+            FuturesAccountBalance(
+                margin_coin="USDT",
+                available=700,
+                account_equity=1000,
+                usdt_equity=1000,
+                wallet_balance=1000,
+            )
+        )
+        CACHE.replace_pending_book({})
+        apply_user_payload(
+            {
+                "e": "ACCOUNT_UPDATE",
+                "a": {
+                    "B": [{"a": "USDT", "wb": "1000", "bc": "0"}],
+                    "P": [{"s": "DOTUSDT", "pa": "0", "ep": "0", "up": "0", "ps": "SHORT"}],
+                },
+            }
+        )
+        bal = CACHE.get_balance()
+        assert bal is not None
+        self.assertAlmostEqual(bal.available, 1000)
+        self.assertAlmostEqual(bal.account_equity, 1000)
 
 
 class TestWsFetchFallback(unittest.TestCase):

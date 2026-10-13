@@ -257,18 +257,23 @@ REST_WEIGHT_HARD_MAX = int(os.getenv("REST_WEIGHT_HARD_MAX", "1800"))
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "1000"))
 
 SPOT_TRANSFER_ENABLED = os.getenv("SPOT_TRANSFER_ENABLED", "true").lower() in ("1", "true", "yes")
-# skim (default): green-day profit skim | pct/hwm: legacy modes retained for env compat
-_SPOT_TRANSFER_MODE_RAW = os.getenv("SPOT_TRANSFER_MODE", "skim").strip().lower()
+# month (default): cuối tháng rút hết lãi, trần % equity đầu tháng
+# skim / pct / hwm: legacy modes retained for env compat
+_SPOT_TRANSFER_MODE_RAW = os.getenv("SPOT_TRANSFER_MODE", "month").strip().lower()
 SPOT_TRANSFER_MODE = (
-    _SPOT_TRANSFER_MODE_RAW if _SPOT_TRANSFER_MODE_RAW in ("skim", "pct", "hwm") else "skim"
+    _SPOT_TRANSFER_MODE_RAW
+    if _SPOT_TRANSFER_MODE_RAW in ("month", "skim", "pct", "hwm")
+    else "month"
 )
 # Legacy pct mode: fixed % of equity / day
 SPOT_TRANSFER_PCT = float(os.getenv("SPOT_TRANSFER_PCT", "1"))
 SPOT_TRANSFER_HWM_SHARE = float(os.getenv("SPOT_TRANSFER_HWM_SHARE", "50"))
-# Skim mode (confirm live): rút = min(cash, day_pnl×skim, sod×day_cap); pause nếu DD≥pause
+# Skim mode (legacy): rút = min(cash, day_pnl×skim, sod×day_cap); pause nếu DD≥pause
 SPOT_TRANSFER_SKIM = float(os.getenv("SPOT_TRANSFER_SKIM", "0.4"))
 SPOT_TRANSFER_DAY_CAP_PCT = float(os.getenv("SPOT_TRANSFER_DAY_CAP_PCT", "1.5")) / 100.0
 SPOT_TRANSFER_DD_PAUSE_PCT = float(os.getenv("SPOT_TRANSFER_DD_PAUSE_PCT", "20")) / 100.0
+# Month mode: rút = min(lãi tháng, mốc đầu tháng × cap); không rút khi lỗ
+SPOT_TRANSFER_MONTH_CAP_PCT = float(os.getenv("SPOT_TRANSFER_MONTH_CAP_PCT", "8")) / 100.0
 SPOT_TRANSFER_EXECUTE_HHMM = os.getenv("SPOT_TRANSFER_EXECUTE_HHMM", "0700").strip()
 # Risk warnings (Discord + dashboard) — chỉ khi DD hoặc maint > 50%
 SPOT_WARN_DD_PCT = float(os.getenv("SPOT_WARN_DD_PCT", "50")) / 100.0

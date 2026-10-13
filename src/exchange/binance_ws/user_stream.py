@@ -12,7 +12,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from src.config import BINANCE_WS_USER_BASE
-from src.exchange.binance_ws.cache import CACHE
+from src.exchange.binance_ws.cache import CACHE, publish_live_equity
 from src.exchange.types import PendingOrder, Position
 
 ListenKeyFactory = Callable[[], str]
@@ -20,20 +20,29 @@ ListenKeyKeepalive = Callable[[str], None]
 ReconcileFn = Callable[[], None]
 
 
-def parse_account_update(payload: dict[str, Any]) -> tuple[list[Position], list[tuple[str, str]], dict[str, float]]:
-    """Return (updated positions, closed (symbol,side), balances {asset: wallet})."""
+def parse_account_update(
+    payload: dict[str, Any],
+) -> tuple[list[Position], list[tuple[str, str]], dict[str, float], dict[str, float]]:
+    """Return positions, closed pairs, wallet balances, and balance-change deltas."""
     account = payload.get("a") or {}
     balances: dict[str, float] = {}
+    changes: dict[str, float] = {}
     for row in account.get("B") or []:
         if not isinstance(row, dict):
             continue
         asset = str(row.get("a") or "").upper()
+        if not asset:
+            continue
         try:
-            wallet = float(row.get("wb") or 0)
+            balances[asset] = float(row.get("wb") or 0)
         except (TypeError, ValueError):
             continue
-        if asset:
-            balances[asset] = wallet
+        raw_bc = row.get("bc")
+        if raw_bc not in (None, ""):
+            try:
+                changes[asset] = float(raw_bc)
+            except (TypeError, ValueError):
+                pass
 
     updates: list[Position] = []
     closed: list[tuple[str, str]] = []
@@ -64,7 +73,7 @@ def parse_account_update(payload: dict[str, Any]) -> tuple[list[Position], list[
                 unrealized_pnl=upnl,
             )
         )
-    return updates, closed, balances
+    return updates, closed, balances, changes
 
 
 def parse_order_trade_update(payload: dict[str, Any]) -> tuple[dict | None, PendingOrder | None, bool]:
@@ -95,6 +104,11 @@ def parse_order_trade_update(payload: dict[str, Any]) -> tuple[dict | None, Pend
         "tradeId": trade_id,
         "commission": o.get("n"),
         "commissionAsset": o.get("N"),
+        "side": str(o.get("S") or "").lower(),
+        "positionSide": str(o.get("ps") or "").lower(),
+        "price": o.get("p"),
+        "origQty": o.get("q"),
+        "executedQty": o.get("z"),
     }
     order_type = str(o.get("o") or "").upper()
     symbol = str(o.get("s") or "").upper()
@@ -109,6 +123,7 @@ def parse_order_trade_update(payload: dict[str, Any]) -> tuple[dict | None, Pend
                 side=str(o.get("S") or "").lower(),
                 price=float(o.get("p") or 0),
                 size=float(o.get("q") or 0),
+                position_side=str(o.get("ps") or "").lower(),
             )
         except (TypeError, ValueError):
             pending = None
@@ -128,8 +143,17 @@ def apply_user_payload(payload: dict[str, Any]) -> None:
 
     CACHE.touch_user()
     if event == "ACCOUNT_UPDATE":
-        updates, closed, balances = parse_account_update(payload)
+        updates, closed, balances, changes = parse_account_update(payload)
         CACHE.apply_position_updates(updates, closed)
+        # "bc" excludes realized PnL and commission, so a TP fill never moves it; "wb" is the
+        # absolute wallet after the event.
+        if "USDT" in balances:
+            CACHE.set_wallet(balances["USDT"])
+        else:
+            delta = float(changes.get("USDT") or 0)
+            if delta:
+                CACHE.apply_wallet_delta(delta)
+        publish_live_equity(force=True)
         touched: set[str] = set()
         for pos in updates:
             touched.add(pos.symbol.upper())
@@ -149,10 +173,6 @@ def apply_user_payload(payload: dict[str, Any]) -> None:
                     on_position_flat(symbol, side)
             except Exception as exc:  # noqa: BLE001
                 logging.debug("RSI-rev position-flat hook skipped: %s", exc)
-        # ACCOUNT_UPDATE "wb" is wallet balance, NOT margin equity / available.
-        # Overwriting those fields skewed dashboard + equity snapshots. Keep the
-        # last REST-reconciled balance; positions above are still applied.
-        _ = balances
         try:
             from src.exchange.binance_ws.persist import save_account_snapshot
 
@@ -189,6 +209,18 @@ def apply_user_payload(payload: dict[str, Any]) -> None:
             on_tp_limit_order_update(detail)
         except Exception as exc:  # noqa: BLE001
             logging.debug("Donchian TP-limit hook skipped: %s", exc)
+        try:
+            from src.donchian.dual_limit import on_entry_order_update
+
+            on_entry_order_update(CACHE.get_order_detail(str((detail or {}).get("orderId") or "")) or detail)
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("Donchian dual-limit entry hook skipped: %s", exc)
+        try:
+            from src.smc.broker import on_order_update as smc_on_order
+
+            smc_on_order(detail)
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("SMC order-update hook skipped: %s", exc)
 
 
 class UserStream:

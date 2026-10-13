@@ -1,7 +1,10 @@
 # Checklist deploy — tránh Binance 418/429 (rate limit)
 
-Pre-flight script: `scripts/preflight_prod_deploy.py` — **phải exit 0** trước deploy.  
-Deploy VPS: `scripts/deploy_to_vps.sh` · Logic bot: [BOT_LOGIC.md](./BOT_LOGIC.md)
+> **Quy trình deploy chuẩn: [DEPLOY.md](./DEPLOY.md).** Cập nhật code PROD = `scripts/deploy_code_only.sh`.
+> `scripts/deploy_to_vps.sh` reset lot + ghi đè `bot.db`/`.env` PROD — chỉ dùng cho VPS mới tinh.
+
+Pre-flight script: `scripts/preflight_prod_deploy.py` — **phải exit 0** trước fresh install.  
+Logic bot: [BOT_LOGIC.md](./BOT_LOGIC.md)
 
 Dùng **trước / trong / sau** mỗi lần deploy PROD (VPS).  
 Mục tiêu: boot **một lần**, dùng **WS cache trên disk**, REST optional tối thiểu.
@@ -79,12 +82,16 @@ print(f'saved {len(positions)} positions')
 
 ## B. Deploy VPS — một lần
 
+**PROD đang chạy (có lot mở) → KHÔNG dùng mục này.** Dùng `scripts/deploy_code_only.sh` theo [DEPLOY.md](./DEPLOY.md).
+
+Chỉ cho VPS **mới tinh**, user đồng ý rõ ràng:
+
 ```bash
 export VPS_HOST=your.droplet.ip
-./scripts/deploy_to_vps.sh
+I_UNDERSTAND_THIS_WIPES_PROD=yes ./scripts/deploy_to_vps.sh
 ```
 
-Script tự làm: sync → pre-flight → tắt local → tar upload code + `data/` → systemd setup → restart.
+Script tự làm: **reset lot (RESET_FRESH)** → sync → pre-flight → tắt local → tar upload code + `data/` + `.env` local → systemd setup → restart.
 
 - [ ] **Whitelist IP VPS** trên Binance API key (futures + spot nếu dùng skim)
 - [ ] `.env` trên VPS có API keys (script upload cả repo kèm `.env` local)
@@ -123,7 +130,7 @@ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://$VPS_HOST:8080/
 
 1. **Stop VPS bot** ngay: `ssh root@$VPS_HOST 'systemctl stop bot-donchian'`
 2. Bật lại **local**, chạy thêm đến khi pre-flight pass
-3. Deploy lại **một lần** (`./scripts/deploy_to_vps.sh`)
+3. Deploy lại **một lần** (fresh install: mục B; PROD có lot: chỉ `systemctl start bot-donchian` sau khi cache đủ — xem [DEPLOY.md](./DEPLOY.md))
 
 ---
 
@@ -143,7 +150,8 @@ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://$VPS_HOST:8080/
 [ ] preflight_prod_deploy.py --strict-candles exit 0
 [ ] pytest -q pass
 [ ] Binance API whitelist IP VPS
-[ ] VPS_HOST set → ./scripts/deploy_to_vps.sh (1 lần)
+[ ] PROD có lot → ./scripts/deploy_code_only.sh check, rồi CONFIRM=yes ... deploy (1 lần)
+[ ] VPS mới tinh → I_UNDERSTAND_THIS_WIPES_PROD=yes ./scripts/deploy_to_vps.sh (1 lần)
 [ ] Log: candles_symbols≥18, listenKey reused, skip REST warmup hầu hết coin
 [ ] Log: KHÔNG rate limit / KHÔNG REST seed 20 coin / KHÔNG flat-on-exchange
 [ ] Dashboard positions khớp sàn

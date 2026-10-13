@@ -92,6 +92,7 @@ def _window_metrics(
     skim_total: float,
     principal: float,
     since: datetime | None,
+    manual_by_day: dict[str, float] | None = None,
 ) -> dict:
     """Metrics for all history (since=None) or from a cut timestamp onward."""
     if since is None:
@@ -127,7 +128,13 @@ def _window_metrics(
         pct_day = total_ret_pct / (live_days - 1)
 
     maxdd_fut = None
-    if eqs := [by_day[d] for d in days]:
+    manuals = manual_by_day or {}
+    if days:
+        manual_cum = 0.0
+        eqs = []
+        for d in days:
+            manual_cum += float(manuals.get(d.isoformat(), 0.0))
+            eqs.append(by_day[d] - manual_cum)
         peak = eqs[0]
         mdd = 0.0
         for e in eqs:
@@ -204,7 +211,7 @@ def build_live_vs_bt() -> dict:
     """Compute live window metrics vs static BT Config A reference."""
     baseline = db.get_baseline_equity()
     principal = float(baseline) if baseline is not None and baseline > 0 else float(INITIAL_CAPITAL)
-    skim_tot, _skim_n = db.sum_successful_spot_transfers()
+    skim_tot = db.signed_spot_flow()
     cut = datetime.fromisoformat(LIMIT_TP_SINCE)
 
     with db.get_connection() as conn:
@@ -214,11 +221,13 @@ def build_live_vs_bt() -> dict:
         closed_all = _closed_stats(conn)
         closed_limit = _closed_stats(conn, since=LIMIT_TP_SINCE)
         skims = conn.execute(
-            "SELECT transfer_date, amount, created_at FROM spot_transfers WHERE status = 'success'"
+            "SELECT transfer_date, amount, reason, created_at FROM spot_transfers WHERE status = 'success'"
         ).fetchall()
         skim_before_cut = conn.execute(
             """
-            SELECT COALESCE(SUM(amount), 0) AS s
+            SELECT COALESCE(SUM(
+                CASE WHEN reason = 'return_to_futures' THEN -amount ELSE amount END
+            ), 0) AS s
             FROM spot_transfers
             WHERE status = 'success' AND created_at < ?
             """,
@@ -227,13 +236,21 @@ def build_live_vs_bt() -> dict:
 
     skim_by_day_all: dict[str, float] = {}
     skim_by_day_limit: dict[str, float] = {}
+    manual_by_day_all: dict[str, float] = {}
+    manual_by_day_limit: dict[str, float] = {}
     for row in skims:
         key = str(row["transfer_date"])
         amt = float(row["amount"] or 0)
+        manual = str(row["reason"] or "") == "return_to_futures"
+        if manual:
+            manual_by_day_all[key] = manual_by_day_all.get(key, 0.0) + amt
+            amt = -amt
         skim_by_day_all[key] = skim_by_day_all.get(key, 0.0) + amt
         created = str(row["created_at"] or "")
         if created and _parse_dt(created) >= cut:
             skim_by_day_limit[key] = skim_by_day_limit.get(key, 0.0) + amt
+            if manual:
+                manual_by_day_limit[key] = manual_by_day_limit.get(key, 0.0) + float(row["amount"] or 0)
 
     live = _window_metrics(
         snaps=snaps,
@@ -243,6 +260,7 @@ def build_live_vs_bt() -> dict:
         skim_total=float(skim_tot or 0),
         principal=principal,
         since=None,
+        manual_by_day=manual_by_day_all,
     )
     limit = _window_metrics(
         snaps=snaps,
@@ -252,6 +270,7 @@ def build_live_vs_bt() -> dict:
         skim_total=float(skim_tot or 0),
         principal=principal,
         since=cut,
+        manual_by_day=manual_by_day_limit,
     )
 
     bt = BT_REF
