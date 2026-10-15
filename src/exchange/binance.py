@@ -1958,6 +1958,37 @@ def fetch_book_ticker(symbol: str) -> tuple[float, float] | None:
     return bid, ask
 
 
+def place_stop_open_order(symbol: str, hold_side: str, size: str, trigger_price: str) -> dict:
+    """STOP_MARKET that opens `hold_side` when the last price reaches `trigger_price`."""
+    order_side, position_side = market_order_params(hold_side, "open")
+    oid = f"bds_{uuid.uuid4().hex[:16]}"
+    params: dict[str, str | int | float | bool] = {
+        "algoType": "CONDITIONAL",
+        "symbol": symbol.upper(),
+        "side": order_side,
+        "positionSide": position_side,
+        "type": "STOP_MARKET",
+        "quantity": size,
+        "triggerPrice": trigger_price,
+        "workingType": "CONTRACT_PRICE",
+        "clientAlgoId": oid,
+    }
+    result = _private_post("/fapi/v1/algoOrder", params, max_retries=1)
+    try:
+        from src.exchange.binance_ws import on_order_placed
+
+        on_order_placed(symbol)
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Binance WS post-stop-open reconcile skipped: %s", exc)
+    algo_id = str(result.get("algoId") or result.get("orderId") or "")
+    return {
+        "orderId": algo_id,
+        "clientOid": str(result.get("clientAlgoId") or oid),
+        "status": str(result.get("algoStatus") or result.get("status") or "").lower(),
+        "stopPrice": result.get("triggerPrice") or trigger_price,
+    }
+
+
 def place_algo_close_order(
     symbol: str,
     *,

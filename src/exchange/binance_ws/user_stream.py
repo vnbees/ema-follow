@@ -130,6 +130,28 @@ def parse_order_trade_update(payload: dict[str, Any]) -> tuple[dict | None, Pend
     return detail, pending, remove and is_limit
 
 
+def parse_algo_update(payload: dict[str, Any]) -> dict | None:
+    """Normalize an ALGO_UPDATE so SMC can match `aid` to the stored entry id."""
+    raw = payload.get("o") or {}
+    if not isinstance(raw, dict):
+        return None
+    algo_id = str(raw.get("aid") or "")
+    if not algo_id:
+        return None
+    status = str(raw.get("X") or "").lower()
+    return {
+        "orderId": algo_id,
+        "status": status,
+        "state": status,
+        "avgPrice": raw.get("ap"),
+        "priceAvg": raw.get("ap"),
+        "executedQty": raw.get("aq"),
+        "symbol": str(raw.get("s") or "").upper(),
+        "type": str(raw.get("o") or ""),
+        "stopPrice": raw.get("tp"),
+    }
+
+
 def apply_user_payload(payload: dict[str, Any]) -> None:
     event = payload.get("e")
     if event == "listenKeyExpired":
@@ -142,6 +164,17 @@ def apply_user_payload(payload: dict[str, Any]) -> None:
         raise RuntimeError("listenKeyExpired")
 
     CACHE.touch_user()
+    if event == "ALGO_UPDATE":
+        detail = parse_algo_update(payload)
+        if detail and detail.get("orderId"):
+            CACHE.upsert_order_detail(str(detail["orderId"]), detail)
+            try:
+                from src.smc.broker import on_order_update as smc_on_order
+
+                smc_on_order(detail)
+            except Exception as exc:  # noqa: BLE001
+                logging.debug("SMC algo-update hook skipped: %s", exc)
+        return
     if event == "ACCOUNT_UPDATE":
         updates, closed, balances, changes = parse_account_update(payload)
         CACHE.apply_position_updates(updates, closed)

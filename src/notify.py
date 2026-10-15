@@ -81,6 +81,63 @@ def _hold_label(opened_at: str) -> str:
     return f"{hours / 24:.1f}d"
 
 
+def notify_smc_fill(
+    symbol: str,
+    side: str,
+    *,
+    entry: float,
+    stop: float,
+    tp: float,
+    qty: float,
+    margin_usdt: float,
+) -> None:
+    """Discord when a reversed SMC limit fills. Fail-soft."""
+    try:
+        if not discord_configured():
+            return
+        title = f"{symbol.upper()} {side.upper()} khớp"
+        body = (
+            f"entry={_fmt_px(entry)}\n"
+            f"cắt lỗ={_fmt_px(stop)}  chốt={_fmt_px(tp)}\n"
+            f"qty={qty:g}  margin={margin_usdt:.2f} USDT"
+        )
+        _send_discord(title, body)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_smc_fill failed: %s", exc)
+
+
+def notify_smc_close(
+    symbol: str,
+    side: str,
+    *,
+    reason: str,
+    entry: float,
+    stop: float,
+    tp: float,
+    close_px: float,
+    pnl_usdt: float,
+    qty: float,
+    margin_usdt: float,
+    opened_at: str = "",
+) -> None:
+    """Discord when a reversed SMC position closes. Fail-soft."""
+    try:
+        if not discord_configured():
+            return
+        label = {"tp": "chốt lời", "stop": "cắt lỗ", "flat": "đóng tay"}.get(reason, reason)
+        title = f"{symbol.upper()} {side.upper()} đóng — {label}"
+        body = (
+            f"entry={_fmt_px(entry)}  cắt lỗ={_fmt_px(stop)}  chốt={_fmt_px(tp)}\n"
+            f"qty={qty:g}  margin={margin_usdt:.2f} USDT\n"
+            f"đóng={_fmt_px(close_px)}\n"
+            f"pnl={pnl_usdt:+.2f} USDT (đã trừ phí)\n"
+            f"giữ {_hold_label(opened_at)}"
+        )
+        _send_discord(title, body)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_smc_close failed: %s", exc)
+
+
 def notify_rsi_rev_open(
     symbol: str,
     side: str,

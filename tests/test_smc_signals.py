@@ -1,7 +1,7 @@
 import unittest
 
-from src.smc.broker import entry_block_reason
-from src.smc.signals import BAR_MS, TTL_BARS, expired, setups, stop_hit
+from src.smc.broker import book_qty, entry_block_reason
+from src.smc.signals import BAR_MS, Setup, TTL_BARS, expired, flipped, setups, stop_hit
 
 
 def _iso(ms: int) -> str:
@@ -82,6 +82,32 @@ class TestSmcSweep(unittest.TestCase):
             "close_reason": "busy",
         }
         self.assertIsNone(entry_block_reason(signal + BAR_MS, [marker]))
+
+    def test_flip_swaps_side_and_exits(self) -> None:
+        long = Setup("long", 10, 1_000, 100.0, 99.0, 110.0)
+        short = flipped(long)
+        self.assertEqual(short.side, "short")
+        self.assertEqual(short.entry, 100.0)
+        self.assertEqual(short.stop, 110.0)
+        self.assertEqual(short.target, 99.0)
+        self.assertEqual(flipped(short).side, "long")
+        self.assertEqual(flipped(short).stop, 99.0)
+        self.assertEqual(flipped(short).target, 110.0)
+
+    def test_through_marker_does_not_block_the_next_candle(self) -> None:
+        signal = 20 * BAR_MS
+        marker = {
+            "created_at": _iso(signal + BAR_MS + 2_000),
+            "closed_at": _iso(signal + BAR_MS + 2_000),
+            "opened_at": None,
+            "close_reason": "through",
+        }
+        self.assertIsNone(entry_block_reason(signal + BAR_MS, [marker]))
+
+    def test_partial_stop_fill_waits_for_the_order_size(self) -> None:
+        self.assertIsNone(book_qty(882, 27))
+        self.assertEqual(book_qty(882, 882), 882)
+        self.assertEqual(book_qty(882, 900), 900)
 
     def test_stop_side(self) -> None:
         self.assertTrue(stop_hit("long", 10.0, 10.0))

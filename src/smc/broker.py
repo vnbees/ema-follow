@@ -1,7 +1,9 @@
-"""Place and manage SMC limits on the shared futures book.
+"""Place and manage reversed SMC limits on the shared futures book.
 
-One pending or open trade per coin. Each new order uses 10% of account equity
-and leverage 10. Entry and take-profit are limits. The stop is a market close.
+The sweep signal is unchanged. The order is the opposite side: the wick is the
+take-profit and the midpoint is the stop. Entry is a stop at the swing extreme,
+so it rests until price trades that level. One pending or open trade per coin.
+Each new order uses 2% of account equity and leverage 10.
 """
 
 from __future__ import annotations
@@ -16,12 +18,15 @@ from src.exchange import ExchangeClientError, configure_symbol_trading, fetch_co
 from src.exchange.fills import commission_usdt_from_detail, parse_fill_price
 from src.exchange.sizing import format_price, format_size
 from src.smc import store
-from src.smc.signals import BAR_MS, Setup, expired, setup_on_last_bar, stop_hit
+from src.smc.signals import BAR_MS, Setup, expired, flipped, setup_on_last_bar, stop_hit
 
-MARGIN_PCT = 0.10
+MARGIN_PCT = 0.02
 _configured: set[str] = set()
 _saw_size: set[int] = set()
 _TERMINAL = frozenset({"filled", "canceled", "cancelled", "expired", "rejected"})
+_STOP_FILLED = frozenset({"filled", "triggered", "finished"})
+_SHORT_FILL_WAIT_SEC = 3.0
+_short_fill_since: dict[int, float] = {}
 
 
 def _mark(symbol: str) -> float:
@@ -84,7 +89,7 @@ def entry_block_reason(signal_ts: int, rows) -> str | None:
     end = start + BAR_MS
     for row in rows:
         reason = row["close_reason"] if "close_reason" in row.keys() else None
-        if reason in {"busy", "cooldown"}:
+        if reason in {"busy", "cooldown", "through"}:
             continue
         created = _epoch_ms(row["created_at"])
         closed = _epoch_ms(row["closed_at"])
@@ -99,13 +104,40 @@ def entry_block_reason(signal_ts: int, rows) -> str | None:
     return None
 
 
+def book_qty(ordered: float, seen: float) -> float | None:
+    """Size to open once the fill covers the order.
+
+    A stop market can print several trades in one moment. The first trade's
+    quantity is not the position.
+    """
+    if seen <= 0:
+        return None
+    if ordered <= 0 or seen + 1e-9 >= ordered:
+        return seen
+    return None
+
+
 def _pnl(side: str, entry: float, close: float, qty: float, fee_open: float, fee_close: float) -> float:
     gross = (close - entry) * qty if side == "long" else (entry - close) * qty
     return gross - fee_open - fee_close
 
 
+def _open_filled(row, *, fill_px: float, qty: float, fee_open: float) -> None:
+    if qty <= 0:
+        return
+    if fee_open <= 0:
+        fee_open = qty * fill_px * 0.0005
+    if not store.mark_open(int(row["id"]), fill_px=fill_px, qty=qty, fee_open=fee_open):
+        return
+    fresh = store.get_trade(int(row["id"]))
+    if fresh is None:
+        return
+    _place_brackets(fresh)
+    _notify_fill(fresh)
+
+
 def _place_entry(trade_id: int, symbol: str, side: str, entry: float, margin: float) -> None:
-    from src.exchange.binance import place_limit_open_order
+    from src.exchange.binance import place_market_order, place_stop_open_order
 
     spec = fetch_contract_spec(symbol)
     px = format_price(entry, spec)
@@ -115,21 +147,54 @@ def _place_entry(trade_id: int, symbol: str, side: str, entry: float, margin: fl
         return
     _ensure(symbol)
     try:
-        result = place_limit_open_order(symbol, side, qty_str, px, post_only=True)
+        result = place_stop_open_order(symbol, side, qty_str, px)
     except ExchangeClientError as exc:
-        if "-5022" not in str(exc):
-            logging.warning("SMC entry %s %s failed: %s", symbol, side, exc)
+        if "-2021" not in str(exc):
+            logging.warning("SMC stop entry %s %s failed: %s", symbol, side, exc)
             return
-        result = place_limit_open_order(symbol, side, qty_str, px, post_only=False)
+        result = place_market_order(symbol, "", qty_str, hold_side=side, trade_side="open")
+        logging.info("SMC stop %s %s already through %s — market entry", symbol, side, px)
     oid = str(result.get("orderId") or "")
     if not oid:
         return
     store.set_entry_order(trade_id, oid, float(qty_str))
-    logging.info("SMC pending %s %s limit %s qty %s id %s", symbol, side, px, qty_str, oid)
+    logging.info("SMC pending %s %s stop %s qty %s id %s", symbol, side, px, qty_str, oid)
+
+
+def _notify_fill(row) -> None:
+    from src.notify import notify_smc_fill
+
+    notify_smc_fill(
+        str(row["symbol"]),
+        str(row["side"]),
+        entry=float(row["fill_px"] or row["entry_px"]),
+        stop=float(row["stop_px"]),
+        tp=float(row["tp_px"]),
+        qty=float(row["qty"] or 0),
+        margin_usdt=float(row["margin_usdt"] or 0),
+    )
+
+
+def _notify_close(row, *, close_px: float, pnl: float, reason: str) -> None:
+    from src.notify import notify_smc_close
+
+    notify_smc_close(
+        str(row["symbol"]),
+        str(row["side"]),
+        reason=reason,
+        entry=float(row["fill_px"] or row["entry_px"]),
+        stop=float(row["stop_px"]),
+        tp=float(row["tp_px"]),
+        close_px=close_px,
+        pnl_usdt=pnl,
+        qty=float(row["qty"] or 0),
+        margin_usdt=float(row["margin_usdt"] or 0),
+        opened_at=str(row["opened_at"] or ""),
+    )
 
 
 def _place_brackets(row) -> None:
-    """Rest the backtest pair: limit at the midpoint, stop-market at the wick."""
+    """Limit at the wick, stop-market at the midpoint."""
     from src.exchange.binance import place_algo_close_order, place_limit_close_order
 
     symbol = str(row["symbol"])
@@ -201,8 +266,10 @@ def _finish_open(row, *, close_px: float, fee_close: float, reason: str) -> None
     qty = float(row["qty"] or 0)
     fee_open = float(row["fee_open"] or 0)
     pnl = _pnl(str(row["side"]), entry, close_px, qty, fee_open, fee_close)
-    store.mark_closed(int(row["id"]), close_px=close_px, fee_close=fee_close, pnl=pnl, reason=reason)
+    if not store.mark_closed(int(row["id"]), close_px=close_px, fee_close=fee_close, pnl=pnl, reason=reason):
+        return
     logging.info("SMC close %s %s %s pnl %.2f", row["symbol"], row["side"], reason, pnl)
+    _notify_close(row, close_px=close_px, pnl=pnl, reason=reason)
 
 
 def _market_stop(row) -> None:
@@ -227,7 +294,7 @@ def _market_stop(row) -> None:
 
 def _apply_detail(row, detail: dict) -> None:
     status = str(detail.get("status") or detail.get("state") or "").lower()
-    if status not in _TERMINAL:
+    if status not in _TERMINAL and status not in _STOP_FILLED:
         return
     oid = str(detail.get("orderId") or "")
     filled = 0.0
@@ -237,12 +304,14 @@ def _apply_detail(row, detail: dict) -> None:
         filled = 0.0
     fee = commission_usdt_from_detail(_ws_detail(oid) or detail)
     if str(row["status"]) == "pending" and oid == str(row["entry_order_id"] or ""):
-        if status == "filled" and filled > 0:
+        if status in _STOP_FILLED and status != "triggered":
+            qty = book_qty(float(row["qty"] or 0), filled)
+            if qty is None:
+                return
             px = parse_fill_price(detail) or float(row["entry_px"])
-            if store.mark_open(int(row["id"]), fill_px=px, qty=filled, fee_open=fee):
-                fresh = store.get_trade(int(row["id"]))
-                if fresh is not None:
-                    _place_brackets(fresh)
+            _open_filled(row, fill_px=px, qty=qty, fee_open=fee)
+        elif status in _STOP_FILLED:
+            return
         elif status in _TERMINAL:
             store.mark_cancelled(int(row["id"]), status or "cancel")
         return
@@ -293,35 +362,49 @@ def _scan(now_ms: int) -> None:
             continue
         if expired(setup.signal_ts, now_ms):
             continue
-        block = entry_block_reason(setup.signal_ts, store.rows_for_symbol(symbol))
+        order = flipped(setup)
+        if stop_hit(order.side, order.stop, float(candles[-1].close)):
+            skipped = store.insert_pending(
+                symbol=symbol,
+                side=order.side,
+                signal_ts=order.signal_ts,
+                entry=order.entry,
+                stop=order.stop,
+                target=order.target,
+                margin=0.0,
+            )
+            store.mark_cancelled(skipped, "through")
+            logging.info("SMC skip %s through signal %s", symbol, order.signal_ts)
+            continue
+        block = entry_block_reason(order.signal_ts, store.rows_for_symbol(symbol))
         if block is None and store.active_for(symbol) is not None:
             block = "busy"
         if block is not None:
             skipped = store.insert_pending(
                 symbol=symbol,
-                side=setup.side,
-                signal_ts=setup.signal_ts,
-                entry=setup.entry,
-                stop=setup.stop,
-                target=setup.target,
+                side=order.side,
+                signal_ts=order.signal_ts,
+                entry=order.entry,
+                stop=order.stop,
+                target=order.target,
                 margin=0.0,
             )
             store.mark_cancelled(skipped, block)
-            logging.info("SMC skip %s %s signal %s", symbol, block, setup.signal_ts)
+            logging.info("SMC skip %s %s signal %s", symbol, block, order.signal_ts)
             continue
         if free < margin:
             break
         trade_id = store.insert_pending(
             symbol=symbol,
-            side=setup.side,
-            signal_ts=setup.signal_ts,
-            entry=setup.entry,
-            stop=setup.stop,
-            target=setup.target,
+            side=order.side,
+            signal_ts=order.signal_ts,
+            entry=order.entry,
+            stop=order.stop,
+            target=order.target,
             margin=margin,
         )
         try:
-            _place_entry(trade_id, symbol, setup.side, setup.entry, margin)
+            _place_entry(trade_id, symbol, order.side, order.entry, margin)
         except ExchangeClientError as exc:
             logging.warning("SMC place %s failed: %s", symbol, exc)
             store.mark_cancelled(trade_id, "place")
@@ -370,8 +453,30 @@ def _guard(row, now_ms: int) -> None:
             wick = 0.0
     hit = (mark > 0 and stop_hit(side, stop, mark)) or (wick > 0 and stop_hit(side, stop, wick))
     if str(row["status"]) == "pending":
+        held = _held_size(symbol, side)
+        trade_id = int(row["id"])
+        if held is not None and held > 1e-12:
+            ordered = float(row["qty"] or 0)
+            qty = book_qty(ordered, held)
+            if qty is None:
+                started = _short_fill_since.get(trade_id)
+                if started is None or time.time() - started < _SHORT_FILL_WAIT_SEC:
+                    _short_fill_since.setdefault(trade_id, time.time())
+                    return
+                qty = held
+            _short_fill_since.pop(trade_id, None)
+            _open_filled(row, fill_px=float(row["entry_px"]), qty=qty, fee_open=0.0)
+            return
+        _short_fill_since.pop(trade_id, None)
         if hit or expired(int(row["signal_ts"]), now_ms):
-            _cancel_order(symbol, str(row["entry_order_id"] or ""))
+            from src.exchange.binance import cancel_order
+
+            oid = str(row["entry_order_id"] or "")
+            try:
+                cancel_order(symbol, oid)
+            except ExchangeClientError as exc:
+                logging.warning("SMC cancel stop entry %s failed: %s", symbol, exc)
+            _cancel_order(symbol, oid)
             reason = "stop" if hit else "expire"
             store.mark_cancelled(int(row["id"]), reason)
             logging.info("SMC cancel pending %s %s", symbol, reason)

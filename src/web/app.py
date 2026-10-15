@@ -984,6 +984,23 @@ def _dual_payload() -> dict:
     }
 
 
+# Stop-entry went live at 14/10/2026 16:14 +07. The SMC report counts from here.
+_SMC_REPORT_FROM = datetime(2026, 10, 14, 9, 14, 54, tzinfo=timezone.utc)
+
+
+def _smc_in_report(row: dict) -> bool:
+    raw = str(row.get("opened_at") or row.get("created_at") or "")
+    if not raw:
+        return False
+    try:
+        stamp = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp >= _SMC_REPORT_FROM
+
+
 def _smc_mark(symbol: str) -> float:
     try:
         from src.exchange.binance_ws import get_mark_from_ws
@@ -1001,7 +1018,7 @@ def _smc_payload() -> dict:
     from src.smc import store as smc_store
 
     smc_store.ensure_schema()
-    closed = [smc_store.row_dict(row) for row in smc_store.closed_rows()]
+    closed = [smc_store.row_dict(row) for row in smc_store.closed_rows() if _smc_in_report(smc_store.row_dict(row))]
     active = [smc_store.row_dict(row) for row in smc_store.active_rows()]
     wins = [float(row["pnl_usdt"] or 0) for row in closed if float(row["pnl_usdt"] or 0) > 0]
     losses = [float(row["pnl_usdt"] or 0) for row in closed if float(row["pnl_usdt"] or 0) <= 0]
@@ -1064,7 +1081,10 @@ def _smc_payload() -> dict:
         coins.append(bucket)
     coins.sort(key=lambda item: item["pnl"], reverse=True)
     account = get_account_balance()
-    recent = [smc_store.row_dict(row) for row in smc_store.list_recent(40)]
+    recent = [
+        row for row in (smc_store.row_dict(item) for item in smc_store.list_recent(200))
+        if _smc_in_report(row)
+    ][:40]
     return {
         "account": {
             "equity": account.equity,
@@ -1099,7 +1119,7 @@ def dashboard(request: Request) -> HTMLResponse:
         "smc.html",
         {
             "exchange_name": EXCHANGE_DISPLAY_NAME,
-            "bot_title": "SMC quét thanh khoản",
+            "bot_title": "SMC đảo chiều",
         },
     )
 

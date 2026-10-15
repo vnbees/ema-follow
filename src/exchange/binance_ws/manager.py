@@ -238,9 +238,14 @@ def reconcile_account_state(*, force: bool = False) -> None:
 
 
 def refresh_available_margin() -> bool:
-    """One account read plus the open-limit book, then available = equity − margin."""
+    """Account, positions, and open limits. A flat book uses the exchange balance.
+
+    Disk restore can still hold a position that was closed while the process was
+    down. Recomputing available from that snapshot keeps margin locked.
+    """
     from src.exchange import binance as binance_mod
     from src.exchange.binance_ws.cache import publish_live_equity
+    from src.exchange.types import Position
 
     if binance_mod.is_optional_rest_blocked():
         return False
@@ -248,9 +253,38 @@ def refresh_available_margin() -> bool:
         with binance_mod.boot_optional_rest_slot():
             CACHE.bump_rest("available_margin")
             balance = binance_mod.fetch_futures_balance_rest()
+            positions = binance_mod.fetch_all_open_positions_rest()
             book = binance_mod.fetch_open_limits_by_symbol()
+        by_symbol: dict[str, dict[str, Position]] = {}
+        for pos in positions:
+            bucket = by_symbol.setdefault(
+                pos.symbol.upper(),
+                {
+                    "long": Position(symbol=pos.symbol, side=None, size=0.0, avg_price=0.0),
+                    "short": Position(symbol=pos.symbol, side=None, size=0.0, avg_price=0.0),
+                },
+            )
+            if pos.side in bucket:
+                bucket[pos.side] = pos
+        CACHE.set_positions(positions, by_symbol)
         CACHE.replace_pending_book(book)
         CACHE.set_balance(balance)
+        if not positions and not any(book.values()):
+            bal = CACHE.get_balance()
+            if bal is not None:
+                bal.available = float(balance.available)
+                bal.account_equity = float(balance.account_equity)
+                bal.usdt_equity = float(balance.usdt_equity)
+                bal.total_initial_margin = float(balance.total_initial_margin)
+                bal.total_maint_margin = float(balance.total_maint_margin)
+                if balance.wallet_balance is not None:
+                    bal.wallet_balance = float(balance.wallet_balance)
+        try:
+            from src.exchange.binance_ws.persist import save_account_snapshot
+
+            save_account_snapshot()
+        except Exception:  # noqa: BLE001
+            pass
         publish_live_equity(force=True)
         bal = CACHE.get_balance()
         if bal is not None:

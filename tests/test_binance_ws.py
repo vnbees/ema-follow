@@ -399,6 +399,28 @@ class TestUserDataParsers(unittest.TestCase):
         self.assertEqual(updates[0].side, "long")
         self.assertEqual(closed, [("BTCUSDT", "short")])
 
+    def test_algo_update_uses_algo_id(self) -> None:
+        from src.exchange.binance_ws.user_stream import parse_algo_update
+
+        detail = parse_algo_update(
+            {
+                "e": "ALGO_UPDATE",
+                "o": {
+                    "aid": 2148716,
+                    "X": "FINISHED",
+                    "ap": "100.5",
+                    "aq": "1.2",
+                    "s": "ETHUSDT",
+                    "o": "STOP_MARKET",
+                    "tp": "100",
+                },
+            }
+        )
+        self.assertEqual(detail["orderId"], "2148716")
+        self.assertEqual(detail["status"], "finished")
+        self.assertEqual(detail["avgPrice"], "100.5")
+        self.assertEqual(detail["executedQty"], "1.2")
+
     def test_order_trade_filled(self) -> None:
         detail, pending, remove = parse_order_trade_update(
             {

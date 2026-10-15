@@ -111,6 +111,12 @@ def setup_on_last_bar(
     return rows[-1]
 
 
+def flipped(setup: Setup) -> Setup:
+    """Opposite side. The wick is the target and the midpoint is the stop."""
+    side = "short" if setup.side == "long" else "long"
+    return Setup(side, setup.index, setup.signal_ts, setup.entry, setup.target, setup.stop)
+
+
 def expired(signal_ts: int, now_ms: int, ttl_bars: int = TTL_BARS) -> bool:
     """True once the bar after the fill window has opened.
 

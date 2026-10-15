@@ -74,8 +74,8 @@ def _seed_available_book() -> None:
 def run_forever() -> None:
     _seed_available_book()
     logging.info(
-        "SMC sweep: swing 50, wick ≤ 0.8 ATR, limit at the swing, stop at the wick, "
-        "target midpoint, 16-bar TTL, 10% of shared equity x 10, one order per coin"
+        "SMC reverse: swing 50, wick ≤ 0.8 ATR, stop-entry at the swing, "
+        "target at the wick, stop at the midpoint, 16-bar TTL, 2%% of shared equity x 10"
     )
     while not flatten_donchian_once():
         logging.info("SMC waiting to flatten the Donchian book")

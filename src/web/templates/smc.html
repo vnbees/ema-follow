@@ -37,7 +37,7 @@
 </head>
 <body>
   <h1>{{ exchange_name }} {{ bot_title }}</h1>
-  <p class="meta">Vốn chung · 10% equity mỗi lệnh · đòn bẩy 10 · một lệnh mỗi coin. Tham khảo Donchian: <a href="/donchian">/donchian</a> · <a href="/legacy">/legacy</a></p>
+  <p class="meta">Sổ từ 14/10 16:14, lúc vào bằng stop. Đảo chiều · 2% equity mỗi lệnh · đòn bẩy 10 · một lệnh mỗi coin. Chốt tại râu, cắt lỗ tại điểm giữa. <a href="/donchian">/donchian</a> · <a href="/legacy">/legacy</a></p>
 
   <div class="controls">
     <span id="tradingPill" class="status-pill"></span>
@@ -108,7 +108,7 @@
     const pct = (n) => n === null || n === undefined ? "—" : `${Number(n).toFixed(1)}%`;
     const px = (n) => n === null || n === undefined || n === "" ? "—" : Number(n).toPrecision(6);
     const sideHtml = (s) => `<span class="side ${s}">${s === "long" ? "LONG" : "SHORT"}</span>`;
-    const reason = { tp: "Chốt giữa vùng", stop: "Cắt lỗ", expire: "Hết 16 nến", size: "Size bằng 0", place: "Không đặt được" };
+    const reason = { tp: "Chốt tại râu", stop: "Cắt lỗ điểm giữa", flat: "Đóng tay", expire: "Hết 16 nến", size: "Size bằng 0", place: "Không đặt được" };
 
     function card(label, value, sub) {
       return `<div class="summary-card"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub || ""}</div></div>`;

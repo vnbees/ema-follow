@@ -52,7 +52,7 @@ class TestDashboardAuth(unittest.TestCase):
 
         home = self.client.get("/", follow_redirects=False)
         self.assertEqual(home.status_code, 200)
-        self.assertIn("SMC quét thanh khoản".encode(), home.content)
+        self.assertIn("SMC đảo chiều".encode(), home.content)
         self.assertIn("Winrate".encode(), home.content)
 
         status = self.client.get("/api/smc/status")

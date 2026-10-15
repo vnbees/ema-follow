@@ -1,8 +1,8 @@
-# Bot SMC quét thanh khoản (USDT-M)
+# Bot SMC đảo chiều (USDT-M)
 
-Bot live đang chạy **SMC quét thanh khoản** trên nến 15 phút (`SMC_ENABLED=true`). Vốn futures dùng chung. Mỗi coin tối đa một lệnh. Mỗi lệnh mới dùng **10% equity** hiện tại, đòn bẩy **10**.
+Bot live đang chạy **SMC đảo chiều** trên nến 15 phút (`SMC_ENABLED=true`). Vốn futures dùng chung. Mỗi coin tối đa một lệnh. Mỗi lệnh mới dùng **2% equity** hiện tại, đòn bẩy **10**.
 
-Swing 50 nến. Long khi râu xuyên dưới đáy swing, nến đóng lại phía trên đáy, và đoạn râu không dài quá **0.8 ATR(14)**. Short là ảnh đối xứng ở đỉnh swing. Limit đúng tại đỉnh hoặc đáy vừa quét. Ngay khi limit đó khớp, bot treo thêm limit chốt tại trung điểm và STOP_MARKET tại đầu râu (giá khớp cuối). Lệnh chờ tối đa **16** nến. Giá chạm cắt lỗ trước khi khớp thì hủy limit vào. Tín hiệu chỉ được đặt lúc nến vừa đóng và coin đã trống suốt nến đó. Coin vừa khớp thì nghỉ thêm một nến, không lấy tín hiệu mới trong nến khớp hoặc nến kế tiếp.
+Swing 50 nến. Tín hiệu long khi râu xuyên dưới đáy swing, nến đóng lại phía trên đáy, và đoạn râu không dài quá **0.8 ATR(14)**. Tín hiệu short là ảnh đối xứng ở đỉnh swing. Lệnh đặt ra đảo chiều tín hiệu đó: long thành short và ngược lại, chốt lời tại đầu râu, cắt lỗ tại trung điểm. Vào lệnh bằng STOP_MARKET đúng tại đỉnh hoặc đáy vừa quét, nên lệnh nằm chờ đến khi giá chạm mức đó. Nến tín hiệu đã đóng qua cắt lỗ thì bỏ. Ngay khi stop khớp, bot treo limit chốt tại đầu râu và STOP_MARKET tại trung điểm, rồi gửi Discord. Đóng lệnh (chốt hoặc cắt) cũng gửi Discord. Lệnh chờ tối đa **16** nến. Giá chạm cắt lỗ trước khi khớp thì hủy stop vào. Tín hiệu chỉ được đặt lúc nến vừa đóng và coin đã trống suốt nến đó. Coin vừa khớp thì nghỉ thêm một nến, không lấy tín hiệu mới trong nến khớp hoặc nến kế tiếp.
 
 Dashboard chính là sổ SMC. Sổ Donchian 2 chiều giữ ở [`/donchian`](/donchian). Dashboard cũ hơn ở `/legacy`.
 
