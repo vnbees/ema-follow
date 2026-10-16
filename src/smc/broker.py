@@ -9,6 +9,7 @@ Each new order uses 2% of account equity and leverage 10.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -27,6 +28,17 @@ _TERMINAL = frozenset({"filled", "canceled", "cancelled", "expired", "rejected"}
 _STOP_FILLED = frozenset({"filled", "triggered", "finished"})
 _SHORT_FILL_WAIT_SEC = 3.0
 _short_fill_since: dict[int, float] = {}
+_bracket_locks: dict[int, threading.Lock] = {}
+_bracket_locks_guard = threading.Lock()
+
+
+def _bracket_lock(trade_id: int) -> threading.Lock:
+    with _bracket_locks_guard:
+        lock = _bracket_locks.get(trade_id)
+        if lock is None:
+            lock = threading.Lock()
+            _bracket_locks[trade_id] = lock
+        return lock
 
 
 def _mark(symbol: str) -> float:
@@ -194,44 +206,52 @@ def _notify_close(row, *, close_px: float, pnl: float, reason: str) -> None:
 
 
 def _place_brackets(row) -> None:
-    """Limit at the wick, stop-market at the midpoint."""
+    """Limit at the wick, stop-market at the midpoint.
+
+    The fill stream and the 2s loop can both arrive before the order id is saved.
+    One lock per trade makes the second caller read the saved id and skip.
+    """
     from src.exchange.binance import place_algo_close_order, place_limit_close_order
 
-    symbol = str(row["symbol"])
-    side = str(row["side"])
-    qty = float(row["qty"] or 0)
-    if qty <= 0:
-        return
-    spec = fetch_contract_spec(symbol)
-    _ensure(symbol)
-    if not str(row["stop_order_id"] or ""):
-        stop_px = format_price(float(row["stop_px"]), spec)
-        try:
-            result = place_algo_close_order(
-                symbol,
-                hold_side=side,
-                order_type="STOP_MARKET",
-                stop_price=stop_px,
-            )
-        except ExchangeClientError as exc:
-            logging.warning("SMC stop %s failed: %s", symbol, exc)
-        else:
-            oid = str(result.get("orderId") or "")
-            if oid:
-                store.set_stop_order(int(row["id"]), oid)
-                logging.info("SMC open %s %s stop %s id %s", symbol, side, stop_px, oid)
-    if not str(row["tp_order_id"] or ""):
-        tp_px = format_price(float(row["tp_px"]), spec)
-        size = format_size(qty, spec)
-        try:
-            result = place_limit_close_order(symbol, side, size, tp_px)
-        except ExchangeClientError as exc:
-            logging.warning("SMC TP %s failed: %s", symbol, exc)
-        else:
-            oid = str(result.get("orderId") or "")
-            if oid:
-                store.set_tp_order(int(row["id"]), oid)
-                logging.info("SMC open %s %s TP %s id %s", symbol, side, tp_px, oid)
+    trade_id = int(row["id"])
+    with _bracket_lock(trade_id):
+        fresh = store.get_trade(trade_id) or row
+        symbol = str(fresh["symbol"])
+        side = str(fresh["side"])
+        qty = float(fresh["qty"] or 0)
+        if qty <= 0:
+            return
+        spec = fetch_contract_spec(symbol)
+        _ensure(symbol)
+        if not str(fresh["stop_order_id"] or ""):
+            stop_px = format_price(float(fresh["stop_px"]), spec)
+            try:
+                result = place_algo_close_order(
+                    symbol,
+                    hold_side=side,
+                    order_type="STOP_MARKET",
+                    stop_price=stop_px,
+                )
+            except ExchangeClientError as exc:
+                logging.warning("SMC stop %s failed: %s", symbol, exc)
+            else:
+                oid = str(result.get("orderId") or "")
+                if oid:
+                    store.set_stop_order(trade_id, oid)
+                    logging.info("SMC open %s %s stop %s id %s", symbol, side, stop_px, oid)
+        fresh = store.get_trade(trade_id) or fresh
+        if not str(fresh["tp_order_id"] or ""):
+            tp_px = format_price(float(fresh["tp_px"]), spec)
+            size = format_size(qty, spec)
+            try:
+                result = place_limit_close_order(symbol, side, size, tp_px)
+            except ExchangeClientError as exc:
+                logging.warning("SMC TP %s failed: %s", symbol, exc)
+            else:
+                oid = str(result.get("orderId") or "")
+                if oid:
+                    store.set_tp_order(trade_id, oid)
+                    logging.info("SMC open %s %s TP %s id %s", symbol, side, tp_px, oid)
 
 
 def _cancel_order(symbol: str, order_id: str) -> dict | None:

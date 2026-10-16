@@ -1,5 +1,9 @@
+import threading
+import time
 import unittest
+from unittest.mock import patch
 
+from src.smc import broker
 from src.smc.broker import book_qty, entry_block_reason
 from src.smc.signals import BAR_MS, Setup, TTL_BARS, expired, flipped, setups, stop_hit
 
@@ -103,6 +107,101 @@ class TestSmcSweep(unittest.TestCase):
             "close_reason": "through",
         }
         self.assertIsNone(entry_block_reason(signal + BAR_MS, [marker]))
+
+    def test_concurrent_brackets_place_each_exit_once(self) -> None:
+        row = {
+            "id": 77,
+            "symbol": "XLMUSDT",
+            "side": "short",
+            "qty": 10,
+            "stop_px": 1.1,
+            "tp_px": 0.9,
+            "stop_order_id": "",
+            "tp_order_id": "",
+        }
+        state = {"stop": "", "tp": "", "stop_n": 0, "tp_n": 0}
+        gate = threading.Lock()
+
+        def get_trade(_trade_id):
+            with gate:
+                return {**row, "stop_order_id": state["stop"], "tp_order_id": state["tp"]}
+
+        def set_stop(_trade_id, oid):
+            with gate:
+                state["stop"] = oid
+
+        def set_tp(_trade_id, oid):
+            with gate:
+                state["tp"] = oid
+
+        def place_stop(*_args, **_kwargs):
+            time.sleep(0.05)
+            with gate:
+                state["stop_n"] += 1
+            return {"orderId": "stop-1"}
+
+        def place_tp(*_args, **_kwargs):
+            time.sleep(0.05)
+            with gate:
+                state["tp_n"] += 1
+            return {"orderId": "tp-1"}
+
+        with (
+            patch.object(broker.store, "get_trade", get_trade),
+            patch.object(broker.store, "set_stop_order", set_stop),
+            patch.object(broker.store, "set_tp_order", set_tp),
+            patch("src.exchange.binance.place_algo_close_order", place_stop),
+            patch("src.exchange.binance.place_limit_close_order", place_tp),
+            patch.object(broker, "fetch_contract_spec", return_value=object()),
+            patch.object(broker, "format_price", side_effect=lambda px, _spec: str(px)),
+            patch.object(broker, "format_size", side_effect=lambda qty, _spec: str(qty)),
+            patch.object(broker, "_ensure"),
+        ):
+            threads = [threading.Thread(target=broker._place_brackets, args=(row,)) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=3)
+        self.assertEqual(state["stop_n"], 1)
+        self.assertEqual(state["tp_n"], 1)
+        self.assertEqual(state["stop"], "stop-1")
+        self.assertEqual(state["tp"], "tp-1")
+
+    def test_missing_tp_is_still_placed_when_stop_exists(self) -> None:
+        row = {
+            "id": 78,
+            "symbol": "XLMUSDT",
+            "side": "short",
+            "qty": 10,
+            "stop_px": 1.1,
+            "tp_px": 0.9,
+            "stop_order_id": "stop-1",
+            "tp_order_id": "",
+        }
+        state = {"stop_n": 0, "tp_n": 0}
+
+        def place_stop(*_args, **_kwargs):
+            state["stop_n"] += 1
+            return {"orderId": "stop-2"}
+
+        def place_tp(*_args, **_kwargs):
+            state["tp_n"] += 1
+            return {"orderId": "tp-1"}
+
+        with (
+            patch.object(broker.store, "get_trade", return_value=row),
+            patch.object(broker.store, "set_stop_order"),
+            patch.object(broker.store, "set_tp_order"),
+            patch("src.exchange.binance.place_algo_close_order", place_stop),
+            patch("src.exchange.binance.place_limit_close_order", place_tp),
+            patch.object(broker, "fetch_contract_spec", return_value=object()),
+            patch.object(broker, "format_price", side_effect=lambda px, _spec: str(px)),
+            patch.object(broker, "format_size", side_effect=lambda qty, _spec: str(qty)),
+            patch.object(broker, "_ensure"),
+        ):
+            broker._place_brackets(row)
+        self.assertEqual(state["stop_n"], 0)
+        self.assertEqual(state["tp_n"], 1)
 
     def test_partial_stop_fill_waits_for_the_order_size(self) -> None:
         self.assertIsNone(book_qty(882, 27))
