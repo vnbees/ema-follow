@@ -3,7 +3,8 @@
 The sweep signal is unchanged. The order is the opposite side: the wick is the
 take-profit and the midpoint is the stop. Entry is a stop at the swing extreme,
 so it rests until price trades that level. One pending or open trade per coin.
-Each new order uses 2% of account equity and leverage 10.
+Each new order uses 2% of equity as margin. Take-profit and stop prices stay put.
+A signal whose take-profit is under 0.12 USDT is not placed.
 """
 
 from __future__ import annotations
@@ -21,7 +22,9 @@ from src.exchange.sizing import format_price, format_size
 from src.smc import store
 from src.smc.signals import BAR_MS, Setup, expired, flipped, setup_on_last_bar, stop_hit
 
+# Margin per order, as a fraction of equity. Notional is margin times leverage.
 MARGIN_PCT = 0.02
+MIN_VALID_TP_USDT = 0.12
 _configured: set[str] = set()
 _saw_size: set[int] = set()
 _TERMINAL = frozenset({"filled", "canceled", "cancelled", "expired", "rejected"})
@@ -101,7 +104,7 @@ def entry_block_reason(signal_ts: int, rows) -> str | None:
     end = start + BAR_MS
     for row in rows:
         reason = row["close_reason"] if "close_reason" in row.keys() else None
-        if reason in {"busy", "cooldown", "through"}:
+        if reason in {"busy", "cooldown", "through", "small"}:
             continue
         created = _epoch_ms(row["created_at"])
         closed = _epoch_ms(row["closed_at"])
@@ -114,6 +117,22 @@ def entry_block_reason(signal_ts: int, rows) -> str | None:
         if start == fill_bar or start == fill_bar + BAR_MS:
             return "cooldown"
     return None
+
+
+def order_notional(entry: float, stop: float, target: float, equity: float) -> float | None:
+    """Position notional for a fixed 2% margin.
+
+    `stop` is unused. Size does not depend on stop distance.
+    Returns None when the take-profit is under 0.12 USDT.
+    """
+    del stop
+    if entry <= 0 or equity <= 0:
+        return None
+    notional = float(equity) * MARGIN_PCT * LEVERAGE
+    reward = abs(float(target) - float(entry)) / float(entry) * notional
+    if reward < MIN_VALID_TP_USDT:
+        return None
+    return notional
 
 
 def book_qty(ordered: float, seen: float) -> float | None:
@@ -366,7 +385,6 @@ def _scan(now_ms: int) -> None:
     free = float(account.available or 0)
     if equity <= 0:
         return
-    margin = equity * MARGIN_PCT
     for symbol in FIXED_SCAN_SYMBOLS:
         candles = _closed_candles(symbol)
         if len(candles) < 80:
@@ -412,8 +430,23 @@ def _scan(now_ms: int) -> None:
             store.mark_cancelled(skipped, block)
             logging.info("SMC skip %s %s signal %s", symbol, block, order.signal_ts)
             continue
+        notional = order_notional(order.entry, order.stop, order.target, equity)
+        if notional is None:
+            skipped = store.insert_pending(
+                symbol=symbol,
+                side=order.side,
+                signal_ts=order.signal_ts,
+                entry=order.entry,
+                stop=order.stop,
+                target=order.target,
+                margin=0.0,
+            )
+            store.mark_cancelled(skipped, "small")
+            logging.info("SMC skip %s small-tp signal %s", symbol, order.signal_ts)
+            continue
+        margin = notional / LEVERAGE
         if free < margin:
-            break
+            continue
         trade_id = store.insert_pending(
             symbol=symbol,
             side=order.side,
@@ -422,6 +455,12 @@ def _scan(now_ms: int) -> None:
             stop=order.stop,
             target=order.target,
             margin=margin,
+        )
+        logging.info(
+            "SMC size %s notional %.2f margin %.2f",
+            symbol,
+            notional,
+            margin,
         )
         try:
             _place_entry(trade_id, symbol, order.side, order.entry, margin)

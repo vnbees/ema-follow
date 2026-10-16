@@ -247,7 +247,7 @@ def list_recent(limit: int = 40) -> list[sqlite3.Row]:
                 """
                 SELECT * FROM smc_trades
                 WHERE status IN ('closed', 'cancelled', 'open', 'pending')
-                  AND IFNULL(close_reason, '') NOT IN ('busy', 'cooldown', 'through')
+                  AND IFNULL(close_reason, '') NOT IN ('busy', 'cooldown', 'through', 'small')
                 ORDER BY id DESC LIMIT ?
                 """,
                 (int(limit),),

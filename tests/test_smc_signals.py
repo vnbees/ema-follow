@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from src.smc import broker
-from src.smc.broker import book_qty, entry_block_reason
+from src.smc.broker import book_qty, entry_block_reason, order_notional
 from src.smc.signals import BAR_MS, Setup, TTL_BARS, expired, flipped, setups, stop_hit
 
 
@@ -202,6 +202,16 @@ class TestSmcSweep(unittest.TestCase):
             broker._place_brackets(row)
         self.assertEqual(state["stop_n"], 0)
         self.assertEqual(state["tp_n"], 1)
+
+    def test_notional_is_two_percent_margin_regardless_of_stop(self) -> None:
+        # 1000 USDT equity, leverage 10 → 20 USDT margin, 200 USDT notional.
+        tight = order_notional(100.0, 98.8, 101.0, 1000.0)
+        wide = order_notional(100.0, 96.4, 101.0, 1000.0)
+        self.assertAlmostEqual(tight, 200.0)
+        self.assertAlmostEqual(wide, 200.0)
+
+    def test_target_under_0_12_usdt_is_not_placed(self) -> None:
+        self.assertIsNone(order_notional(100.0, 99.0, 100.001, 800.0))
 
     def test_partial_stop_fill_waits_for_the_order_size(self) -> None:
         self.assertIsNone(book_qty(882, 27))
