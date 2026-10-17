@@ -4,7 +4,14 @@ import unittest
 from unittest.mock import patch
 
 from src.smc import broker
-from src.smc.broker import book_qty, entry_block_reason, order_notional
+from src.smc.broker import (
+    MAX_HOLD_SEC,
+    book_qty,
+    entry_block_reason,
+    hold_limit_reached,
+    order_notional,
+    round_trip_fee_usdt,
+)
 from src.smc.signals import BAR_MS, Setup, TTL_BARS, expired, flipped, setups, stop_hit
 
 
@@ -210,13 +217,25 @@ class TestSmcSweep(unittest.TestCase):
         self.assertAlmostEqual(tight, 200.0)
         self.assertAlmostEqual(wide, 200.0)
 
-    def test_target_under_0_12_usdt_is_not_placed(self) -> None:
-        self.assertIsNone(order_notional(100.0, 99.0, 100.001, 800.0))
+    def test_target_below_round_trip_fee_is_not_placed(self) -> None:
+        # 800 equity → notional 160. Fee is taker 0.05% in plus maker 0.02% out.
+        notional = 160.0
+        fee = round_trip_fee_usdt(100.0, 100.05, notional)
+        self.assertAlmostEqual(fee, 160 * 0.0005 + 160 * 1.0005 * 0.0002)
+        self.assertIsNone(order_notional(100.0, 99.0, 100.05, 800.0))
+        self.assertEqual(order_notional(100.0, 99.0, 100.10, 800.0), notional)
 
     def test_partial_stop_fill_waits_for_the_order_size(self) -> None:
         self.assertIsNone(book_qty(882, 27))
         self.assertEqual(book_qty(882, 882), 882)
         self.assertEqual(book_qty(882, 900), 900)
+
+    def test_hold_limit_is_41_minutes(self) -> None:
+        opened = _iso(0)
+        self.assertFalse(hold_limit_reached(opened, 35 * 60))
+        self.assertFalse(hold_limit_reached(opened, MAX_HOLD_SEC - 1))
+        self.assertTrue(hold_limit_reached(opened, MAX_HOLD_SEC))
+        self.assertTrue(hold_limit_reached(opened, 50 * 60))
 
     def test_stop_side(self) -> None:
         self.assertTrue(stop_hit("long", 10.0, 10.0))

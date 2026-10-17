@@ -4,7 +4,7 @@ The sweep signal is unchanged. The order is the opposite side: the wick is the
 take-profit and the midpoint is the stop. Entry is a stop at the swing extreme,
 so it rests until price trades that level. One pending or open trade per coin.
 Each new order uses 2% of equity as margin. Take-profit and stop prices stay put.
-A signal whose take-profit is under 0.12 USDT is not placed.
+A signal whose take-profit does not cover the round-trip fee is not placed.
 """
 
 from __future__ import annotations
@@ -24,7 +24,11 @@ from src.smc.signals import BAR_MS, Setup, expired, flipped, setup_on_last_bar, 
 
 # Margin per order, as a fraction of equity. Notional is margin times leverage.
 MARGIN_PCT = 0.02
-MIN_VALID_TP_USDT = 0.12
+# Stop-market entry is taker. The take-profit limit is maker.
+TAKER_FEE_RATE = 0.0005
+MAKER_FEE_RATE = 0.0002
+# Close a filled trade at the end of the 35–41 minute stable window.
+MAX_HOLD_SEC = 41 * 60
 _configured: set[str] = set()
 _saw_size: set[int] = set()
 _TERMINAL = frozenset({"filled", "canceled", "cancelled", "expired", "rejected"})
@@ -119,18 +123,26 @@ def entry_block_reason(signal_ts: int, rows) -> str | None:
     return None
 
 
+def round_trip_fee_usdt(entry: float, target: float, notional: float) -> float:
+    """Taker fee to open plus maker fee to close at the take-profit price."""
+    if entry <= 0 or notional <= 0:
+        return 0.0
+    close_notional = float(notional) * float(target) / float(entry)
+    return float(notional) * TAKER_FEE_RATE + close_notional * MAKER_FEE_RATE
+
+
 def order_notional(entry: float, stop: float, target: float, equity: float) -> float | None:
     """Position notional for a fixed 2% margin.
 
     `stop` is unused. Size does not depend on stop distance.
-    Returns None when the take-profit is under 0.12 USDT.
+    Returns None when the take-profit does not cover the round-trip fee.
     """
     del stop
     if entry <= 0 or equity <= 0:
         return None
     notional = float(equity) * MARGIN_PCT * LEVERAGE
     reward = abs(float(target) - float(entry)) / float(entry) * notional
-    if reward < MIN_VALID_TP_USDT:
+    if reward < round_trip_fee_usdt(entry, target, notional):
         return None
     return notional
 
@@ -311,7 +323,7 @@ def _finish_open(row, *, close_px: float, fee_close: float, reason: str) -> None
     _notify_close(row, close_px=close_px, pnl=pnl, reason=reason)
 
 
-def _market_stop(row) -> None:
+def _market_close(row, *, reason: str, fallback: float) -> None:
     from src.exchange.binance import close_position_side
     from src.exchange.fills import resolve_order_fill, resolve_order_commission
 
@@ -323,12 +335,16 @@ def _market_stop(row) -> None:
     try:
         result = close_position_side(symbol, side, size)
     except ExchangeClientError as exc:
-        logging.warning("SMC stop %s failed: %s", symbol, exc)
+        logging.warning("SMC %s %s failed: %s", reason, symbol, exc)
         return
-    fill = resolve_order_fill(symbol, result, fallback_price=float(row["stop_px"]))
+    fill = resolve_order_fill(symbol, result, fallback_price=fallback)
     oid = str(result.get("orderId") or "")
     fee = resolve_order_commission(oid) if oid else 0.0
-    _finish_open(row, close_px=fill, fee_close=fee, reason="stop")
+    _finish_open(row, close_px=fill, fee_close=fee, reason=reason)
+
+
+def _market_stop(row) -> None:
+    _market_close(row, reason="stop", fallback=float(row["stop_px"]))
 
 
 def _apply_detail(row, detail: dict) -> None:
@@ -473,7 +489,7 @@ def _scan(now_ms: int) -> None:
             free -= margin
 
 
-def _opened_age_sec(row) -> float | None:
+def _opened_age_sec(row, now_sec: float | None = None) -> float | None:
     raw = str(row["opened_at"] or "")
     if not raw:
         return None
@@ -483,7 +499,14 @@ def _opened_age_sec(row) -> float | None:
         return None
     if opened.tzinfo is None:
         opened = opened.replace(tzinfo=timezone.utc)
-    return time.time() - opened.timestamp()
+    now = time.time() if now_sec is None else now_sec
+    return now - opened.timestamp()
+
+
+def hold_limit_reached(opened_at: str, now_sec: float, limit_sec: float = MAX_HOLD_SEC) -> bool:
+    """True once a filled trade has been open for the stable-window limit."""
+    age = _opened_age_sec({"opened_at": opened_at}, now_sec)
+    return age is not None and age >= limit_sec
 
 
 def _held_size(symbol: str, side: str) -> float | None:
@@ -541,6 +564,13 @@ def _guard(row, now_ms: int) -> None:
             logging.info("SMC cancel pending %s %s", symbol, reason)
         return
     fresh = store.get_trade(int(row["id"])) or row
+    now_sec = now_ms / 1000.0
+    if hold_limit_reached(str(fresh["opened_at"] or ""), now_sec):
+        held = _held_size(symbol, side)
+        if held is not None and held > 1e-12:
+            logging.info("SMC time stop %s %s after %.0fs", symbol, side, MAX_HOLD_SEC)
+            _market_close(fresh, reason="time", fallback=float(_mark(symbol) or fresh["fill_px"] or fresh["entry_px"]))
+            return
     if not str(fresh["stop_order_id"] or "") or not str(fresh["tp_order_id"] or ""):
         _place_brackets(fresh)
         fresh = store.get_trade(int(row["id"])) or fresh

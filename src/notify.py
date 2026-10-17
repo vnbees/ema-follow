@@ -124,7 +124,7 @@ def notify_smc_close(
     try:
         if not discord_configured():
             return
-        label = {"tp": "chốt lời", "stop": "cắt lỗ", "flat": "đóng tay"}.get(reason, reason)
+        label = {"tp": "chốt lời", "stop": "cắt lỗ", "flat": "đóng tay", "time": "hết 41 phút"}.get(reason, reason)
         title = f"{symbol.upper()} {side.upper()} đóng — {label}"
         body = (
             f"entry={_fmt_px(entry)}  cắt lỗ={_fmt_px(stop)}  chốt={_fmt_px(tp)}\n"

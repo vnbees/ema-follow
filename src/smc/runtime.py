@@ -75,7 +75,7 @@ def run_forever() -> None:
     _seed_available_book()
     logging.info(
         "SMC reverse: swing 50, wick ≤ 0.8 ATR, stop-entry at the swing, "
-        "target at the wick, stop at the midpoint, 16-bar TTL, "
+        "target at the wick, stop at the midpoint, 41-minute hold, 16-bar TTL, "
         "margin 2% of equity, leverage 10"
     )
     while not flatten_donchian_once():

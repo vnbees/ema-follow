@@ -988,6 +988,23 @@ def _dual_payload() -> dict:
 _SMC_REPORT_FROM = datetime(2026, 10, 14, 9, 14, 54, tzinfo=timezone.utc)
 
 
+def smc_report_from() -> datetime:
+    """Dashboard window. A settings row resets the numbers without deleting trades."""
+    from src.database import get_setting
+
+    raw = get_setting("smc_report_from", "")
+    if raw:
+        try:
+            stamp = datetime.fromisoformat(raw)
+        except ValueError:
+            stamp = None
+        if stamp is not None:
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            return stamp
+    return _SMC_REPORT_FROM
+
+
 def _smc_in_report(row: dict) -> bool:
     raw = str(row.get("opened_at") or row.get("created_at") or "")
     if not raw:
@@ -998,7 +1015,7 @@ def _smc_in_report(row: dict) -> bool:
         return False
     if stamp.tzinfo is None:
         stamp = stamp.replace(tzinfo=timezone.utc)
-    return stamp >= _SMC_REPORT_FROM
+    return stamp >= smc_report_from()
 
 
 def _smc_mark(symbol: str) -> float:
@@ -1107,6 +1124,7 @@ def _smc_payload() -> dict:
         "open": open_view,
         "pending": pending_view,
         "recent": recent,
+        "report_from": format_vn_time(smc_report_from().isoformat()),
         "trading_enabled": is_trading_enabled(),
         "last_cycle_at": format_vn_time(get_last_cycle_at()),
     }
