@@ -9,6 +9,8 @@ from src.smc.broker import (
     book_qty,
     entry_block_reason,
     hold_limit_reached,
+    KEEP_FRAC,
+    should_halve,
     order_notional,
     round_trip_fee_usdt,
 )
@@ -210,18 +212,18 @@ class TestSmcSweep(unittest.TestCase):
         self.assertEqual(state["stop_n"], 0)
         self.assertEqual(state["tp_n"], 1)
 
-    def test_notional_is_two_percent_margin_regardless_of_stop(self) -> None:
-        # 1000 USDT equity, leverage 10 → 20 USDT margin, 200 USDT notional.
+    def test_notional_is_ten_percent_margin_regardless_of_stop(self) -> None:
+        # 1000 USDT equity, leverage 10 → 100 USDT margin, 1000 USDT notional.
         tight = order_notional(100.0, 98.8, 101.0, 1000.0)
         wide = order_notional(100.0, 96.4, 101.0, 1000.0)
-        self.assertAlmostEqual(tight, 200.0)
-        self.assertAlmostEqual(wide, 200.0)
+        self.assertAlmostEqual(tight, 1000.0)
+        self.assertAlmostEqual(wide, 1000.0)
 
     def test_target_below_round_trip_fee_is_not_placed(self) -> None:
-        # 800 equity → notional 160. Fee is taker 0.05% in plus maker 0.02% out.
-        notional = 160.0
+        # 800 equity → notional 800. Fee is taker 0.05% in plus maker 0.02% out.
+        notional = 800.0
         fee = round_trip_fee_usdt(100.0, 100.05, notional)
-        self.assertAlmostEqual(fee, 160 * 0.0005 + 160 * 1.0005 * 0.0002)
+        self.assertAlmostEqual(fee, 800 * 0.0005 + 800 * 1.0005 * 0.0002)
         self.assertIsNone(order_notional(100.0, 99.0, 100.05, 800.0))
         self.assertEqual(order_notional(100.0, 99.0, 100.10, 800.0), notional)
 
@@ -236,6 +238,14 @@ class TestSmcSweep(unittest.TestCase):
         self.assertFalse(hold_limit_reached(opened, MAX_HOLD_SEC - 1))
         self.assertTrue(hold_limit_reached(opened, MAX_HOLD_SEC))
         self.assertTrue(hold_limit_reached(opened, 50 * 60))
+
+    def test_against_move_cuts_the_fill_to_one_percent(self) -> None:
+        self.assertTrue(should_halve("against"))
+        self.assertTrue(should_halve("flat"))
+        self.assertFalse(should_halve("with"))
+        self.assertFalse(should_halve("unknown"))
+        self.assertIsNone(should_halve(None))
+        self.assertAlmostEqual(KEEP_FRAC, 0.1)
 
     def test_stop_side(self) -> None:
         self.assertTrue(stop_hit("long", 10.0, 10.0))

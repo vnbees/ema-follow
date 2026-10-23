@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ exchange_name }} fade 5m</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #0f1117; color: #e6edf3; overflow-x: hidden; }
+    h1 { margin: 0 0 4px; font-size: 22px; line-height: 1.25; }
+    a { color: #58a6ff; }
+    .meta { color: #8b949e; font-size: 13px; margin: 4px 0 16px; overflow-wrap: anywhere; }
+    .lead { max-width: 72rem; }
+    .green { color: #3fb950; }
+    .red { color: #f85149; }
+    .panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    .scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #30363d; text-align: left; vertical-align: top; }
+    th { color: #8b949e; font-size: 11px; text-transform: uppercase; }
+    .side { font-size: 12px; font-weight: 700; padding: 2px 7px; border-radius: 4px; color: #fff; white-space: nowrap; }
+    .side.long { background: #238636; }
+    .side.short { background: #da3633; }
+    .side.flat { background: #30363d; color: #8b949e; }
+    .block { cursor: pointer; }
+    .block:hover { background: #21262d; }
+    .caret { display: inline-block; width: 12px; color: #8b949e; }
+    .mcard { border-bottom: 1px solid #30363d; padding: 10px 0; }
+    .mcard:last-child { border-bottom: 0; }
+    .mrow { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+    .msub { color: #8b949e; font-size: 12px; margin-top: 4px; line-height: 1.45; }
+    .order { padding: 8px 0 8px 16px; border-bottom: 1px solid #30363d; font-size: 12px; }
+    .empty { color: #8b949e; padding: 8px 0; }
+    @media (max-width: 720px) {
+      body { padding: 12px; }
+      h1 { font-size: 18px; }
+      .lead { display: none; }
+      .panel { padding: 12px; margin: 12px 0; }
+      table { font-size: 12px; }
+      th, td { padding: 7px 6px; }
+      #coins-table, #pending-table, #opens-table { display: none; }
+      #coins-cards, #pending-cards, #opens-cards { display: block; }
+    }
+    @media (min-width: 721px) {
+      #coins-cards, #pending-cards, #opens-cards { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <h1>{{ exchange_name }} fade 5m vs nến 4h</h1>
+  <p class="meta lead">Lot ~1 USDT. Fade 5m vs 4h. TP 1 ATR 5m; hết nến 4h đóng market. Cover opposite+1 khi 4h đổi màu. Cùng chiều đang lãi thì không cộng thêm.
+    <a href="/so-lenh">SMC cũ</a> · <a href="/donchian">Donchian</a></p>
+  <p class="meta" id="status">Đang tải…</p>
+  <div class="panel">
+    <div class="scroll" id="coins-table">
+      <table>
+        <thead><tr><th>Coin</th><th>4h</th><th>Close</th><th>Vào lệnh</th><th>Chờ</th><th>Giữ</th></tr></thead>
+        <tbody id="coins"></tbody>
+      </table>
+    </div>
+    <div id="coins-cards"></div>
+  </div>
+  <div class="panel">
+    <p class="meta">Limit chờ</p>
+    <div class="scroll" id="pending-table">
+      <table>
+        <thead><tr><th>Coin</th><th>P</th><th>Giá</th><th>Nến 5m</th></tr></thead>
+        <tbody id="pending"></tbody>
+      </table>
+    </div>
+    <div id="pending-cards"></div>
+  </div>
+  <div class="panel">
+    <p class="meta">Đang giữ</p>
+    <div class="scroll" id="opens-table">
+      <table>
+        <thead><tr><th>Coin</th><th>P</th><th>Giá vào</th><th>TP</th><th>Qty</th><th>Nến 5m</th></tr></thead>
+        <tbody id="opens"></tbody>
+      </table>
+    </div>
+    <div id="opens-cards"></div>
+  </div>
+  <div class="panel">
+    <p class="meta">Đóng gần đây · PnL sổ <span id="closedPnl">—</span></p>
+    <div id="closed"></div>
+  </div>
+<script>
+const openBlocks = new Set();
+function px(v){ return v==null ? '—' : Number(v).toPrecision(6); }
+function sideCell(s){
+  const k = (s||'flat').toLowerCase();
+  return '<span class="side '+k+'">'+(s||'flat')+'</span>';
+}
+function bar(ts){
+  if(!ts) return '—';
+  return new Date(Number(ts)).toLocaleString('vi-VN', {
+    timeZone:'Asia/Ho_Chi_Minh',
+    day:'2-digit', month:'2-digit',
+    hour:'2-digit', minute:'2-digit',
+    hour12:false
+  });
+}
+function vnClock(ts){
+  if(!ts) return '—';
+  return new Date(Number(ts)).toLocaleTimeString('vi-VN', {
+    timeZone:'Asia/Ho_Chi_Minh', hour:'2-digit', minute:'2-digit', hour12:false
+  });
+}
+function vnDay(ts){
+  if(!ts) return '';
+  return new Date(Number(ts)).toLocaleDateString('vi-VN', {
+    timeZone:'Asia/Ho_Chi_Minh', day:'2-digit', month:'2-digit'
+  });
+}
+function blockLabel(b){
+  return vnDay(b.bucket_ts)+' · '+vnClock(b.bucket_ts)+' → '+vnClock(b.end_ts);
+}
+function pnlCell(v){
+  const n = Number(v||0);
+  return '<span class="'+(n>=0?'green':'red')+'">'+(n>=0?'+':'')+n.toFixed(4)+'</span>';
+}
+function toggleBlock(id){
+  const key = String(id);
+  if (openBlocks.has(key)) openBlocks.delete(key);
+  else openBlocks.add(key);
+  const last = window._fadeClosed;
+  if (last) renderClosed(last);
+}
+function renderClosed(blocks){
+  window._fadeClosed = blocks;
+  if (!blocks || !blocks.length) {
+    document.getElementById('closed').innerHTML = '<div class="empty">Chưa có</div>';
+    return;
+  }
+  document.getElementById('closed').innerHTML = blocks.map(b => {
+    const key = String(b.bucket_ts);
+    const open = openBlocks.has(key);
+    const head = '<div class="mcard block" onclick="toggleBlock('+key+')"><div class="mrow"><span><span class="caret">'+(open?'▾':'▸')+'</span> '+blockLabel(b)+'</span><span>'+pnlCell(b.pnl)+'</span></div><div class="msub">'+b.n+' lệnh</div></div>';
+    if (!open) return head;
+    const rows = (b.orders||[]).map(row =>
+      '<div class="order"><div class="mrow"><span>'+row.symbol+' '+sideCell(row.side)+'</span>'+pnlCell(row.pnl)+'</div>'+
+      '<div class="msub">mở '+bar(row.opened_ts)+' · đóng '+bar(row.closed_ts)+'</div>'+
+      '<div class="msub">'+px(row.entry_px)+' → '+px(row.exit_px)+' · '+(row.reason||'')+'</div></div>'
+    ).join('');
+    return head + (rows || '<div class="empty">Không có lệnh</div>');
+  }).join('');
+}
+async function refresh(){
+  const r = await fetch('/api/fade5m');
+  if(!r.ok) return;
+  const d = await r.json();
+  let live = 'TẮT';
+  if (d.trading_enabled) {
+    if (d.entries_open) live = 'LIVE';
+    else {
+      const now = (d.live_now||[]).join(',') || 'none';
+      live = now+' LIVE · còn lại chờ '+(d.start_at||'')+' +07';
+    }
+  }
+  if (d.switch_at && !d.switched) live += ' · đổi list '+d.switch_at+' +07';
+  document.getElementById('status').textContent =
+    (d.n_symbols||0)+' coin · chờ '+d.n_pending+' · giữ '+d.n_open+' · '+live+
+    (d.flattening ? ' · đang đóng hết nến 4h' : '');
+  const coinRows = d.rows||[];
+  document.getElementById('coins').innerHTML = coinRows.map(row =>
+    '<tr><td>'+row.symbol+'</td><td>'+(row.h4==='green'?'xanh':row.h4==='red'?'đỏ':'doji')+'</td><td>'+px(row.last_close)+'</td><td>'+(row.entries_open?'LIVE':'chờ')+'</td><td>'+row.n_pending+'</td><td>'+row.n_open+'</td></tr>'
+  ).join('') || '<tr><td colspan="6">Chưa có WS</td></tr>';
+  document.getElementById('coins-cards').innerHTML = coinRows.map(row =>
+    '<div class="mcard"><div class="mrow"><strong>'+row.symbol+'</strong><span>'+(row.h4==='green'?'xanh':row.h4==='red'?'đỏ':'doji')+' · '+px(row.last_close)+'</span></div><div class="msub">'+(row.entries_open?'LIVE':'chờ')+' · chờ '+row.n_pending+' · giữ '+row.n_open+'</div></div>'
+  ).join('') || '<div class="empty">Chưa có WS</div>';
+  document.getElementById('closedPnl').textContent = (d.closed_pnl>=0?'+':'')+Number(d.closed_pnl||0).toFixed(2)+' USDT';
+  const pending = d.pending||[];
+  document.getElementById('pending').innerHTML = pending.map(row =>
+    '<tr><td>'+row.symbol+'</td><td>'+sideCell(row.side)+'</td><td>'+px(row.limit_px)+'</td><td>'+bar(row.bar_ts)+'</td></tr>'
+  ).join('') || '<tr><td colspan="4">Không có</td></tr>';
+  document.getElementById('pending-cards').innerHTML = pending.map(row =>
+    '<div class="mcard"><div class="mrow"><span>'+row.symbol+' '+sideCell(row.side)+'</span><span>'+px(row.limit_px)+'</span></div><div class="msub">'+bar(row.bar_ts)+'</div></div>'
+  ).join('') || '<div class="empty">Không có</div>';
+  const opens = d.opens||[];
+  document.getElementById('opens').innerHTML = opens.map(row =>
+    '<tr><td>'+row.symbol+'</td><td>'+sideCell(row.side)+'</td><td>'+px(row.entry_px)+'</td><td>'+px(row.tp_px)+'</td><td>'+row.qty+'</td><td>'+bar(row.opened_ts||row.bar_ts)+'</td></tr>'
+  ).join('') || '<tr><td colspan="6">Không có</td></tr>';
+  document.getElementById('opens-cards').innerHTML = opens.map(row =>
+    '<div class="mcard"><div class="mrow"><span>'+row.symbol+' '+sideCell(row.side)+'</span><span>'+px(row.entry_px)+'</span></div><div class="msub">TP '+px(row.tp_px)+' · qty '+row.qty+' · '+bar(row.opened_ts||row.bar_ts)+'</div></div>'
+  ).join('') || '<div class="empty">Không có</div>';
+  renderClosed(d.closed_blocks||[]);
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

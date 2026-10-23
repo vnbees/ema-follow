@@ -970,39 +970,62 @@ def main() -> None:
                     if _top_symbols():
                         break
                 initial_symbols = _top_symbols()
-            if initial_symbols:
-                _sync_watched(initial_symbols)
-            _start_boot_warmup(initial_symbols or [])
+            from src.fade5m.config import ENABLED as FADE5M_ENABLED, watch_symbols as fade_watch
+            from src.trend4h.config import ENABLED as TREND4H_ENABLED
+
+            if FADE5M_ENABLED:
+                from src.exchange.binance_ws import set_watched_symbols, watch_fade5m_symbols
+
+                set_watched_symbols([])
+                fade_syms = fade_watch()
+                watch_fade5m_symbols(fade_syms)
+                logging.info(
+                    "Fade5m on — kline WS 5m+4h %s, skip 15m REST warmup",
+                    ",".join(fade_syms),
+                )
+            else:
+                if initial_symbols:
+                    _sync_watched(initial_symbols)
+                if TREND4H_ENABLED:
+                    logging.info("Trend4h on — skip 15m REST warmup, seed 4h klines one coin at a time")
+                else:
+                    _start_boot_warmup(initial_symbols or [])
     except Exception as exc:  # noqa: BLE001
         logging.warning("Binance WS start skipped: %s", exc)
         notify_error("Binance WS start", str(exc))
 
+    from src.fade5m.config import ENABLED as FADE5M_ENABLED
+    from src.trend4h.config import ENABLED as TREND4H_ENABLED
+
     smc_on = os.getenv("SMC_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-    if not smc_on:
+    if FADE5M_ENABLED or TREND4H_ENABLED:
+        smc_on = False
+    if not smc_on and not TREND4H_ENABLED and not FADE5M_ENABLED:
         start_watcher()
 
-    logging.info("%s Donchian Parallel-Trend bot started", EXCHANGE_DISPLAY_NAME)
-    logging.info("Dashboard: http://localhost:%d", WEB_PORT)
-    logging.info(
-        "Logic: Donchian(%d) slope_lb=%d tol=%.3f%% interval=%s | WS kline=%s | scan=%s | "
-        "margin=%.2f%% (cap %.0f%%) × %dx | max_open=%d top_k=%d | vol_ratio≥%.2f (period=%d)",
-        DONCHIAN_PERIOD, SLOPE_LOOKBACK, PARALLEL_TOL, INTERVAL, GRANULARITY,
-        f"fixed×{len(FIXED_SCAN_SYMBOLS)}" if SCAN_MODE == "fixed" else f"top-{TOP_N_SYMBOLS}",
-        MARGIN_PCT * 100, MARGIN_CAP_PCT * 100, LEVERAGE, MAX_OPEN, TOP_K_PER_CYCLE,
-        MIN_VOL_RATIO, VOL_RATIO_PERIOD,
-    )
-    if DUAL_LIMIT_ENABLED:
+    if not TREND4H_ENABLED and not FADE5M_ENABLED:
+        logging.info("%s Donchian Parallel-Trend bot started", EXCHANGE_DISPLAY_NAME)
+        logging.info("Dashboard: http://localhost:%d", WEB_PORT)
         logging.info(
-            "Dual limit: every signal → post-only LONG + SHORT, cancel after %d bar(s), "
-            "no lot cap, max %d coins. Market entry, stale-opposite and lệnh 2 are off.",
-            ENTRY_TTL_BARS,
-            MAX_COINS,
+            "Logic: Donchian(%d) slope_lb=%d tol=%.3f%% interval=%s | WS kline=%s | scan=%s | "
+            "margin=%.2f%% (cap %.0f%%) × %dx | max_open=%d top_k=%d | vol_ratio≥%.2f (period=%d)",
+            DONCHIAN_PERIOD, SLOPE_LOOKBACK, PARALLEL_TOL, INTERVAL, GRANULARITY,
+            f"fixed×{len(FIXED_SCAN_SYMBOLS)}" if SCAN_MODE == "fixed" else f"top-{TOP_N_SYMBOLS}",
+            MARGIN_PCT * 100, MARGIN_CAP_PCT * 100, LEVERAGE, MAX_OPEN, TOP_K_PER_CYCLE,
+            MIN_VOL_RATIO, VOL_RATIO_PERIOD,
         )
-    elif STALE_OPP_HOURS > 0:
-        logging.info(
-            "Stale opposite: allow one reverse entry when the open lot is losing for ≥ %.0fh",
-            STALE_OPP_HOURS,
-        )
+        if DUAL_LIMIT_ENABLED:
+            logging.info(
+                "Dual limit: every signal → post-only LONG + SHORT, cancel after %d bar(s), "
+                "no lot cap, max %d coins. Market entry, stale-opposite and lệnh 2 are off.",
+                ENTRY_TTL_BARS,
+                MAX_COINS,
+            )
+        elif STALE_OPP_HOURS > 0:
+            logging.info(
+                "Stale opposite: allow one reverse entry when the open lot is losing for ≥ %.0fh",
+                STALE_OPP_HOURS,
+            )
     if is_trading_enabled():
         logging.info("Trading: LIVE")
     else:
@@ -1023,9 +1046,25 @@ def main() -> None:
             SPOT_TRANSFER_EXECUTE_HHMM,
         )
 
+    if FADE5M_ENABLED:
+        logging.info("%s 5m fade vs 4h color bot started", EXCHANGE_DISPLAY_NAME)
+        logging.info("Dashboard: http://localhost:%d", WEB_PORT)
+        from src.fade5m.runtime import run_forever
+
+        run_forever()
+        return
+
+    if TREND4H_ENABLED:
+        logging.info("%s 4h Supertrend+ADX bot started", EXCHANGE_DISPLAY_NAME)
+        logging.info("Dashboard: http://localhost:%d", WEB_PORT)
+        from src.trend4h.runtime import run_forever
+
+        run_forever()
+        return
+
     if smc_on:
         logging.info("%s SMC liquidity-sweep bot started", EXCHANGE_DISPLAY_NAME)
-        logging.info("Dashboard: http://localhost:%d  (Donchian cũ: /donchian)", WEB_PORT)
+        logging.info("Dashboard: http://localhost:%d  (sổ lệnh: /so-lenh, Donchian cũ: /donchian)", WEB_PORT)
         from src.smc.runtime import run_forever
 
         run_forever()

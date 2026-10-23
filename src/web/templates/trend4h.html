@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ exchange_name }} Supertrend 4h</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #0f1117; color: #e6edf3; }
+    h1 { margin: 0 0 4px; font-size: 22px; }
+    a { color: #58a6ff; }
+    .meta { color: #8b949e; font-size: 13px; margin: 4px 0 16px; }
+    .green { color: #3fb950; }
+    .red { color: #f85149; }
+    .panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #30363d; text-align: left; }
+    th { color: #8b949e; font-size: 11px; text-transform: uppercase; }
+    .side { font-size: 12px; font-weight: 700; padding: 2px 7px; border-radius: 4px; color: #fff; }
+    .side.long { background: #238636; }
+    .side.short { background: #da3633; }
+    .side.flat { background: #30363d; color: #8b949e; }
+  </style>
+</head>
+<body>
+  <h1>{{ exchange_name }} Supertrend 4h + ADX</h1>
+  <p class="meta">20 coin · nến 4h · Supertrend(10, 3) · chỉ đảo khi ADX ≥ 25 · 1 USDT × 10 · taker tại đóng nến.
+    <a href="/so-lenh">SMC cũ</a> · <a href="/donchian">Donchian</a></p>
+  <p class="meta" id="status">Đang tải…</p>
+  <div class="panel">
+    <table>
+      <thead>
+        <tr><th>Coin</th><th>Muốn</th><th>Đang giữ</th><th>Giá vào</th><th>Nến 4h</th><th>Close</th></tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <div class="panel">
+    <p class="meta">Đóng gần đây · PnL sổ <span id="closedPnl">—</span></p>
+    <table>
+      <thead><tr><th>Coin</th><th>P</th><th>Vào</th><th>Ra</th><th>PnL</th><th>Lý do</th></tr></thead>
+      <tbody id="closed"></tbody>
+    </table>
+  </div>
+<script>
+function px(v){ return v==null ? '—' : Number(v).toPrecision(6); }
+function sideCell(s){
+  const k = (s||'flat').toLowerCase();
+  return '<span class="side '+k+'">'+(s||'flat')+'</span>';
+}
+async function refresh(){
+  const r = await fetch('/api/trend4h');
+  if(!r.ok) return;
+  const d = await r.json();
+  document.getElementById('status').textContent =
+    (d.retired ? 'Sách cũ đã tắt. ' : 'Đang đóng sách fade/Donchian… ') +
+    'Seed 4h '+d.seeded+'/'+d.need;
+  document.getElementById('closedPnl').textContent = (d.closed_pnl>=0?'+':'')+Number(d.closed_pnl||0).toFixed(2)+' USDT';
+  document.getElementById('rows').innerHTML = (d.rows||[]).map(row =>
+    '<tr><td>'+row.symbol+'</td><td>'+sideCell(row.want)+'</td><td>'+sideCell(row.side)+'</td><td>'+px(row.entry)+'</td><td>'+row.bars+'</td><td>'+px(row.last_close)+'</td></tr>'
+  ).join('');
+  document.getElementById('closed').innerHTML = (d.recent||[]).map(row =>
+    '<tr><td>'+row.symbol+'</td><td>'+sideCell(row.side)+'</td><td>'+px(row.entry_px)+'</td><td>'+px(row.exit_px)+'</td><td class="'+(row.pnl>=0?'green':'red')+'">'+(row.pnl>=0?'+':'')+Number(row.pnl||0).toFixed(4)+'</td><td>'+(row.reason||'')+'</td></tr>'
+  ).join('');
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

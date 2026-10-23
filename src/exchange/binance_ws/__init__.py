@@ -22,6 +22,7 @@ from src.exchange.binance_ws.manager import (
     set_watched_symbols,
     start_binance_ws,
     stop_binance_ws,
+    watch_fade5m_symbols,
     watch_symbols,
 )
 
@@ -47,5 +48,6 @@ __all__ = [
     "set_watched_symbols",
     "start_binance_ws",
     "stop_binance_ws",
+    "watch_fade5m_symbols",
     "watch_symbols",
 ]

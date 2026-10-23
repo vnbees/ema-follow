@@ -51,6 +51,15 @@ def _atr(highs: list[float], lows: list[float], closes: list[float]) -> list[flo
     return out
 
 
+def last_atr(highs: list[float], lows: list[float], closes: list[float]) -> float | None:
+    """ATR(14) on the latest bar, or None until the series is long enough."""
+    rows = _atr(highs, lows, closes)
+    if not rows:
+        return None
+    value = rows[-1]
+    return float(value) if value is not None and value > 0 else None
+
+
 def setups(
     ts: list[int],
     opens: list[float],

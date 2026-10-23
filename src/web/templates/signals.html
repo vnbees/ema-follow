@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ exchange_name }} Tín hiệu</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #0f1117; color: #e6edf3; }
+    h1 { margin: 0 0 4px; font-size: 22px; }
+    h2 { font-size: 16px; margin: 0 0 12px; }
+    a { color: #58a6ff; }
+    .meta { color: #8b949e; font-size: 13px; margin: 4px 0 12px; line-height: 1.45; }
+    .green { color: #3fb950; }
+    .red { color: #f85149; }
+    .controls { display: flex; align-items: center; gap: 10px; margin: 12px 0 16px; flex-wrap: wrap; }
+    .status-pill { border: 1px solid #30363d; border-radius: 999px; padding: 4px 10px; font-size: 12px; color: #d29922; }
+    button { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 7px 12px; cursor: pointer; }
+    form { margin: 0; }
+    .panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+    .summary-card { background: #0f1117; border: 1px solid #30363d; border-radius: 8px; padding: 12px; }
+    .summary-card .label { color: #8b949e; font-size: 12px; }
+    .summary-card .value { font-size: 18px; margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #30363d; text-align: left; white-space: nowrap; }
+    th { color: #8b949e; font-size: 11px; text-transform: uppercase; }
+    .table-wrap { overflow-x: auto; }
+    .side { font-size: 12px; font-weight: 700; padding: 2px 7px; border-radius: 4px; color: #fff; }
+    .side.long { background: #238636; }
+    .side.short { background: #da3633; }
+    .muted { color: #8b949e; }
+    td.num { font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <h1>{{ exchange_name }} Tín hiệu</h1>
+  <p class="meta">
+    Không đặt lệnh ở các coin khác. OP vào lệnh quay về mức tín hiệu: giá cách mức ít nhất 1%.
+    Mọi mức còn trong 7 ngày đều được theo dõi. Giá đang cao hơn thì mỗi nến 15m xanh mở short limit; giá đang thấp hơn thì mỗi nến đỏ mở long limit.
+    Nhiều mức cùng chiều chỉ mở một lệnh, gắn với mức gần giá nhất.
+    Chốt bằng limit cách giá khớp 1 ATR(14); khoảng cách tối thiểu phải đủ để sau phí còn lãi. Tổng vị thế OP đang lãi thì không mở thêm. Hết 7 ngày thì hủy lệnh chờ và đóng vị thế ngay bằng lệnh thị trường.
+    Ký quỹ mỗi lệnh 1 USDT, đòn bẩy 10.
+    Xác suất là tỷ lệ giá rời mức đó rồi chạm lại, đo từ 01/10/2025 đến 30/09/2026.
+    Cửa sổ 4 giờ là 16 nến, cửa sổ 1 ngày là 96 nến, cửa sổ 7 ngày là 672 nến, tính từ nến tín hiệu.
+    Sổ lệnh cũ: <a href="/so-lenh">/so-lenh</a>
+  </p>
+  <div class="controls">
+    <span class="status-pill">OP đang vào lệnh</span>
+    <form method="post" action="/logout"><button type="submit">Đăng xuất</button></form>
+    <span class="meta" style="margin:0;">Số liệu lúc <span id="asOf">—</span></span>
+  </div>
+  <div class="panel" id="revertPanel">
+    <h2>Lệnh quay về mức tín hiệu</h2>
+    <p class="meta" id="revertNote">Đang tải.</p>
+    <div id="revertBook"></div>
+  </div>
+  <div class="panel">
+    <div class="summary-grid" id="summary"></div>
+  </div>
+  <div class="panel">
+    <h2>Mức giá tín hiệu gần nhất</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Coin</th>
+            <th>Chiều</th>
+            <th>Mức quay về</th>
+            <th>Giá hiện tại</th>
+            <th>Cách mức</th>
+            <th>Tuổi tín hiệu</th>
+            <th>4 giờ</th>
+            <th>Cửa sổ 4 giờ</th>
+            <th>1 ngày</th>
+            <th>Cửa sổ 1 ngày</th>
+            <th>7 ngày</th>
+            <th>Cửa sổ 7 ngày</th>
+            <th>Nguồn xác suất</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </div>
+  <script>
+    const pct = (v) => (v == null ? "—" : Number(v).toFixed(1).replace(".", ",") + "%");
+    const card = (label, value, sub) =>
+      `<div class="summary-card"><div class="label">${label}</div><div class="value">${value}</div><div class="sub muted">${sub || ""}</div></div>`;
+    function age(min) {
+      if (min == null) return "—";
+      if (min < 60) return min + " phút";
+      const h = Math.floor(min / 60);
+      const m = min % 60;
+      if (h < 48) return h + " giờ " + m + " phút";
+      return Math.floor(h / 24) + " ngày " + (h % 24) + " giờ";
+    }
+    function paint(data) {
+      document.getElementById("asOf").textContent = data.as_of || "—";
+      const rows = data.rows || [];
+      const live = rows.filter((r) => r.has_signal && r.window_1d_open);
+      const withSignal = rows.filter((r) => r.has_signal);
+      document.getElementById("summary").innerHTML = [
+        card("Coin có tín hiệu", withSignal.length, "trong cửa sổ 400 nến 15m"),
+        card("Cửa sổ 1 ngày còn mở", live.length, "tính từ nến tín hiệu"),
+        card("Xác suất gộp 7 ngày", pct(data.pooled_7d), (data.pooled_n_7d || "") + " tín hiệu đủ 7 ngày, 20 coin"),
+        card("Xác suất gộp 1 ngày", pct(data.pooled_1d), (data.pooled_n_1d || data.pooled_n) + " tín hiệu đủ 1 ngày"),
+        card("Xác suất gộp 4 giờ", pct(data.pooled_4h), (data.pooled_n_4h || "") + " tín hiệu đủ 4 giờ"),
+      ].join("");
+      document.getElementById("rows").innerHTML = rows.map((r) => {
+        if (!r.has_signal) {
+          return `<tr><td>${r.symbol.replace("USDT","")}</td><td colspan="12" class="muted">Chưa có tín hiệu trong 400 nến 15m gần nhất</td></tr>`;
+        }
+        const dist = r.distance_pct == null ? "—" : (r.distance_pct >= 0 ? "+" : "") + r.distance_pct.toFixed(2).replace(".", ",") + "%";
+        const distClass = r.distance_pct == null ? "" : (r.distance_pct >= 0 ? "green" : "red");
+        const side = r.side === "long" ? "Long" : "Short";
+        const source = "nến 15m · 4 giờ " + r.n_4h + " · 1 ngày " + r.n_1d + " · 7 ngày " + r.n_7d;
+        return `<tr>
+          <td>${r.symbol.replace("USDT","")}</td>
+          <td><span class="side ${r.side}">${side}</span></td>
+          <td class="num">${r.entry_text}</td>
+          <td class="num">${r.mark_text}</td>
+          <td class="num ${distClass}">${dist}</td>
+          <td>${age(r.age_min)}<div class="muted">${r.signal_at || ""}</div></td>
+          <td class="num">${pct(r.prob_4h)}</td>
+          <td>${r.window_4h}</td>
+          <td class="num">${pct(r.prob_1d)}</td>
+          <td>${r.window_1d}</td>
+          <td class="num">${pct(r.prob_7d)}</td>
+          <td>${r.window_7d}</td>
+          <td class="muted">${source}</td>
+        </tr>`;
+      }).join("");
+    }
+    const reasonText = { tp: "đã chốt", expire: "hết 7 ngày", cancel: "hủy, chưa khớp" };
+    const statusText = { pending: "Chờ khớp", open: "Đang giữ", closed: "Đã đóng", cancelled: "Đã hủy" };
+    function paintBook(data) {
+      const coin = (data.coins || [])[0];
+      const note = document.getElementById("revertNote");
+      const host = document.getElementById("revertBook");
+      if (!coin) {
+        note.textContent = "Chưa có coin được bật.";
+        host.innerHTML = "";
+        return;
+      }
+      const pnl = coin.open_pnl == null ? "chưa có vị thế" : (coin.open_pnl >= 0 ? "+" : "") + coin.open_pnl.toFixed(4) + " USDT";
+      const block = coin.in_profit ? " Tổng vị thế đang lãi, không mở thêm." : "";
+      note.textContent = coin.symbol.replace("USDT", "") + " · giá " + coin.mark_text + " · lãi tạm tính " + pnl + "." + block + " Mỗi lệnh " + data.margin_usdt + " USDT, đòn bẩy " + data.leverage + ".";
+      if (!coin.signals.length) {
+        host.innerHTML = "<p class=\"meta\">Chưa có mức tín hiệu trong 7 ngày.</p>";
+        return;
+      }
+      host.innerHTML = coin.signals.map((sig) => {
+        const dist = sig.distance_pct == null ? "—" : (sig.distance_pct >= 0 ? "cao hơn " : "thấp hơn ") + Math.abs(sig.distance_pct).toFixed(2).replace(".", ",") + "%";
+        const rows = sig.orders.length ? sig.orders.map((o) => {
+          const why = reasonText[o.reason] || "";
+          const pnlCell = o.pnl == null ? "—" : (o.pnl >= 0 ? "+" : "") + Number(o.pnl).toFixed(4);
+          return `<tr>
+            <td>${o.bar_at}</td>
+            <td><span class="side ${o.side}">${o.side === "long" ? "Long" : "Short"}</span></td>
+            <td>${statusText[o.status] || o.status}${why ? " · " + why : ""}</td>
+            <td class="num">${o.entry_text}</td>
+            <td class="num">${o.tp_text}</td>
+            <td class="num">${o.close_text}</td>
+            <td class="num">${pnlCell}</td>
+          </tr>`;
+        }).join("") : `<tr><td colspan="7" class="muted">Chưa có lệnh ở mức này</td></tr>`;
+        return `<div style="margin-top:14px">
+          <div><strong>${sig.level_text}</strong> <span class="muted">tín hiệu ${sig.signal_at} · ${sig.window} · giá đang ${dist}</span></div>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Nến</th><th>Chiều</th><th>Trạng thái</th><th>Giá vào</th><th>Giá chốt</th><th>Giá đóng</th><th>Lãi</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table></div>
+        </div>`;
+      }).join("");
+    }
+    async function load() {
+      const res = await fetch("/api/signals");
+      if (res.status === 401) { window.location = "/login"; return; }
+      paint(await res.json());
+      const book = await fetch("/api/revert");
+      if (book.status === 401) { window.location = "/login"; return; }
+      paintBook(await book.json());
+    }
+    load();
+    setInterval(load, 15000);
+  </script>
+</body>
+</html>

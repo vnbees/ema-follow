@@ -146,6 +146,43 @@ class TestDiscordNotify(unittest.TestCase):
             )
             mock_send.assert_not_called()
 
+    def test_predict5m_open_pause_resume(self) -> None:
+        mock_resp = MagicMock(ok=True, status_code=204, text="")
+        with (
+            patch.object(notify, "DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/test/token"),
+            patch("src.notify.requests.post", return_value=mock_resp) as mock_post,
+        ):
+            notify.notify_predict5m_open(
+                "BNBUSDT", "DOWN", stake=2, step=1, window_start_ms=0, limit_px=0.32
+            )
+            notify.notify_predict5m_open(
+                "BNBUSDT",
+                "UP",
+                stake=1,
+                step=0,
+                window_start_ms=0,
+                limit_px=0.32,
+                interval="15m",
+            )
+            notify.notify_predict5m_pause(hours=1, until_ms=0)
+            notify.notify_predict5m_resume(stake=1)
+            notify.notify_predict5m_result(
+                "BNBUSDT",
+                "DOWN",
+                won=None,
+                filled=False,
+                stake=2,
+                pnl=0,
+                reason="unfilled:EXPIRED",
+            )
+            self.assertEqual(mock_post.call_count, 5)
+            titles = [c.kwargs["json"]["content"] for c in mock_post.call_args_list]
+            self.assertTrue(any("Prediction 5m" in t and "DOWN" in t for t in titles))
+            self.assertTrue(any("Prediction 15m" in t and "UP" in t for t in titles))
+            self.assertTrue(any("dừng 1h" in t for t in titles))
+            self.assertTrue(any("không khớp" in t for t in titles))
+            self.assertTrue(any("chạy lại" in t for t in titles))
+
 
 if __name__ == "__main__":
     unittest.main()

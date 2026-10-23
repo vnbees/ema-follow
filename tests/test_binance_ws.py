@@ -99,6 +99,7 @@ class TestMarketParsers(unittest.TestCase):
         CACHE.candles.clear()
         CACHE.candle_interval.clear()
         CACHE.candle_last_msg_at.clear()
+        CACHE.candles_extra.clear()
         apply_market_payload(
             {
                 "e": "kline",
@@ -170,6 +171,23 @@ class TestCacheCandlesAndRank(unittest.TestCase):
         assert got is not None
         self.assertEqual(len(got), 2)
         self.assertEqual(got[-1].timestamp, 200)
+
+    def test_extra_5m_does_not_clobber_15m(self):
+        from src.config import GRANULARITY
+
+        if GRANULARITY == "5m":
+            self.skipTest("GRANULARITY is 5m")
+        c15 = Candle(timestamp=100, open=1, high=2, low=0.5, close=1.5, volume=1)
+        c5 = Candle(timestamp=200, open=2, high=3, low=1, close=2.5, volume=2)
+        self.cache.set_candles("OPUSDT", GRANULARITY, [c15])
+        self.cache.upsert_kline_update("OPUSDT", "5m", c5, is_closed=True)
+        got15 = self.cache.get_candles("OPUSDT", GRANULARITY, 10)
+        got5 = self.cache.get_candles("OPUSDT", "5m", 10)
+        self.assertIsNotNone(got15)
+        self.assertIsNotNone(got5)
+        assert got15 is not None and got5 is not None
+        self.assertEqual(got15[-1].close, 1.5)
+        self.assertEqual(got5[-1].close, 2.5)
 
     def test_rank_sort_parity(self) -> None:
         self.cache.set_quote_volumes({"AAAUSDT": 10, "BBBUSDT": 50, "CCCUSDT": 30}, seeded=True)

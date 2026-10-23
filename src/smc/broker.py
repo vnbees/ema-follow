@@ -3,8 +3,11 @@
 The sweep signal is unchanged. The order is the opposite side: the wick is the
 take-profit and the midpoint is the stop. Entry is a stop at the swing extreme,
 so it rests until price trades that level. One pending or open trade per coin.
-Each new order uses 2% of equity as margin. Take-profit and stop prices stay put.
+Each new order uses 10% of equity as margin. Take-profit and stop prices stay put.
 A signal whose take-profit does not cover the round-trip fee is not placed.
+A filled trade stays open until its take-profit or stop. When the 15 minutes
+before the fill moved against the trade or were flat, the position is cut to 1%
+of equity and the brackets are placed on what remains.
 """
 
 from __future__ import annotations
@@ -22,12 +25,15 @@ from src.exchange.sizing import format_price, format_size
 from src.smc import store
 from src.smc.signals import BAR_MS, Setup, expired, flipped, setup_on_last_bar, stop_hit
 
-# Margin per order, as a fraction of equity. Notional is margin times leverage.
-MARGIN_PCT = 0.02
+# Margin locked when the stop is placed. A same-direction fill keeps this.
+# An against or flat fill is cut down to SMALL_MARGIN_PCT.
+MARGIN_PCT = 0.10
+SMALL_MARGIN_PCT = 0.01
+KEEP_FRAC = SMALL_MARGIN_PCT / MARGIN_PCT
 # Stop-market entry is taker. The take-profit limit is maker.
 TAKER_FEE_RATE = 0.0005
 MAKER_FEE_RATE = 0.0002
-# Close a filled trade at the end of the 35–41 minute stable window.
+# Kept for the research backtest. The live watcher does not close on this timer.
 MAX_HOLD_SEC = 41 * 60
 _configured: set[str] = set()
 _saw_size: set[int] = set()
@@ -132,7 +138,7 @@ def round_trip_fee_usdt(entry: float, target: float, notional: float) -> float:
 
 
 def order_notional(entry: float, stop: float, target: float, equity: float) -> float | None:
-    """Position notional for a fixed 2% margin.
+    """Position notional for a fixed 10% margin.
 
     `stop` is unused. Size does not depend on stop distance.
     Returns None when the take-profit does not cover the round-trip fee.
@@ -175,8 +181,7 @@ def _open_filled(row, *, fill_px: float, qty: float, fee_open: float) -> None:
     fresh = store.get_trade(int(row["id"]))
     if fresh is None:
         return
-    _place_brackets(fresh)
-    _notify_fill(fresh)
+    _settle_size(fresh)
 
 
 def _place_entry(trade_id: int, symbol: str, side: str, entry: float, margin: float) -> None:
@@ -317,10 +322,12 @@ def _finish_open(row, *, close_px: float, fee_close: float, reason: str) -> None
     qty = float(row["qty"] or 0)
     fee_open = float(row["fee_open"] or 0)
     pnl = _pnl(str(row["side"]), entry, close_px, qty, fee_open, fee_close)
+    pnl += float(_col(row, "cut_pnl") or 0)
     if not store.mark_closed(int(row["id"]), close_px=close_px, fee_close=fee_close, pnl=pnl, reason=reason):
         return
     logging.info("SMC close %s %s %s pnl %.2f", row["symbol"], row["side"], reason, pnl)
     _notify_close(row, close_px=close_px, pnl=pnl, reason=reason)
+    _close_hedge(row)
 
 
 def _market_close(row, *, reason: str, fallback: float) -> None:
@@ -376,11 +383,8 @@ def _apply_detail(row, detail: dict) -> None:
 
 
 def on_order_update(detail: dict | None) -> None:
-    if not detail:
-        return
-    row = store.find_by_order(str(detail.get("orderId") or ""))
-    if row is not None:
-        _apply_detail(row, detail)
+    """Order stream is ignored. The process only serves the signal page."""
+    del detail
 
 
 def _poll_fills() -> None:
@@ -504,9 +508,31 @@ def _opened_age_sec(row, now_sec: float | None = None) -> float | None:
 
 
 def hold_limit_reached(opened_at: str, now_sec: float, limit_sec: float = MAX_HOLD_SEC) -> bool:
-    """True once a filled trade has been open for the stable-window limit."""
+    """True once a filled trade has been open for the stable-window limit.
+
+    The live watcher does not call this. Research scripts still do.
+    """
     age = _opened_age_sec({"opened_at": opened_at}, now_sec)
     return age is not None and age >= limit_sec
+
+
+def should_halve(prior_dir: str | None) -> bool | None:
+    """Cut the fill from 10% margin to 1% when the prior 15 minutes were against or flat.
+
+    None means the reading is not ready. Only a same-direction move keeps the 10%.
+    """
+    if prior_dir is None:
+        return None
+    return prior_dir in {"against", "flat"}
+
+
+def _col(row, key: str, default=None):
+    if hasattr(row, "keys") and key not in row.keys():
+        return default
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
 
 
 def _held_size(symbol: str, side: str) -> float | None:
@@ -519,6 +545,116 @@ def _held_size(symbol: str, side: str) -> float | None:
     if pos is None:
         return None
     return float(pos.size or 0)
+
+
+def _settle_size(row) -> None:
+    """After the fill, cut an against or flat position from 10% margin down to 1%."""
+    from src.smc.track import _MARKS, prior_direction
+
+    if str(row["status"]) != "open" or _col(row, "size_cut"):
+        return
+    trade_id = int(row["id"])
+    direction = prior_direction(
+        str(row["symbol"]),
+        str(row["side"]),
+        float(row["fill_px"] or 0),
+        str(row["opened_at"] or ""),
+        _MARKS,
+        int(time.time() * 1000),
+    )
+    cut = should_halve(direction)
+    if cut is None:
+        return
+    if not store.claim_size_cut(trade_id):
+        return
+    try:
+        if cut:
+            _cut_to_small(row)
+        else:
+            store.mark_size_full(trade_id)
+    except Exception:
+        store.release_size_cut(trade_id)
+        raise
+    fresh = store.get_trade(trade_id)
+    if fresh is None or not _col(fresh, "size_cut"):
+        return
+    _place_brackets(fresh)
+    _notify_fill(fresh)
+
+
+def _cut_to_small(row) -> None:
+    from src.exchange.binance import close_position_side
+    from src.exchange.fills import resolve_order_commission, resolve_order_fill
+
+    trade_id = int(row["id"])
+    symbol = str(row["symbol"])
+    side = str(row["side"])
+    qty = float(row["qty"] or 0)
+    if qty <= 0:
+        store.mark_size_full(trade_id)
+        return
+    spec = fetch_contract_spec(symbol)
+    close_qty = float(format_size(qty * (1.0 - KEEP_FRAC), spec))
+    if close_qty <= 0 or close_qty >= qty - 1e-12:
+        store.mark_size_full(trade_id)
+        logging.info("SMC keep full size %s, cut %s is not smaller than %s", symbol, close_qty, qty)
+        return
+    _ensure(symbol)
+    _cancel_protective(row)
+    try:
+        result = close_position_side(symbol, side, format_size(close_qty, spec))
+    except ExchangeClientError as exc:
+        store.release_size_cut(trade_id)
+        logging.warning("SMC cut %s failed: %s", symbol, exc)
+        return
+    entry = float(row["fill_px"] or row["entry_px"] or 0)
+    close_px = resolve_order_fill(symbol, result, fallback_price=_mark(symbol) or entry)
+    oid = str(result.get("orderId") or "")
+    fee_close = resolve_order_commission(oid) if oid else close_qty * close_px * TAKER_FEE_RATE
+    fee_open = float(row["fee_open"] or 0)
+    fee_cut = fee_open * (close_qty / qty)
+    pnl = _pnl(side, entry, close_px, close_qty, fee_cut, fee_close)
+    remain = qty - close_qty
+    margin = float(row["margin_usdt"] or 0) * (remain / qty)
+    store.mark_size_half(
+        trade_id,
+        qty=remain,
+        fee_open=fee_open - fee_cut,
+        margin=margin,
+        cut_pnl=pnl,
+        label="small",
+    )
+    logging.info("SMC cut %s %s closed %.8g remain %.8g pnl %.2f", symbol, side, close_qty, remain, pnl)
+
+
+def _close_hedge(row) -> None:
+    from src.exchange.binance import close_position_side
+    from src.exchange.fills import resolve_order_commission, resolve_order_fill
+
+    fresh = store.get_trade(int(row["id"])) or row
+    if str(_col(fresh, "hedge_status") or "") != "open":
+        return
+    symbol = str(fresh["symbol"])
+    side = str(_col(fresh, "hedge_side") or "")
+    qty = float(_col(fresh, "hedge_qty") or 0)
+    if not side or qty <= 0:
+        return
+    spec = fetch_contract_spec(symbol)
+    size = format_size(qty, spec)
+    try:
+        result = close_position_side(symbol, side, size)
+    except ExchangeClientError as exc:
+        logging.warning("SMC hedge close %s %s failed: %s", symbol, side, exc)
+        return
+    entry = float(_col(fresh, "hedge_fill_px") or 0)
+    fallback = _mark(symbol) or entry
+    fill = resolve_order_fill(symbol, result, fallback_price=fallback)
+    oid = str(result.get("orderId") or "")
+    fee_close = resolve_order_commission(oid) if oid else qty * fill * TAKER_FEE_RATE
+    fee_open = qty * entry * TAKER_FEE_RATE
+    pnl = _pnl(side, entry, fill, qty, fee_open, fee_close)
+    if store.mark_hedge_closed(int(fresh["id"]), close_px=fill, pnl=pnl):
+        logging.info("SMC hedge close %s %s pnl %.2f", symbol, side, pnl)
 
 
 def _guard(row, now_ms: int) -> None:
@@ -564,13 +700,11 @@ def _guard(row, now_ms: int) -> None:
             logging.info("SMC cancel pending %s %s", symbol, reason)
         return
     fresh = store.get_trade(int(row["id"])) or row
-    now_sec = now_ms / 1000.0
-    if hold_limit_reached(str(fresh["opened_at"] or ""), now_sec):
-        held = _held_size(symbol, side)
-        if held is not None and held > 1e-12:
-            logging.info("SMC time stop %s %s after %.0fs", symbol, side, MAX_HOLD_SEC)
-            _market_close(fresh, reason="time", fallback=float(_mark(symbol) or fresh["fill_px"] or fresh["entry_px"]))
-            return
+    if str(fresh["status"]) == "open" and not _col(fresh, "size_cut"):
+        _settle_size(fresh)
+        fresh = store.get_trade(int(row["id"])) or fresh
+    if not _col(fresh, "size_cut"):
+        return
     if not str(fresh["stop_order_id"] or "") or not str(fresh["tp_order_id"] or ""):
         _place_brackets(fresh)
         fresh = store.get_trade(int(row["id"])) or fresh
@@ -595,6 +729,8 @@ def manage(now_ms: int | None = None) -> None:
     now = int(now_ms if now_ms is not None else time.time() * 1000)
     if not has_credentials():
         return
+    for row in store.hedges_still_open():
+        _close_hedge(row)
     _poll_fills()
     for row in store.active_rows():
         _guard(row, now)

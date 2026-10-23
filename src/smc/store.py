@@ -59,6 +59,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(smc_trades)")}
     if "stop_order_id" not in cols:
         conn.execute("ALTER TABLE smc_trades ADD COLUMN stop_order_id TEXT")
+    for name, decl in (
+        ("hedge_side", "TEXT"),
+        ("hedge_qty", "REAL"),
+        ("hedge_status", "TEXT"),
+        ("hedge_order_id", "TEXT"),
+        ("hedge_fill_px", "REAL"),
+        ("hedge_close_px", "REAL"),
+        ("hedge_pnl", "REAL"),
+        ("size_cut", "TEXT"),
+        ("cut_pnl", "REAL"),
+    ):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE smc_trades ADD COLUMN {name} {decl}")
 
 
 def has_signal(symbol: str, signal_ts: int) -> bool:
@@ -214,6 +227,151 @@ def mark_closed(
             (close_px, fee_close, pnl, reason, now, trade_id),
         )
         return cur.rowcount > 0
+
+
+def claim_size_cut(trade_id: int) -> bool:
+    with _lock, get_connection() as conn:
+        ensure_schema(conn)
+        cur = conn.execute(
+            """
+            UPDATE smc_trades SET size_cut = 'pending'
+            WHERE id = ? AND status = 'open' AND size_cut IS NULL
+            """,
+            (trade_id,),
+        )
+        return cur.rowcount > 0
+
+
+def release_size_cut(trade_id: int) -> None:
+    with _lock, get_connection() as conn:
+        ensure_schema(conn)
+        conn.execute(
+            """
+            UPDATE smc_trades SET size_cut = NULL
+            WHERE id = ? AND size_cut = 'pending'
+            """,
+            (trade_id,),
+        )
+
+
+def mark_size_full(trade_id: int) -> None:
+    with _lock, get_connection() as conn:
+        ensure_schema(conn)
+        conn.execute(
+            """
+            UPDATE smc_trades SET size_cut = 'full'
+            WHERE id = ? AND size_cut = 'pending'
+            """,
+            (trade_id,),
+        )
+
+
+def mark_size_half(
+    trade_id: int,
+    *,
+    qty: float,
+    fee_open: float,
+    margin: float,
+    cut_pnl: float,
+    label: str = "half",
+) -> None:
+    with _lock, get_connection() as conn:
+        ensure_schema(conn)
+        conn.execute(
+            """
+            UPDATE smc_trades
+            SET size_cut = ?, qty = ?, fee_open = ?, margin_usdt = ?, cut_pnl = ?
+            WHERE id = ? AND size_cut = 'pending'
+            """,
+            (label, qty, fee_open, margin, cut_pnl, trade_id),
+        )
+
+
+def claim_hedge(trade_id: int) -> bool:
+    """One attempt to open the opposite order. A second caller finds the claim."""
+    with _lock, get_connection() as conn:
+        ensure_schema(conn)
+        cur = conn.execute(
+            """
+            UPDATE smc_trades SET hedge_status = 'pending'
+            WHERE id = ? AND status = 'open' AND hedge_status IS NULL
+            """,
+            (trade_id,),
+        )
+        return cur.rowcount > 0
+
+
+def release_hedge_claim(trade_id: int) -> None:
+    with _lock, get_connection() as conn:
+        ensure_schema(conn)
+        conn.execute(
+            """
+            UPDATE smc_trades SET hedge_status = NULL
+            WHERE id = ? AND hedge_status = 'pending'
+            """,
+            (trade_id,),
+        )
+
+
+def mark_hedge_open(trade_id: int, *, side: str, qty: float, order_id: str, fill_px: float) -> None:
+    with _lock, get_connection() as conn:
+        ensure_schema(conn)
+        conn.execute(
+            """
+            UPDATE smc_trades
+            SET hedge_status = 'open', hedge_side = ?, hedge_qty = ?,
+                hedge_order_id = ?, hedge_fill_px = ?
+            WHERE id = ? AND hedge_status = 'pending'
+            """,
+            (side, qty, order_id, fill_px, trade_id),
+        )
+
+
+def mark_hedge_skip(trade_id: int) -> None:
+    with _lock, get_connection() as conn:
+        ensure_schema(conn)
+        conn.execute(
+            """
+            UPDATE smc_trades SET hedge_status = 'skip'
+            WHERE id = ? AND hedge_status IS NULL
+            """,
+            (trade_id,),
+        )
+        conn.execute(
+            """
+            UPDATE smc_trades SET hedge_status = 'skip'
+            WHERE id = ? AND hedge_status = 'pending' AND hedge_order_id IS NULL
+            """,
+            (trade_id,),
+        )
+
+
+def mark_hedge_closed(trade_id: int, *, close_px: float, pnl: float) -> bool:
+    with _lock, get_connection() as conn:
+        ensure_schema(conn)
+        cur = conn.execute(
+            """
+            UPDATE smc_trades
+            SET hedge_status = 'closed', hedge_close_px = ?, hedge_pnl = ?
+            WHERE id = ? AND hedge_status = 'open'
+            """,
+            (close_px, pnl, trade_id),
+        )
+        return cur.rowcount > 0
+
+
+def hedges_still_open() -> list[sqlite3.Row]:
+    with _lock, get_connection() as conn:
+        ensure_schema(conn)
+        return list(
+            conn.execute(
+                """
+                SELECT * FROM smc_trades
+                WHERE status = 'closed' AND hedge_status = 'open'
+                ORDER BY id
+                """
+            ).fetchall()
+        )
 
 
 def get_trade(trade_id: int) -> sqlite3.Row | None:

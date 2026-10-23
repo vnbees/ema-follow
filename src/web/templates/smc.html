@@ -33,17 +33,22 @@
     .side { font-size: 12px; font-weight: 700; padding: 2px 7px; border-radius: 4px; color: #fff; }
     .side.long { background: #238636; }
     .side.short { background: #da3633; }
+    .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,.72); display: flex; align-items: center; justify-content: center; z-index: 30; padding: 16px; }
+    .modal-back[hidden] { display: none; }
+    .modal { background: #161b22; border: 1px solid #30363d; border-radius: 12px; width: min(880px, 100%); max-height: calc(100vh - 32px); overflow: auto; padding: 20px; }
+    .modal h2 { font-size: 18px; }
+    .modal-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+    .readout { background: #0f1117; border: 1px solid #30363d; border-radius: 8px; padding: 10px 12px; margin: 12px 0; }
+    #trackRows td { font-variant-numeric: tabular-nums; }
   </style>
 </head>
 <body>
   <h1>{{ exchange_name }} {{ bot_title }}</h1>
-  <p class="meta">Sổ từ <span id="reportFrom">—</span>. Đảo chiều · 2% equity mỗi lệnh · đòn bẩy 10 · một lệnh mỗi coin. Chốt tại râu, cắt lỗ tại điểm giữa. Đóng sau 41 phút. <a href="/donchian">/donchian</a> · <a href="/legacy">/legacy</a></p>
+  <p class="meta">Sổ từ <span id="reportFrom">—</span>. Đảo chiều · cùng chiều 10% equity, ngược chiều hoặc đi ngang còn 1% · đòn bẩy 10 · một lệnh chính mỗi coin. Chốt tại râu, cắt lỗ tại điểm giữa. Giữ đến khi chạm chốt lời hoặc cắt lỗ. Trang này chỉ để xem lại. <a href="/">tín hiệu</a> · <a href="/donchian">/donchian</a> · <a href="/legacy">/legacy</a></p>
 
   <div class="controls">
     <span id="tradingPill" class="status-pill"></span>
     <span id="ratePill" class="status-pill warn" hidden></span>
-    <form method="post" action="/settings/trading/start"><button type="submit">Bật trading</button></form>
-    <form method="post" action="/settings/trading/stop"><button type="submit">Tắt trading</button></form>
     <form method="post" action="/logout"><button type="submit">Đăng xuất</button></form>
     <span class="meta" style="margin:0;">Cập nhật <span id="refreshedAt"></span></span>
   </div>
@@ -84,6 +89,41 @@
   </div>
 
   <div class="panel">
+    <h2>Thời gian giữ</h2>
+    <p class="meta">Cùng mốc với sổ phía trên. Mỗi lệnh đã khớp ghi lời lỗ từng phút theo giá mark, và ghi giá 15 phút trước lúc khớp đang cùng chiều hay ngược chiều. Lệnh giữ đến khi chạm cắt lỗ hoặc chốt lời. Cùng chiều giữ 10% equity. Ngược chiều hoặc đi ngang thì cắt còn 1% ngay sau khi khớp. Hai cột Nếu chốt và Nếu cắt lỗ chỉ để xem: tính trên khối lượng còn lại, phí chốt maker, phí cắt taker, và phần đã cắt size.</p>
+    <div class="summary-grid" id="levels" style="margin: 12px 0;"></div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Coin</th><th>Chiều</th><th>Vào lúc</th><th>Thoát lúc</th><th>15 phút trước</th><th>Size</th><th>Giữ thực tế</th><th>Đóng thực tế</th><th>PnL</th>
+            <th>Nếu chốt</th><th>Nếu cắt lỗ</th>
+            <th>Theo dõi đến</th><th>Giữ đến TP/SL</th><th>PnL nếu giữ</th>
+          </tr>
+        </thead>
+        <tbody id="tracks"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="trackModal" class="modal-back" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="trackTitle">
+      <div class="modal-head">
+        <h2 id="trackTitle">Đường từng phút</h2>
+        <button type="button" id="trackClose">Đóng</button>
+      </div>
+      <div id="trackReadout" class="readout">Đưa chuột vào một điểm trên biểu đồ.</div>
+      <div id="trackChart"></div>
+      <div class="table-wrap" style="max-height:240px; margin-top:12px;">
+        <table>
+          <thead><tr><th>Phút</th><th>Giờ</th><th>Giá</th><th>PnL</th></tr></thead>
+          <tbody id="trackRows"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
     <h2>Lệnh gần nhất</h2>
     <div class="table-wrap">
       <table>
@@ -109,6 +149,135 @@
     const px = (n) => n === null || n === undefined || n === "" ? "—" : Number(n).toPrecision(6);
     const sideHtml = (s) => `<span class="side ${s}">${s === "long" ? "LONG" : "SHORT"}</span>`;
     const reason = { tp: "Chốt tại râu", stop: "Cắt lỗ điểm giữa", time: "Hết 41 phút", flat: "Đóng tay", expire: "Hết 16 nến", size: "Size bằng 0", place: "Không đặt được" };
+    const shadowLabel = { tp: "Chạm chốt lời", sl: "Chạm cắt lỗ", watching: "Đang theo dõi" };
+    const priorLabel = { with: "Cùng chiều", against: "Ngược chiều", flat: "Đi ngang" };
+    const hedgeLabel = { open: "Đang mở", closed: "Đã đóng", pending: "Đang gửi" };
+
+    function hedgeText(row) {
+      const state = hedgeLabel[row.hedge_status];
+      if (!state) return "—";
+      const side = row.hedge_side === "long" ? "LONG" : row.hedge_side === "short" ? "SHORT" : "";
+      const pnl = row.hedge_status === "closed" && row.hedge_pnl !== null && row.hedge_pnl !== undefined
+        ? ` ${Number(row.hedge_pnl) > 0 ? "+" : ""}${Number(row.hedge_pnl).toFixed(2)}`
+        : "";
+      return `${side} ${state}${pnl}`.trim();
+    }
+
+    function sizeText(row) {
+      if (row.size_cut === "small") return "1%";
+      if (row.size_cut === "half") return "Giảm 50%";
+      if (row.size_cut === "full") return "Đủ";
+      return hedgeText(row);
+    }
+
+    function holdText(sec) {
+      if (sec === null || sec === undefined) return "—";
+      const total = Math.max(0, Math.round(Number(sec) / 60));
+      const hours = Math.floor(total / 60);
+      const minutes = total % 60;
+      if (hours > 0) return `${hours} giờ ${minutes} phút`;
+      return `${minutes} phút`;
+    }
+
+    function pnlText(n) {
+      const v = Number(n);
+      const sign = v > 0 ? "+" : "";
+      return `${sign}${v.toFixed(2)} USDT`;
+    }
+
+    function clock(ms) {
+      return new Date(ms).toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" });
+    }
+
+    function showPoint(point) {
+      const box = document.getElementById("trackReadout");
+      const cls = Number(point.pnl) > 0 ? "green" : Number(point.pnl) < 0 ? "red" : "";
+      box.innerHTML = `Phút thứ <b>${point.minute}</b> · ${clock(point.minute_ms)} · giá ${px(point.price)} · lời lỗ <b class="${cls}">${pnlText(point.pnl)}</b>`;
+    }
+
+    function drawTrack(path) {
+      const title = document.getElementById("trackTitle");
+      const side = path.side === "long" ? "LONG" : "SHORT";
+      const followed = shadowLabel[path.shadow_status] || "chưa chốt theo dõi";
+      const prior = priorLabel[path.prior_dir] || "";
+      title.textContent = prior
+        ? `${path.symbol} ${side} · 15 phút trước: ${prior} · ${followed}`
+        : `${path.symbol} ${side} · ${followed}`;
+      const box = document.getElementById("trackChart");
+      const rows = document.getElementById("trackRows");
+      const points = path.points || [];
+      if (!points.length) {
+        box.innerHTML = `<p class="meta">Chưa có đường từng phút. Đường bắt đầu được ghi từ lúc bot chạy bản tracking.</p>`;
+        rows.innerHTML = "";
+        document.getElementById("trackReadout").textContent = "Chưa có phút nào.";
+        return;
+      }
+      showPoint(points[points.length - 1]);
+      const width = 820;
+      const height = 280;
+      const left = 72;
+      const right = 16;
+      const top = 16;
+      const bottom = 36;
+      const values = points.map((p) => Number(p.pnl));
+      let min = Math.min(...values);
+      let max = Math.max(...values);
+      if (min === max) {
+        min -= 0.05;
+        max += 0.05;
+      }
+      const pad = (max - min) * 0.15;
+      min -= pad;
+      max += pad;
+      const span = max - min;
+      const x = (i) => left + (points.length === 1 ? (width - left - right) / 2 : (i / (points.length - 1)) * (width - left - right));
+      const y = (v) => top + ((max - v) / span) * (height - top - bottom);
+      const line = points.map((p, i) => `${x(i).toFixed(1)},${y(Number(p.pnl)).toFixed(1)}`).join(" ");
+      const color = values[values.length - 1] >= 0 ? "#3fb950" : "#f85149";
+      const yTicks = [max, (max + min) / 2, min];
+      const yLabels = yTicks.map((v) => `<text x="${left - 8}" y="${y(v) + 4}" fill="#8b949e" font-size="12" text-anchor="end">${pnlText(v).replace(" USDT", "")}</text><line x1="${left}" y1="${y(v)}" x2="${width - right}" y2="${y(v)}" stroke="#30363d" />`).join("");
+      const step = Math.max(1, Math.ceil(points.length / 8));
+      const xLabels = points.map((p, i) => (i % step === 0 || i === points.length - 1) ? `<text x="${x(i)}" y="${height - 10}" fill="#8b949e" font-size="12" text-anchor="middle">${p.minute}</text>` : "").join("");
+      const dots = points.map((p, i) => `<circle class="track-dot" data-i="${i}" cx="${x(i)}" cy="${y(Number(p.pnl))}" r="5" fill="${color}" stroke="#0f1117" stroke-width="1" style="cursor:pointer"><title>Phút ${p.minute} · ${clock(p.minute_ms)} · ${pnlText(p.pnl)}</title></circle>`).join("");
+      box.innerHTML = `
+        <svg viewBox="0 0 ${width} ${height}" width="100%" height="280" role="img" aria-label="Lời lỗ từng phút">
+          ${yLabels}
+          <polyline fill="none" stroke="${color}" stroke-width="2" points="${line}" />
+          ${dots}
+          ${xLabels}
+          <text x="${(left + width - right) / 2}" y="${height - 0}" fill="#8b949e" font-size="11" text-anchor="middle">phút kể từ lúc khớp</text>
+        </svg>`;
+      box.querySelectorAll(".track-dot").forEach((dot) => {
+        const point = points[Number(dot.dataset.i)];
+        dot.addEventListener("mouseenter", () => showPoint(point));
+        dot.addEventListener("click", () => showPoint(point));
+      });
+      rows.innerHTML = points.map((p) => `<tr>
+        <td>Phút ${p.minute}</td>
+        <td>${clock(p.minute_ms)}</td>
+        <td>${px(p.price)}</td>
+        <td>${money(p.pnl)}</td>
+      </tr>`).join("");
+    }
+
+    function closeTrack() {
+      document.getElementById("trackModal").hidden = true;
+    }
+
+    async function openTrack(id) {
+      const res = await fetch(`/api/smc/track/${id}`);
+      if (!res.ok) return;
+      drawTrack(await res.json());
+      document.getElementById("trackModal").hidden = false;
+    }
+
+    document.getElementById("trackClose").addEventListener("click", closeTrack);
+    document.getElementById("trackModal").addEventListener("click", (event) => {
+      if (event.target.id === "trackModal") closeTrack();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeTrack();
+    });
 
     function card(label, value, sub) {
       return `<div class="summary-card"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub || ""}</div></div>`;
@@ -162,6 +331,41 @@
         <td>${px(r.tp_px)}</td>
         <td>${r.upnl === null || r.upnl === undefined ? "—" : money(r.upnl)}</td>
       </tr>`).join("") || `<tr><td colspan="7">Không có lệnh</td></tr>`;
+
+      const trackRes = await fetch("/api/smc/track");
+      const trackBody = trackRes.ok ? await trackRes.json() : {trades: [], levels: null};
+      const tracks = trackBody.trades || [];
+      const levels = trackBody.levels || {};
+      const acceptableSub = levels.acceptable_sl === null || levels.acceptable_sl === undefined
+        ? "Sổ chưa đủ lệnh thắng và lệnh thua để tính"
+        : (levels.avg_sl !== null && levels.avg_sl !== undefined && Number(levels.avg_sl) < Number(levels.acceptable_sl)
+          ? "TB cắt lỗ đang sâu hơn mức này"
+          : "Một lần cắt lỗ bằng lãi của các lệnh thắng đi kèm");
+      document.getElementById("levels").innerHTML = [
+        card("TB nếu chốt", money(levels.avg_tp), levels.n ? `${levels.n} lệnh` : ""),
+        card("TB nếu cắt lỗ", money(levels.avg_sl), "Trung bình theo giá cắt lỗ"),
+        card("Winrate sổ này", pct(levels.win_rate), levels.closed_n ? `${levels.closed_n} lệnh đã đóng` : ""),
+        card("Cắt lỗ còn giữ lãi", money(levels.acceptable_sl), acceptableSub),
+      ].join("");
+      document.getElementById("tracks").innerHTML = tracks.map((r) => `<tr data-id="${r.id}" style="cursor:pointer">
+        <td>${r.symbol.replace("USDT","")}</td>
+        <td>${sideHtml(r.side)}</td>
+        <td>${r.opened_at || "—"}</td>
+        <td>${r.closed_at || "—"}</td>
+        <td>${priorLabel[r.prior_dir] || "—"}</td>
+        <td>${sizeText(r)}</td>
+        <td>${holdText(r.hold_sec)}</td>
+        <td>${reason[r.close_reason] || (r.status === "open" ? "Đang mở" : r.close_reason || "—")}</td>
+        <td>${r.pnl_usdt === null || r.pnl_usdt === undefined ? "—" : money(r.pnl_usdt)}</td>
+        <td>${r.tp_if_usdt === null || r.tp_if_usdt === undefined ? "—" : money(r.tp_if_usdt)}</td>
+        <td>${r.sl_if_usdt === null || r.sl_if_usdt === undefined ? "—" : money(r.sl_if_usdt)}</td>
+        <td>${shadowLabel[r.shadow_status] || "—"}</td>
+        <td>${holdText(r.shadow_hold_sec)}</td>
+        <td>${r.shadow_pnl === null || r.shadow_pnl === undefined ? "—" : money(r.shadow_pnl)}</td>
+      </tr>`).join("") || `<tr><td colspan="14">Chưa có lệnh đã khớp</td></tr>`;
+      document.querySelectorAll("#tracks tr[data-id]").forEach((row) => {
+        row.addEventListener("click", () => openTrack(row.dataset.id));
+      });
 
       document.getElementById("recent").innerHTML = data.recent.map((r) => `<tr>
         <td>${r.symbol.replace("USDT","")}</td>

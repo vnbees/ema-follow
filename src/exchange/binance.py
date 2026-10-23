@@ -1835,6 +1835,22 @@ def place_limit_close_order(
     }
 
 
+def cancel_all_open_orders(symbol: str) -> None:
+    """DELETE /fapi/v1/allOpenOrders. Weight 1. Empty book is still code=200."""
+    try:
+        _private_delete(
+            "/fapi/v1/allOpenOrders",
+            {"symbol": symbol.upper()},
+            max_retries=1,
+            priority="optional",
+        )
+    except ExchangeClientError as exc:
+        msg = str(exc).lower()
+        if "-2011" in msg or "unknown order" in msg or "no open" in msg:
+            return
+        raise
+
+
 def cancel_limit_order(symbol: str, order_id: str) -> dict:
     """Cancel a regular LIMIT order. Unknown-order is treated as already gone."""
     if not order_id:
@@ -2093,6 +2109,7 @@ class BinanceExchange:
     place_algo_close_order = staticmethod(place_algo_close_order)
     cancel_order = staticmethod(cancel_order)
     cancel_limit_order = staticmethod(cancel_limit_order)
+    cancel_all_open_orders = staticmethod(cancel_all_open_orders)
     close_position_side = staticmethod(close_position_side)
     transfer_futures_to_spot = staticmethod(transfer_futures_to_spot)
     fetch_spot_balance = staticmethod(fetch_spot_balance)

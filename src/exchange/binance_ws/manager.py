@@ -27,6 +27,7 @@ _thread: threading.Thread | None = None
 _stop_event: asyncio.Event | None = None
 _started = False
 _watch_symbols: set[str] = set()
+_fade5m_symbols: set[str] = set()
 _last_disconnect_notify_at = 0.0
 _pending_reconcile = False
 _pending_reconcile_symbols: set[str] = set()
@@ -57,6 +58,17 @@ def set_watched_symbols(symbols: list[str] | set[str]) -> None:
 def watched_symbols() -> set[str]:
     with _lock:
         return set(_watch_symbols)
+
+
+def watch_fade5m_symbols(symbols: list[str] | set[str]) -> None:
+    """Kline 5m + 4h for the fade5m book. Does not touch the 15m watch set."""
+    with _lock:
+        _fade5m_symbols.update(s.upper() for s in symbols if s)
+
+
+def fade5m_watched() -> set[str]:
+    with _lock:
+        return set(_fade5m_symbols)
 
 
 def market_fresh(max_age: float | None = None) -> bool:
@@ -451,13 +463,27 @@ async def _async_main() -> None:
                 logging.debug("Binance WS deferred reconcile: %s", exc)
             await asyncio.sleep(60)
 
-    await asyncio.gather(
+    tasks = [
         all_market.run(),
         klines.run(),
         user.run(),
         _health_watch(),
         _deferred_rest_after_market(),
-    )
+    ]
+    try:
+        from src.fade5m.config import ENABLED as FADE5M_ON
+
+        if FADE5M_ON:
+            tasks.append(
+                KlineStream(
+                    interval=("5m", "4h"),
+                    symbols_provider=fade5m_watched,
+                    stop_event=_stop_event,
+                ).run()
+            )
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Binance fade5m kline stream skipped: %s", exc)
+    await asyncio.gather(*tasks)
 
 
 def start_binance_ws() -> None:
@@ -503,6 +529,16 @@ def start_binance_ws() -> None:
             logging.info("Binance WS pre-subscribe klines for %s", ",".join(managed))
     except Exception as exc:  # noqa: BLE001
         logging.debug("Binance WS open-symbol preload skipped: %s", exc)
+
+    try:
+        from src.fade5m.config import ENABLED as FADE5M_ON, watch_symbols as fade_watch
+
+        if FADE5M_ON:
+            fade_syms = fade_watch()
+            watch_fade5m_symbols(fade_syms)
+            logging.info("Binance WS fade5m kline 5m+4h %s (no REST klines)", ",".join(fade_syms))
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Binance WS fade5m preload skipped: %s", exc)
 
     remaining = binance_mod.rate_limit_remaining_sec()
     if remaining > 0:

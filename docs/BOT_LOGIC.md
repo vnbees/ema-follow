@@ -1,8 +1,49 @@
-# Bot SMC đảo chiều (USDT-M)
+# Bot fade 5m vs nến 4h (USDT-M)
 
-Bot live đang chạy **SMC đảo chiều** trên nến 15 phút (`SMC_ENABLED=true`). Vốn futures dùng chung. Mỗi coin tối đa một lệnh. Mỗi lệnh mới dùng đòn bẩy **10** và ký quỹ cố định **2%** equity. Giá chốt lời và cắt lỗ giữ nguyên. Lệnh có mức chốt lời không đủ trả phí một vòng (taker 0.05% lúc vào + maker 0.02% lúc chốt, tính trên notional của lệnh) không được đặt.
+Bot live **fade 5m** (`FADE5M_ENABLED=true`) lot ~1 USDT × 10x. Tới **07:00 +07 21/10/2026** vẫn 20 coin (SOL XRP DOGE HYPE WLD SUI ARB ENA TIA ADA TAO FIL INJ DOT APT OP XLM TRX ATOM ZEC) — lệnh đang giữ follow cover/skip-add/đóng 4h bình thường. Từ 07:00 chỉ **vào lệnh mới** 5 coin: **XRP DOGE SUI XLM ATOM** (`FADE5M_SYMBOLS_NEXT` + `FADE5M_SWITCH_AT`). 07:00 là hết nến 4h nên đóng market sổ fade5m cả 20, rồi chỉ 5 coin đặt lại từ 07:10. Cover `opposite+1` vẫn có thể >1 USDT khi 4h đổi màu. Vào lệnh từ `FADE5M_START_AT` (23:00 +07 20/10/2026); trước giờ đó chỉ nghe WS, không đặt/hủy/đóng. Không đóng vị thế Supertrend/tay đang có trên sàn. Mỗi khi nến **5 phút đóng**: nếu nến **4h đang chạy** là xanh (close 5m cuối > open 4h) và nến 5m đó **đỏ** → **LONG**; 4h đỏ + 5m xanh → **SHORT**. Vào bằng **limit GTC** tại giá đóng 5m. Ký quỹ mặc định **1 USDT × 10**. Nếu 4h đổi màu và còn lệnh **ngược chiều** đã khớp, lệnh mới lấy **khối lượng ngược đó + 1 USDT**. Cover chưa khớp thì **chỉ giữ một lệnh**: hủy limit cover cũ, đặt lại giá đóng 5m mới, size vẫn opposite+1. Cùng chiều đang lãi thì không cộng thêm 1 USDT. Mỗi lệnh khớp treo **TP 1 ATR(14) nến 5m** (limit đóng, reduce-only); ATR chưa có hoặc đặt sàn thất bại thì bỏ TP, giữ lệnh tới hết 4h. Nến 5m cuối của 4h **không** đặt lệnh mới — hủy TP còn treo rồi **đóng market** toàn bộ sổ fade5m (pending + đã khớp). Không đụng vị thế Supertrend/Donchian/SMC còn lại trên sàn.
 
-Swing 50 nến. Tín hiệu long khi râu xuyên dưới đáy swing, nến đóng lại phía trên đáy, và đoạn râu không dài quá **0.8 ATR(14)**. Tín hiệu short là ảnh đối xứng ở đỉnh swing. Lệnh đặt ra đảo chiều tín hiệu đó: long thành short và ngược lại, chốt lời tại đầu râu, cắt lỗ tại trung điểm. Vào lệnh bằng STOP_MARKET đúng tại đỉnh hoặc đáy vừa quét, nên lệnh nằm chờ đến khi giá chạm mức đó. Nến tín hiệu đã đóng qua cắt lỗ thì bỏ. Ngay khi stop khớp, bot treo limit chốt tại đầu râu và STOP_MARKET tại trung điểm, rồi gửi Discord. Đóng lệnh (chốt hoặc cắt) cũng gửi Discord. Lệnh đã khớp mà còn mở sau **41 phút** thì đóng market (hết vùng giữ 35–41 phút). Lệnh chờ tối đa **16** nến. Giá chạm cắt lỗ trước khi khớp thì hủy stop vào. Tín hiệu chỉ được đặt lúc nến vừa đóng và coin đã trống suốt nến đó. Coin vừa khớp thì nghỉ thêm một nến, không lấy tín hiệu mới trong nến khớp hoặc nến kế tiếp.
+Màu 4h đang chạy lấy từ kline WebSocket 4h (`open` nến 4h đang chạy) so với `close` nến 5m vừa đóng (kline WS 5m). **Không REST klines** — restart không seed nến. Supertrend 4h, SMC và vòng Donchian **tắt**.
+
+Dashboard `/`. Sổ SMC cũ `/so-lenh`. Donchian `/donchian`.
+
+---
+
+# Bot Prediction 5m / 15m / 1h BTC/ETH/BNB — không chạy
+
+Code `src/predict5m`. **Tắt mặc định** (`PREDICT5M_ENABLED=false`, `PREDICT5M_TRADING_ENABLED=false`). Không gắn vòng live `cycle.py`. Không đặt cược cho đến khi bật tay. Luồng quote/place **LIMIT GTC** (wei, ví Prediction, `priceLimit` lãi ≥ 2× vốn) và vòng chờ **đúng mở nến** của từng khung đã gắn sẵn — chỉ chạy khi bật flag (`python -m src.predict5m.runtime`).
+
+Ba khung **5m, 15m, 1h**. BTCUSDT / ETHUSDT / BNBUSDT trên Binance Prediction Markets (Up/Down). **Cùng lúc một** cược mở (mọi khung). Cùng lúc có tín hiệu thì ưu tiên khung nhỏ: 5m rồi 15m rồi 1h. Coin đầu tiên có tín hiệu trong khung được chọn. Luật tín hiệu giống nhau trên nến **đã đóng** của đúng khung đó (`closeTime < now`) — nến đang chạy không được đánh giá. Đủ điều kiện trên nến đóng rồi đặt **ngay mở nến kế** (cửa Prediction), không lấy nến đang mở làm tín hiệu:
+
+1. Nhãn TV **default ON**: Engulfing (BE), Hammer, Dragonfly Doji, Abandoned Baby — latch xanh/đỏ. Pattern tắt mặc định (Marubozu, Long Lower Shadow, Harami, Tweezer, Piercing…) **không** đổi latch. Mọi nhãn khác (xám **D** / **STW** / **STB**, hoặc xanh và đỏ cùng một nến) xóa latch.
+2. SQZMOM chấm **xám** (`sqzOff`).
+3. Hist cùng phía nhãn (xanh lime/green với nhãn xanh; đỏ red/maroon với nhãn đỏ).
+4. Nến vừa đóng là nến **ngược** (nhãn xanh + nến đỏ, hoặc nhãn đỏ + nến xanh).
+
+Tín hiệu đúng thì treo **LIMIT** tại giá share sao cho **thắng lãi ≥ 2 lần vốn** (`price ≈ (1−fee)/3`, làm tròn xuống tick). Không khớp market giá mở cửa. Hết cửa bot đọc trạng thái lệnh: **chưa khớp** thì **không đổi target** (sàn tự hủy LIMIT khi đóng cửa, bot không hủy); đã khớp thì lấy nến cùng khung quyết thắng/thua. Vốn: target lãi mặc định **2 USDT** (`PREDICT5M_TARGET_USDT`, tối thiểu để vốn vào ≥ 1 USDT sàn). Vốn vào = target / 2 vì LIMIT lời 2×. Thua (đã khớp): target sau = **lỗ lũy kế + 2** (thắng gỡ hết lỗ rồi còn đúng 2 USDT). Thắng hoặc hết ví thì reset target 2. Dùng chung mọi khung. Trước mỗi lệnh bot đọc số dư ví Prediction (CeDeFi). **Không đủ tiền** thì **dừng 1 giờ**. Discord khi vào lệnh, khi khớp/thắng/thua/không khớp, khi lỗi, khi dừng 1h và khi chạy lại.
+
+---
+
+# Bot Supertrend 4h + ADX (USDT-M) — không chạy
+
+Bot live **không** chạy Supertrend 4h khi `FADE5M_ENABLED=true`. Mô tả dưới đây giữ cho code `src/trend4h`.
+
+Bot Supertrend 4h + ADX (`TREND4H_ENABLED=true` khi fade 5m tắt). 20 coin majors. Supertrend(10, 3) trên nến 4 giờ. Chỉ **mở hoặc đảo** khi ADX(14) ≥ 25; ADX thấp không cắt lệnh đang giữ. Một vị thế mỗi coin, ký quỹ **1 USDT × 10**, vào/ra **market taker** tại giá đóng nến 4h. REST kline 4h seed từng coin cách 2,5 giây; không warmup REST 15m.
+
+Backtest (1 USDT × 10, taker): OP full 2022-06→2026-09 **+42,5** PF 1,60; năm 2025-10→2026-09 **+8,3**; 20 coin full **18/20 lời, +576**.
+
+---
+
+# Bot SMC đảo chiều (USDT-M) — không chạy
+
+Bot live **không** chạy SMC đảo chiều khi `TREND4H_ENABLED=true`. Mô tả dưới đây giữ cho `/so-lenh` và backtest cũ.
+
+Bot SMC trên nến 15 phút (`SMC_ENABLED=true` khi trend 4h tắt). Vốn futures dùng chung. Mỗi coin tối đa một lệnh. Mỗi lệnh mới dùng đòn bẩy **10** và ký quỹ **10%** equity. Giá chốt lời và cắt lỗ giữ nguyên. Lệnh có mức chốt lời không đủ trả phí một vòng (taker 0.05% lúc vào + maker 0.02% lúc chốt, tính trên notional của lệnh) không được đặt.
+
+Swing 50 nến. Tín hiệu long khi râu xuyên dưới đáy swing, nến đóng lại phía trên đáy, và đoạn râu không dài quá **0.8 ATR(14)**. Tín hiệu short là ảnh đối xứng ở đỉnh swing. Lệnh đặt ra đảo chiều tín hiệu đó: long thành short và ngược lại, chốt lời tại đầu râu, cắt lỗ tại trung điểm. Vào lệnh bằng STOP_MARKET đúng tại đỉnh hoặc đáy vừa quét, nên lệnh nằm chờ đến khi giá chạm mức đó. Nến tín hiệu đã đóng qua cắt lỗ thì bỏ. Ngay khi stop khớp, bot treo limit chốt tại đầu râu và STOP_MARKET tại trung điểm, rồi gửi Discord. Đóng lệnh (chốt hoặc cắt) cũng gửi Discord. Lệnh đã khớp được giữ đến khi chạm chốt lời hoặc cắt lỗ, không đóng theo đồng hồ. Nếu 15 phút trước lúc khớp giá chạy ngược chiều lệnh hoặc đi ngang, bot đóng market phần dư để phần còn lại bằng **1%** equity, rồi chỉnh chốt lời và cắt lỗ theo phần đó. Cùng chiều thì giữ **10%**. Chưa đủ giá 15 phút trong bộ nhớ thì giữ **10%**. Lệnh chờ tối đa **16** nến. Giá chạm cắt lỗ trước khi khớp thì hủy stop vào. Tín hiệu chỉ được đặt lúc nến vừa đóng và coin đã trống suốt nến đó. Coin vừa khớp thì nghỉ thêm một nến, không lấy tín hiệu mới trong nến khớp hoặc nến kế tiếp.
+
+Backtest luật size này trên đúng giai đoạn bot SMC đã chạy, từ 12/10/2026 15:00 đến 19/10/2026 08:45 (giờ VN). Vốn đầu 949,64 USDT, lấy từ số dư lúc bot bắt đầu quét. Tín hiệu dò lại trên cửa sổ 400 nến 15 phút, khớp và đóng theo nến 1 phút. Cùng chiều giữ 10% equity, ngược chiều hoặc đi ngang giữ 1%. Kết quả: 143 lệnh, winrate 65% (93 lệnh lãi), RR 0,92 (lãi trung bình 2,18 USDT, lỗ trung bình 2,36 USDT), PnL **+84,99** USDT, vốn cuối 1.034,64. 132 lệnh chạm chốt lời cộng 176,56; 11 lệnh cắt lỗ trừ 91,57. Trong 50 lệnh lỗ, 44 lệnh ngược chiều (88%), 4 lệnh đi ngang, 2 lệnh cùng chiều. Hai lệnh cùng chiều lỗ là BCH short 14/10 (−16,77) và AVAX long 16/10 (−53,40).
+
+Cùng kỳ, luật cũ 2% và cắt còn một nửa lãi +17,04, winrate 86%, RR 0,26. Chỉ vào lệnh cùng chiều với size 10% lãi sổ +86,75, winrate 96%, RR 0,07. Giá khớp lấy đúng giá stop, chưa tính funding và bước làm tròn khối lượng sàn.
 
 Dashboard chính là sổ SMC. Sổ Donchian 2 chiều giữ ở [`/donchian`](/donchian). Dashboard cũ hơn ở `/legacy`.
 

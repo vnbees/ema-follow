@@ -24,7 +24,7 @@ from src.bot_state import (
     set_trading_enabled,
 )
 from src.web.number_format import format_dashboard_pnl, format_dashboard_price
-from src.web.time_format import format_vn_time
+from src.web.time_format import format_vn_from_ms, format_vn_time
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -1131,6 +1131,44 @@ def _smc_payload() -> dict:
 
 
 @app.get("/", response_class=HTMLResponse)
+def signal_dashboard(request: Request) -> HTMLResponse:
+    from src.fade5m.config import ENABLED as FADE5M_ENABLED
+    from src.trend4h.config import ENABLED as TREND4H_ENABLED
+
+    if FADE5M_ENABLED:
+        return templates.TemplateResponse(
+            request,
+            "fade5m.html",
+            {"exchange_name": EXCHANGE_DISPLAY_NAME},
+        )
+    if TREND4H_ENABLED:
+        return templates.TemplateResponse(
+            request,
+            "trend4h.html",
+            {"exchange_name": EXCHANGE_DISPLAY_NAME},
+        )
+    return templates.TemplateResponse(
+        request,
+        "signals.html",
+        {"exchange_name": EXCHANGE_DISPLAY_NAME},
+    )
+
+
+@app.get("/api/fade5m")
+def api_fade5m() -> dict:
+    from src.fade5m.runtime import snapshot
+
+    return snapshot()
+
+
+@app.get("/api/trend4h")
+def api_trend4h() -> dict:
+    from src.trend4h.runtime import snapshot
+
+    return snapshot()
+
+
+@app.get("/so-lenh", response_class=HTMLResponse)
 def dashboard(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
         request,
@@ -1140,6 +1178,146 @@ def dashboard(request: Request) -> HTMLResponse:
             "bot_title": "SMC đảo chiều",
         },
     )
+
+
+@app.get("/api/signals")
+def api_signals() -> dict:
+    import time
+
+    from src.donchian.config import FIXED_SCAN_SYMBOLS
+    from src.exchange.binance_ws.cache import CACHE
+    from src.smc.broker import _mark
+    from src.smc.outlook import level_for, pooled_rates
+    from src.smc.signals import BAR_MS
+
+    now_ms = int(time.time() * 1000)
+    rows = []
+    for symbol in FIXED_SCAN_SYMBOLS:
+        raw = CACHE.get_candles(symbol, "15m", 400) or []
+        candles = [c for c in raw if int(c.timestamp) + BAR_MS <= now_ms]
+        level = level_for(
+            symbol,
+            [int(c.timestamp) for c in candles],
+            [float(c.high) for c in candles],
+            [float(c.low) for c in candles],
+            [float(c.close) for c in candles],
+            _mark(symbol),
+            now_ms,
+        )
+        if level.get("has_signal"):
+            level["entry_text"] = format_dashboard_price(level["entry"])
+            level["mark_text"] = format_dashboard_price(level.get("mark"))
+            level["signal_at"] = format_vn_from_ms(int(level["signal_ts"]))
+        rows.append(level)
+    h4, d1, d7, n1, n4, n7 = pooled_rates()
+    return {
+        "as_of": format_vn_from_ms(now_ms),
+        "pooled_4h": h4,
+        "pooled_1d": d1,
+        "pooled_7d": d7,
+        "pooled_n": n1,
+        "pooled_n_4h": n4,
+        "pooled_n_1d": n1,
+        "pooled_n_7d": n7,
+        "rows": rows,
+    }
+
+
+@app.get("/api/revert")
+def api_revert() -> dict:
+    from src.smc.revert import snapshot
+
+    view = snapshot()
+    coins = []
+    for coin in view["coins"]:
+        signals = []
+        for item in coin["signals"]:
+            level = item["signal"]
+            mark = coin["mark"]
+            level_px = float(level["level_px"])
+            distance = None
+            if mark and level_px:
+                distance = (mark - level_px) / level_px * 100.0
+            left = int(level["deadline_ts"]) - view["now_ms"]
+            if left <= 0:
+                window = "đã hết 7 ngày"
+            else:
+                hours = left // 3_600_000
+                window = f"còn {hours // 24} ngày {hours % 24} giờ"
+            orders = []
+            for order in item["orders"]:
+                orders.append(
+                    {
+                        "id": order["id"],
+                        "side": order["side"],
+                        "status": order["status"],
+                        "bar_at": format_vn_from_ms(int(order["bar_ts"])),
+                        "entry_text": format_dashboard_price(order.get("fill_px") or order["entry_px"]),
+                        "tp_text": format_dashboard_price(order["tp_px"]),
+                        "close_text": format_dashboard_price(order.get("close_px")),
+                        "pnl": order.get("pnl_usdt"),
+                        "reason": order.get("close_reason") or "",
+                        "margin_usdt": order["margin_usdt"],
+                    }
+                )
+            signals.append(
+                {
+                    "id": level["id"],
+                    "status": level["status"],
+                    "level_text": format_dashboard_price(level_px),
+                    "signal_at": format_vn_from_ms(int(level["signal_ts"])),
+                    "window": window,
+                    "distance_pct": distance,
+                    "orders": orders,
+                }
+            )
+        coins.append(
+            {
+                "symbol": coin["symbol"],
+                "mark_text": format_dashboard_price(coin["mark"]),
+                "in_profit": coin["in_profit"],
+                "open_pnl": coin["open_pnl"],
+                "signals": signals,
+            }
+        )
+    return {
+        "margin_usdt": view["margin_usdt"],
+        "leverage": view["leverage"],
+        "min_distance_pct": view["min_distance_pct"],
+        "coins": coins,
+    }
+
+
+@app.get("/api/smc/track")
+def api_smc_track() -> dict:
+    from src.smc.track import level_reference, track_rows
+
+    rows = []
+    for row in track_rows():
+        if not _smc_in_report(row):
+            continue
+        rows.append(
+            {
+                **row,
+                "opened_at": format_vn_time(row["opened_at"]) if row["opened_at"] else "",
+                "closed_at": format_vn_time(row["closed_at"]) if row["closed_at"] else "",
+                "shadow_hit_at": format_vn_time(row["shadow_hit_at"]) if row["shadow_hit_at"] else "",
+            }
+        )
+    return {"trades": rows, "levels": level_reference(rows)}
+
+
+@app.get("/api/smc/track/{trade_id}")
+def api_smc_track_path(trade_id: int) -> dict:
+    from src.smc.track import track_path
+
+    path = track_path(trade_id)
+    if path is None or not _smc_in_report(path):
+        return {"points": []}
+    path["opened_at"] = format_vn_time(path["opened_at"]) if path["opened_at"] else ""
+    path["closed_at"] = format_vn_time(path["closed_at"]) if path["closed_at"] else ""
+    path["shadow_hit_at"] = format_vn_time(path["shadow_hit_at"]) if path["shadow_hit_at"] else ""
+    return path
 
 
 @app.get("/api/smc/status")

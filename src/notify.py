@@ -253,6 +253,236 @@ def notify_risk_warning(kind: str, message: str) -> None:
         logging.warning("Discord notify_risk_warning failed: %s", exc)
 
 
+def notify_predict5m_open(
+    symbol: str,
+    side: str,
+    *,
+    stake: float,
+    step: int = 0,
+    window_start_ms: int,
+    dry_run: bool = False,
+    limit_px: float | None = None,
+    interval: str = "5m",
+    target: float | None = None,
+) -> None:
+    try:
+        if not discord_configured():
+            return
+        from datetime import datetime, timedelta, timezone
+
+        vn = timezone(timedelta(hours=7))
+        win = datetime.fromtimestamp(int(window_start_ms) / 1000, vn).strftime("%H:%M")
+        tag = " dry-run" if dry_run else ""
+        px = f" LIMIT {limit_px:.2f} (lãi ≥2× vốn)" if limit_px else ""
+        tgt = "" if target is None else f"target={target:.2f} → "
+        body = (
+            f"{tgt}cược={stake:.2f} USDT{px}\n"
+            f"cửa {interval} {win} +07{tag}"
+        )
+        _send_discord(
+            f"{symbol.upper()} {side.upper()} mở — Prediction {interval}", body
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_predict5m_open failed: %s", exc)
+
+
+def notify_predict5m_result(
+    symbol: str,
+    side: str,
+    *,
+    won: bool | None,
+    filled: bool,
+    stake: float,
+    pnl: float,
+    reason: str,
+    step: int | None = None,
+    interval: str = "5m",
+    target: float | None = None,
+    next_target: float | None = None,
+    next_stake: float | None = None,
+) -> None:
+    try:
+        if not discord_configured():
+            return
+        if not filled:
+            title = f"{symbol.upper()} {side.upper()} không khớp — Prediction {interval}"
+            body = f"LIMIT hết cửa, không đổi target\ncược={stake:.2f} USDT\n{reason}"
+        elif won:
+            title = f"{symbol.upper()} {side.upper()} thắng — Prediction {interval}"
+            rst = f"{next_target:.0f}" if next_target else "2"
+            body = f"pnl=+{pnl:.2f} USDT\ncược={stake:.2f} reset target về {rst}"
+        else:
+            nxt = ""
+            if next_target is not None and next_stake is not None:
+                nxt = f"\ntarget tiếp {next_target:.2f} → cược {next_stake:.2f} USDT"
+            elif step is not None:
+                nxt = f"\nbước tiếp {int(step) + 1}: {stake * 2:.0f} USDT"
+            title = f"{symbol.upper()} {side.upper()} thua — Prediction {interval}"
+            body = f"pnl={pnl:.2f} USDT\ncược={stake:.2f}{nxt}"
+        _send_discord(title, body)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_predict5m_result failed: %s", exc)
+
+
+def notify_predict5m_pause(
+    *,
+    hours: float = 1.0,
+    until_ms: int | None = None,
+    stake: float | None = None,
+    available: float | None = None,
+    interval: str = "5m",
+) -> None:
+    try:
+        if not discord_configured():
+            return
+        extra = ""
+        if until_ms:
+            from datetime import datetime, timedelta, timezone
+
+            vn = timezone(timedelta(hours=7))
+            extra = f"\nchạy lại {datetime.fromtimestamp(int(until_ms) / 1000, vn).strftime('%H:%M')} +07"
+        wallet = ""
+        if stake is not None and available is not None:
+            wallet = f"cần {stake:.0f} USDT, ví còn {available:.2f}\n"
+        body = (
+            f"ví không đủ lệnh tiếp theo, reset target\n"
+            f"{wallet}"
+            f"dừng {hours:g}h rồi mới vào lệnh{extra}"
+        )
+        _send_discord(f"Prediction {interval} dừng 1h", body)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_predict5m_pause failed: %s", exc)
+
+
+def notify_predict5m_resume(*, stake: float = 1.0, interval: str = "5m") -> None:
+    try:
+        if not discord_configured():
+            return
+        body = f"hết giờ dừng 1h\ncược lại {stake:.0f} USDT"
+        _send_discord(f"Prediction {interval} chạy lại", body)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_predict5m_resume failed: %s", exc)
+
+
+def notify_trend4h_open(symbol: str, side: str, *, entry: float, bar_ts: int) -> None:
+    try:
+        if not discord_configured():
+            return
+        body = f"vào={_fmt_px(entry)}\nSupertrend 4h + ADX≥25\nký quỹ=1 USDT × 10"
+        _send_discord(f"{symbol.upper()} {side.upper()} mở — trend 4h", body)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_trend4h_open failed: %s", exc)
+
+
+def notify_fade5m_limit(symbol: str, side: str, *, px: float, bar_ts: int, qty: float | None = None) -> None:
+    try:
+        if not discord_configured():
+            return
+        qty_txt = f"qty={qty}\n" if qty is not None else ""
+        body = f"limit={_fmt_px(px)}\n{qty_txt}4h màu ngược nến 5m"
+        _send_discord(f"{symbol.upper()} {side.upper()} limit — fade 5m", body)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_fade5m_limit failed: %s", exc)
+
+
+def notify_fade5m_fill(symbol: str, side: str, *, entry: float, bar_ts: int) -> None:
+    try:
+        if not discord_configured():
+            return
+        body = f"khớp={_fmt_px(entry)}\nbar_ts={bar_ts}"
+        _send_discord(f"{symbol.upper()} {side.upper()} khớp — fade 5m", body)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_fade5m_fill failed: %s", exc)
+
+
+def notify_fade5m_close(
+    symbol: str,
+    side: str,
+    *,
+    reason: str,
+    entry: float,
+    exit_px: float,
+    pnl: float,
+) -> None:
+    try:
+        if not discord_configured():
+            return
+        body = f"vào={_fmt_px(entry)}  đóng={_fmt_px(exit_px)}\npnl={pnl:+.4f} USDT\n{reason}"
+        _send_discord(f"{symbol.upper()} {side.upper()} đóng — fade 5m", body)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_fade5m_close failed: %s", exc)
+
+
+def notify_trend4h_close(
+    symbol: str,
+    side: str,
+    *,
+    reason: str,
+    entry: float,
+    exit_px: float,
+    pnl: float,
+) -> None:
+    try:
+        if not discord_configured():
+            return
+        label = "đảo Supertrend" if reason == "st_flip" else reason
+        body = f"vào={_fmt_px(entry)}  đóng={_fmt_px(exit_px)}\npnl={pnl:+.4f} USDT"
+        _send_discord(f"{symbol.upper()} {side.upper()} đóng — {label}", body)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_trend4h_close failed: %s", exc)
+
+
+def notify_revert_open(
+    symbol: str,
+    side: str,
+    *,
+    level: float,
+    entry: float,
+    tp: float,
+    margin_usdt: float,
+) -> None:
+    """Discord when a return-to-signal limit is placed. Fail-soft."""
+    try:
+        if not discord_configured():
+            return
+        title = f"{symbol.upper()} {side.upper()} mở"
+        body = (
+            f"mức tín hiệu={_fmt_px(level)}\n"
+            f"limit vào={_fmt_px(entry)}  chốt={_fmt_px(tp)}\n"
+            f"ký quỹ={margin_usdt:.2f} USDT × 10"
+        )
+        _send_discord(title, body)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_revert_open failed: %s", exc)
+
+
+def notify_revert_close(
+    symbol: str,
+    side: str,
+    *,
+    reason: str,
+    level: float,
+    entry: float,
+    close_px: float | None,
+    pnl_usdt: float | None,
+) -> None:
+    """Discord when a return-to-signal order closes or is cancelled. Fail-soft."""
+    try:
+        if not discord_configured():
+            return
+        label = {"tp": "chốt lời", "expire": "hết 7 ngày", "cancel": "hủy, chưa khớp"}.get(reason, reason)
+        title = f"{symbol.upper()} {side.upper()} đóng — {label}"
+        pnl = "chưa khớp" if pnl_usdt is None else f"{pnl_usdt:+.4f} USDT"
+        body = (
+            f"mức tín hiệu={_fmt_px(level)}\n"
+            f"vào={_fmt_px(entry)}  đóng={_fmt_px(close_px) if close_px else '—'}\n"
+            f"pnl={pnl}"
+        )
+        _send_discord(title, body)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Discord notify_revert_close failed: %s", exc)
+
+
 def notify_error(context: str, detail: str, *, cooldown_sec: float | None = None) -> None:
     """Send bot-error notification to Discord. Never raises; no balance fetch (avoid API during bans)."""
     try:

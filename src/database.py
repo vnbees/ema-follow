@@ -47,6 +47,14 @@ def init_db() -> None:
     from src.donchian import store
 
     store.ensure_schema()
+    from src.trend4h import store as trend4h_store
+    from src.fade5m import store as fade5m_store
+
+    from src.predict5m import store as predict5m_store
+
+    trend4h_store.ensure_schema()
+    fade5m_store.ensure_schema()
+    predict5m_store.ensure_schema()
 
 
 def _migrate_spot_transfer_tables(conn: sqlite3.Connection) -> None:

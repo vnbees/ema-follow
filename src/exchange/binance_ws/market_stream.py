@@ -270,12 +270,13 @@ class KlineStream:
     def __init__(
         self,
         *,
-        interval: str = GRANULARITY,
+        interval: str | tuple[str, ...] = GRANULARITY,
         symbols_provider: SubscribeFn | None = None,
         stop_event: asyncio.Event | None = None,
         silence_sec: float | None = None,
     ) -> None:
-        self.interval = interval
+        self.intervals = (interval,) if isinstance(interval, str) else tuple(interval)
+        self.interval = self.intervals[0]
         self.symbols_provider = symbols_provider or (lambda: set())
         self._stop = stop_event or asyncio.Event()
         self._ws: Any = None
@@ -298,7 +299,11 @@ class KlineStream:
         return self._msg_id
 
     def desired_streams(self) -> set[str]:
-        return {_kline_stream(symbol, self.interval) for symbol in self.symbols_provider()}
+        return {
+            _kline_stream(symbol, interval)
+            for interval in self.intervals
+            for symbol in self.symbols_provider()
+        }
 
     async def _send_sub(self, streams: set[str], *, subscribe: bool) -> None:
         if not streams or self._ws is None:
@@ -340,8 +345,10 @@ class KlineStream:
         now = time.monotonic()
         silent: set[str] = set()
         for stream in list(self._subscribed):
-            symbol = stream.split("@", 1)[0].upper()
-            age = CACHE.candle_age_sec(symbol)
+            symbol, _, rest = stream.partition("@")
+            symbol = symbol.upper()
+            interval = rest.split("_", 1)[-1] if rest.startswith("kline_") else self.interval
+            age = CACHE.candle_age_sec(symbol, interval)
             if age is not None:
                 if age < self._silence_sec:
                     continue
@@ -363,8 +370,12 @@ class KlineStream:
         self._subscribed -= silent
         for stream in silent:
             self._subscribed_since.pop(stream, None)
+            symbol, _, rest = stream.partition("@")
+            symbol = symbol.upper()
+            interval = rest.split("_", 1)[-1] if rest.startswith("kline_") else self.interval
             with CACHE.lock:
-                CACHE.candle_last_msg_at.pop(stream.split("@", 1)[0].upper(), None)
+                CACHE.candle_last_msg_at.pop(symbol, None)
+                CACHE.candle_last_msg_at.pop(f"{symbol}:{interval}", None)
 
     async def _sync(self) -> None:
         await self._force_resubscribe_silent()
@@ -452,7 +463,7 @@ class KlineStream:
                                     and payload["data"].get("e") == "kline"
                                 ):
                                     k = payload["data"].get("k") or {}
-                                if isinstance(k, dict) and k.get("x"):
+                                if isinstance(k, dict) and k.get("x") and str(k.get("i") or "") == GRANULARITY:
                                     try:
                                         from src.exchange.binance_ws.persist import (
                                             save_candles_snapshot,

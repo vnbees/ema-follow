@@ -62,6 +62,7 @@ class BinanceWsCache:
     candles: dict[str, list[Candle]] = field(default_factory=dict)
     candle_interval: dict[str, str] = field(default_factory=dict)
     candle_last_msg_at: dict[str, float] = field(default_factory=dict)
+    candles_extra: dict[tuple[str, str], list[Candle]] = field(default_factory=dict)
     quote_volumes: dict[str, float] = field(default_factory=dict)
     marks: dict[str, float] = field(default_factory=dict)
     market_last_msg_at: float = 0.0
@@ -133,9 +134,14 @@ class BinanceWsCache:
             if self.kline_disconnect_since is None:
                 self.kline_disconnect_since = _now()
 
-    def candle_age_sec(self, symbol: str) -> float | None:
+    def candle_age_sec(self, symbol: str, interval: str | None = None) -> float | None:
+        symbol = symbol.upper()
         with self.lock:
-            ts = self.candle_last_msg_at.get(symbol.upper())
+            if interval:
+                ts = self.candle_last_msg_at.get(f"{symbol}:{interval}")
+                if ts:
+                    return _now() - ts
+            ts = self.candle_last_msg_at.get(symbol)
             if not ts:
                 return None
             return _now() - ts
@@ -161,13 +167,25 @@ class BinanceWsCache:
 
     def set_candles(self, symbol: str, interval: str, candles: list[Candle]) -> None:
         symbol = symbol.upper()
+        from src.config import GRANULARITY
+
         with self.lock:
+            if interval != GRANULARITY:
+                self.candles_extra[(symbol, interval)] = list(candles)
+                return
             self.candles[symbol] = list(candles)
             self.candle_interval[symbol] = interval
 
     def get_candles(self, symbol: str, interval: str, limit: int) -> list[Candle] | None:
         symbol = symbol.upper()
+        from src.config import GRANULARITY
+
         with self.lock:
+            if interval != GRANULARITY:
+                rows = self.candles_extra.get((symbol, interval))
+                if not rows:
+                    return None
+                return list(rows[-limit:])
             if self.candle_interval.get(symbol) != interval:
                 return None
             rows = self.candles.get(symbol)
@@ -205,19 +223,25 @@ class BinanceWsCache:
     ) -> None:
         _ = is_closed
         symbol = symbol.upper()
+        from src.config import GRANULARITY
+
         with self.lock:
+            now = _now()
+            if interval != GRANULARITY:
+                rows = self.candles_extra.setdefault((symbol, interval), [])
+                self._upsert_candle_row(rows, candle)
+                self.candle_last_msg_at[f"{symbol}:{interval}"] = now
+                self.candle_last_msg_at[symbol] = now
+                self.kline_connected = True
+                self.kline_disconnect_since = None
+                return
             stored = self.candle_interval.get(symbol)
             if stored not in (None, interval):
-                from src.config import GRANULARITY
-
-                if interval != GRANULARITY:
-                    return
                 # Take over: leftover 5m cache would otherwise block 15m WS updates.
                 self.candles[symbol] = []
             self.candle_interval[symbol] = interval
             rows = self.candles.setdefault(symbol, [])
             self._upsert_candle_row(rows, candle)
-            now = _now()
             self.candle_last_msg_at[symbol] = now
             self.kline_connected = True
             self.kline_disconnect_since = None
