@@ -14,7 +14,7 @@ Code `src/predict5m`. Bật bằng `PREDICT5M_ENABLED` + `PREDICT5M_TRADING_ENAB
 
 Ba khung **5m, 15m, 1h**. BTCUSDT / ETHUSDT / BNBUSDT trên Binance Prediction Markets (Up/Down). **Cùng lúc một** cược mở (mọi khung). Cùng lúc có tín hiệu thì ưu tiên khung nhỏ: 5m rồi 15m rồi 1h. Coin đầu tiên có tín hiệu trong khung được chọn. Luật tín hiệu giống nhau trên nến **đã đóng** của đúng khung đó (`closeTime < now`) — nến đang chạy không được đánh giá. Đủ điều kiện trên nến đóng rồi đặt **ngay mở nến kế** (cửa Prediction), không lấy nến đang mở làm tín hiệu:
 
-1. Nhãn TV **default ON**: Engulfing (BE), Hammer, Dragonfly Doji, Abandoned Baby — latch xanh/đỏ. Pattern tắt mặc định (Marubozu, Long Lower Shadow, Harami, Tweezer, Piercing…) **không** đổi latch. Mọi nhãn khác (xám **D** / **STW** / **STB**, hoặc xanh và đỏ cùng một nến) xóa latch.
+1. Nhãn TV **default ON**: Engulfing (BE), Hammer, Dragonfly Doji, Abandoned Baby — latch = nhãn xanh/đỏ **gần nhất** trên đúng khung đó. Pattern tắt mặc định (Marubozu, Long Lower Shadow, Harami, Tweezer, Piercing, **STW/STB**…) **không** đổi latch. Chỉ nhãn xám **D** (Doji, mặc định bật) hoặc xanh và đỏ cùng một nến mới xóa latch.
 2. SQZMOM chấm **xám** (`sqzOff`).
 3. Hist cùng phía nhãn (xanh lime/green với nhãn xanh; đỏ red/maroon với nhãn đỏ).
 4. Nến vừa đóng là nến **ngược** (nhãn xanh + nến đỏ, hoặc nhãn đỏ + nến xanh).

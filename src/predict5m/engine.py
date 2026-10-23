@@ -1,8 +1,9 @@
 """Entry: a closed bar on 5m/15m/1h, then bet at the next open of that timeframe.
 
-The forming bar is never evaluated (closeTime must be < now). Latch + SQZ +
-body are read on that closed bar only. Any TV label that is not blue or red
-(Doji D, spinning STW/STB, or both colors on one bar) clears the latch.
+The forming bar is never evaluated (closeTime must be < now). Latch is the
+nearest TV-default blue/red on that timeframe (Engulfing/Hammer/Dragonfly/
+Abandoned Baby). Gray Doji D or both colors on one bar clears it. Spinning
+STW/STB are off on TV defaults and do not clear.
 """
 
 from __future__ import annotations

@@ -258,16 +258,20 @@ class PlaceHelpersTests(unittest.TestCase):
 
 
 class LatchTests(unittest.TestCase):
-    def test_gray_clears_directional(self):
+    def test_doji_d_clears_directional(self):
         raw = np.array([0, -1, 0, 0, 1, 0], dtype=np.int8)
-        gray = np.array([0, 0, 1, 0, 0, 0], dtype=bool)
-        got = list(latch_labels(raw, gray))
+        doji = np.array([0, 0, 1, 0, 0, 0], dtype=bool)
+        got = list(latch_labels(raw, doji))
         self.assertEqual(got, [0, -1, 0, 0, 1, 1])
 
-    def test_any_non_blue_red_on_same_bar_invalidates(self):
+    def test_spinning_without_clear_keeps_latch(self):
+        raw = np.array([-1, 0, 0], dtype=np.int8)
+        self.assertEqual(list(latch_labels(raw)), [-1, -1, -1])
+
+    def test_doji_on_same_bar_as_engulfing_invalidates(self):
         raw = np.array([-1], dtype=np.int8)
-        gray = np.array([True])
-        self.assertEqual(int(latch_labels(raw, gray)[0]), 0)
+        doji = np.array([True])
+        self.assertEqual(int(latch_labels(raw, doji)[0]), 0)
 
     def test_latch_uses_tv_default_patterns_only(self):
         self.assertEqual(

@@ -63,7 +63,8 @@ def detect(o, h, l, c):
             np.abs(dn_sh - up_sh) / up_sh * 100 < 100
         )
     shadow_eq = (up_sh == dn_sh) | sh_rel
-    # TV gray labels: D (Doji), STW / STB (spinning tops)
+    # TV gray D is default ON. STW/STB are defval=false — they do not show and
+    # must not clear the latch.
     plain_doji = is_doji & shadow_eq & ~((up_sh <= body) | (dn_sh <= body))
     spin_sh = (rng > 0) & (dn_sh >= rng * 0.34) & (up_sh >= rng * 0.34) & ~is_doji
     spinning_w = spin_sh & white
@@ -468,10 +469,10 @@ def directional_on_bar(patterns: dict) -> np.ndarray:
 
 
 def latch_labels(raw: np.ndarray, clear: np.ndarray | None = None) -> np.ndarray:
-    """Keep last blue/red until a new directional label.
+    """Keep last blue/red TV-default label until a new one.
 
-    Any non-blue/red label (gray D/STW/STB, or blue+red conflict) clears the latch,
-    including when it shares the bar with a directional pattern.
+    Gray Doji D (TV default ON) or blue+red on the same bar clears. Spinning
+    STW/STB are off on TV defaults — they do not clear.
     """
     out = np.zeros(len(raw), dtype=np.int8)
     last = 0
@@ -486,5 +487,5 @@ def latch_labels(raw: np.ndarray, clear: np.ndarray | None = None) -> np.ndarray
 
 def latest_labels(o, h, l, c) -> np.ndarray:
     pat = detect(o, h, l, c)
-    clear = (pat["_Gray"] != 0) | (pat["_TvConflict"] != 0)
+    clear = (pat["_Doji"] != 0) | (pat["_TvConflict"] != 0)
     return latch_labels(directional_on_bar(pat), clear)
