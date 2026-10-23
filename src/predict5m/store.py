@@ -271,3 +271,42 @@ def close_bet(
             """,
             (won_val, float(pnl), reason, fill_status, int(bet_id)),
         )
+
+
+def recent_bets(limit: int = 80) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM predict5m_bets ORDER BY id DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def summary() -> dict:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT
+              COUNT(*) AS n,
+              SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS n_open,
+              SUM(CASE WHEN status = 'closed' AND won = 1 THEN 1 ELSE 0 END) AS wins,
+              SUM(CASE WHEN status = 'closed' AND won = 0 THEN 1 ELSE 0 END) AS losses,
+              SUM(CASE WHEN status = 'closed' AND won IS NULL THEN 1 ELSE 0 END) AS unfilled,
+              SUM(CASE WHEN status = 'closed' THEN COALESCE(pnl, 0) ELSE 0 END) AS pnl
+            FROM predict5m_bets
+            """
+        ).fetchone()
+    n = int(row["n"] or 0)
+    wins = int(row["wins"] or 0)
+    losses = int(row["losses"] or 0)
+    filled = wins + losses
+    return {
+        "n": n,
+        "n_open": int(row["n_open"] or 0),
+        "wins": wins,
+        "losses": losses,
+        "unfilled": int(row["unfilled"] or 0),
+        "filled": filled,
+        "pnl": float(row["pnl"] or 0),
+        "winrate": (wins / filled) if filled else None,
+    }

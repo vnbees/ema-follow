@@ -265,25 +265,8 @@ def notify_predict5m_open(
     interval: str = "5m",
     target: float | None = None,
 ) -> None:
-    try:
-        if not discord_configured():
-            return
-        from datetime import datetime, timedelta, timezone
-
-        vn = timezone(timedelta(hours=7))
-        win = datetime.fromtimestamp(int(window_start_ms) / 1000, vn).strftime("%H:%M")
-        tag = " dry-run" if dry_run else ""
-        px = f" LIMIT {limit_px:.2f} (lãi ≥2× vốn)" if limit_px else ""
-        tgt = "" if target is None else f"target={target:.2f} → "
-        body = (
-            f"{tgt}cược={stake:.2f} USDT{px}\n"
-            f"cửa {interval} {win} +07{tag}"
-        )
-        _send_discord(
-            f"{symbol.upper()} {side.upper()} mở — Prediction {interval}", body
-        )
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("Discord notify_predict5m_open failed: %s", exc)
+    """Open/loss/unfilled stay on the dashboard. Discord is win or problem only."""
+    return
 
 
 def notify_predict5m_result(
@@ -304,22 +287,14 @@ def notify_predict5m_result(
     try:
         if not discord_configured():
             return
-        if not filled:
-            title = f"{symbol.upper()} {side.upper()} không khớp — Prediction {interval}"
-            body = f"LIMIT hết cửa, không đổi target\ncược={stake:.2f} USDT\n{reason}"
-        elif won:
-            title = f"{symbol.upper()} {side.upper()} thắng — Prediction {interval}"
-            rst = f"{next_target:.0f}" if next_target else "2"
-            body = f"pnl=+{pnl:.2f} USDT\ncược={stake:.2f} reset target về {rst}"
-        else:
-            nxt = ""
-            if next_target is not None and next_stake is not None:
-                nxt = f"\ntarget tiếp {next_target:.2f} → cược {next_stake:.2f} USDT"
-            elif step is not None:
-                nxt = f"\nbước tiếp {int(step) + 1}: {stake * 2:.0f} USDT"
-            title = f"{symbol.upper()} {side.upper()} thua — Prediction {interval}"
-            body = f"pnl={pnl:.2f} USDT\ncược={stake:.2f}{nxt}"
-        _send_discord(title, body)
+        if not filled or not won:
+            return
+        rst = f"{next_target:.0f}" if next_target else "2"
+        body = f"pnl=+{pnl:.2f} USDT\ncược={stake:.2f} reset target về {rst}"
+        _send_discord(
+            f"{symbol.upper()} {side.upper()} thắng — Prediction {interval}",
+            body,
+        )
     except Exception as exc:  # noqa: BLE001
         logging.warning("Discord notify_predict5m_result failed: %s", exc)
 
@@ -355,13 +330,8 @@ def notify_predict5m_pause(
 
 
 def notify_predict5m_resume(*, stake: float = 1.0, interval: str = "5m") -> None:
-    try:
-        if not discord_configured():
-            return
-        body = f"hết giờ dừng 1h\ncược lại {stake:.0f} USDT"
-        _send_discord(f"Prediction {interval} chạy lại", body)
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("Discord notify_predict5m_resume failed: %s", exc)
+    """Resume is not a problem — dashboard only."""
+    return
 
 
 def notify_trend4h_open(symbol: str, side: str, *, entry: float, bar_ts: int) -> None:

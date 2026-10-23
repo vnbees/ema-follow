@@ -14,10 +14,8 @@ import numpy as np
 
 from src.notify import (
     notify_error,
-    notify_predict5m_open,
     notify_predict5m_pause,
     notify_predict5m_result,
-    notify_predict5m_resume,
 )
 from src.predict5m import broker, store
 from src.predict5m.api import available_usdt, fetch_klines, find_order
@@ -73,7 +71,6 @@ def _maybe_resume(now_ms: int) -> None:
     if store.clear_pause_if_due(now_ms):
         stake = stake_from_target(TARGET_USDT)
         log.info("predict5m resume after 1h pause, stake=%.2f", stake)
-        notify_predict5m_resume(stake=stake)
 
 
 def scan_once(now_ms: int | None = None, *, timeframe: str = "5m") -> dict:
@@ -167,17 +164,6 @@ def scan_once(now_ms: int | None = None, *, timeframe: str = "5m") -> dict:
         placed.get("limit_px"),
         chosen.bar_ts,
         placed.get("dry_run"),
-    )
-    notify_predict5m_open(
-        chosen.symbol,
-        side,
-        stake=stake,
-        step=0,
-        target=bank.target,
-        window_start_ms=chosen.entry_ts,
-        dry_run=bool(placed.get("dry_run")),
-        limit_px=placed.get("limit_px"),
-        interval=timeframe,
     )
     return {"opened": row, "placed": placed, "signal": chosen, "timeframe": timeframe}
 
@@ -427,6 +413,47 @@ def seconds_until_open(now_ms: int | None = None, *, pad_sec: float = 1.2) -> fl
         ms = interval_ms(tf)
         rem.append(ms - (now_ms % ms))
     return min(rem) / 1000.0 + pad_sec
+
+
+_wallet_cache: tuple[float, float | None] = (0.0, None)
+
+
+def _wallet_cached() -> float | None:
+    global _wallet_cache
+    now = time.time()
+    ts, val = _wallet_cache
+    if now - ts < 30:
+        return val
+    try:
+        val = available_usdt()
+    except Exception:  # noqa: BLE001
+        val = None
+    _wallet_cache = (now, val)
+    return val
+
+
+def snapshot() -> dict:
+    store.ensure_schema()
+    now_ms = _now_ms()
+    bank = store.bankroll()
+    stats = store.summary()
+    pause_until = store.pause_until_ms()
+    return {
+        "enabled": ENABLED,
+        "trading_enabled": TRADING_ENABLED,
+        "symbols": list(SYMBOLS),
+        "timeframes": list(TIMEFRAMES),
+        "target": bank.target,
+        "base_target": TARGET_USDT,
+        "streak_loss": bank.streak_loss,
+        "next_stake": stake_from_target(bank.target),
+        "paused": store.is_paused(now_ms),
+        "pause_until_ms": pause_until if pause_until > 0 else None,
+        "wallet": _wallet_cached(),
+        "open": store.open_bet(),
+        "recent": store.recent_bets(80),
+        **stats,
+    }
 
 
 def run_forever() -> None:

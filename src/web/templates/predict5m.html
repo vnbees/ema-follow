@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ exchange_name }} Prediction</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #0f1117; color: #e6edf3; }
+    h1 { margin: 0 0 4px; font-size: 22px; }
+    h2 { font-size: 16px; margin: 0 0 12px; }
+    a { color: #58a6ff; }
+    .meta { color: #8b949e; font-size: 13px; margin: 4px 0 16px; }
+    .green { color: #3fb950; }
+    .red { color: #f85149; }
+    .muted { color: #8b949e; }
+    .panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+    .summary-card { background: #0f1117; border: 1px solid #30363d; border-radius: 8px; padding: 12px; }
+    .summary-card .label { color: #8b949e; font-size: 12px; }
+    .summary-card .value { font-size: 18px; margin-top: 4px; }
+    .summary-card .sub { color: #8b949e; font-size: 12px; margin-top: 4px; }
+    .status-pill { border: 1px solid #30363d; border-radius: 999px; padding: 4px 10px; font-size: 12px; }
+    .status-pill.running { color: #3fb950; }
+    .status-pill.stopped { color: #f85149; }
+    .status-pill.warn { color: #d29922; border-color: #9e6a03; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #30363d; text-align: left; white-space: nowrap; }
+    th { color: #8b949e; font-size: 11px; text-transform: uppercase; }
+    .table-wrap { overflow-x: auto; }
+    .side { font-size: 12px; font-weight: 700; padding: 2px 7px; border-radius: 4px; color: #fff; }
+    .side.up { background: #238636; }
+    .side.down { background: #da3633; }
+    @media (max-width: 720px) {
+      body { padding: 12px; }
+      h1 { font-size: 18px; }
+      .panel { padding: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <h1>{{ exchange_name }} Prediction 5m / 15m / 1h</h1>
+  <p class="meta">BTC ETH BNB · LIMIT lãi ≥ 2× vốn · gỡ lỗ + target. Discord chỉ thắng hoặc lỗi.
+    <a href="/so-lenh">SMC</a> · <a href="/donchian">Donchian</a></p>
+  <p class="meta" id="status">Đang tải…</p>
+
+  <div class="panel">
+    <h2>Lãi lỗ</h2>
+    <div class="summary-grid" id="summary"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Lệnh đang mở</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Coin</th><th>Cửa</th><th>Khung</th><th>Cược</th><th>Target</th>
+            <th>Giá LIMIT</th><th>Vào</th><th>Trạng thái</th>
+          </tr>
+        </thead>
+        <tbody id="open"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Lịch sử lệnh</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Đóng</th><th>Coin</th><th>Cửa</th><th>Khung</th><th>Cược</th>
+            <th>Kết quả</th><th>PnL</th><th>Lý do</th>
+          </tr>
+        </thead>
+        <tbody id="recent"></tbody>
+      </table>
+    </div>
+  </div>
+<script>
+function pnl(v){
+  const n = Number(v||0);
+  return '<span class="'+(n>=0?'green':'red')+'">'+(n>=0?'+':'')+n.toFixed(2)+'</span>';
+}
+function sideCell(s){
+  const k = String(s||'').toLowerCase();
+  return '<span class="side '+k+'">'+(s||'—')+'</span>';
+}
+function bar(ts){
+  if(!ts) return '—';
+  return new Date(Number(ts)).toLocaleString('vi-VN', {
+    timeZone:'Asia/Ho_Chi_Minh',
+    day:'2-digit', month:'2-digit',
+    hour:'2-digit', minute:'2-digit',
+    hour12:false
+  });
+}
+function resultOf(row){
+  if(row.status === 'open') return '<span class="muted">đang mở</span>';
+  if(row.won === 1) return '<span class="green">thắng</span>';
+  if(row.won === 0) return '<span class="red">thua</span>';
+  return '<span class="muted">không khớp</span>';
+}
+function card(label, value, sub){
+  return '<div class="summary-card"><div class="label">'+label+'</div><div class="value">'+value+'</div>'
+    +(sub ? '<div class="sub">'+sub+'</div>' : '')+'</div>';
+}
+async function refresh(){
+  const r = await fetch('/api/predict5m');
+  if(!r.ok) return;
+  const d = await r.json();
+  const wr = d.winrate == null ? '—' : (d.winrate*100).toFixed(0)+'%';
+  const wallet = d.wallet == null ? '—' : Number(d.wallet).toFixed(2)+' USDT';
+  let pill = d.enabled && d.trading_enabled ? 'đang trade' : (d.enabled ? 'chỉ quét' : 'tắt');
+  let extra = '';
+  if(d.paused){
+    pill = 'dừng 1h';
+    extra = d.pause_until_ms ? ' đến '+bar(d.pause_until_ms) : '';
+  }
+  document.getElementById('status').innerHTML =
+    '<span class="status-pill '+(d.paused?'warn':(d.trading_enabled?'running':'stopped'))+'">'+pill+'</span> '
+    +(d.symbols||[]).join(' ')+' · '+(d.timeframes||[]).join('/')+extra;
+  document.getElementById('summary').innerHTML = [
+    card('PnL đã chốt', pnl(d.pnl), (d.filled||0)+' lệnh khớp'),
+    card('Thắng / thua', (d.wins||0)+' / '+(d.losses||0), 'winrate '+wr),
+    card('Không khớp', d.unfilled||0, 'không đổi target'),
+    card('Ví CeDeFi', wallet, 'cược tiếp '+Number(d.next_stake||0).toFixed(2)),
+    card('Target hiện tại', Number(d.target||0).toFixed(2), 'gốc '+Number(d.base_target||0).toFixed(0)+' · lỗ dồn '+Number(d.streak_loss||0).toFixed(2)),
+  ].join('');
+  const open = d.open;
+  document.getElementById('open').innerHTML = open
+    ? '<tr><td>'+open.symbol+'</td><td>'+sideCell(open.side)+'</td><td>'+(open.timeframe||'')+'</td><td>'+Number(open.stake||0).toFixed(2)+'</td><td>'+(open.target_usdt==null?'—':Number(open.target_usdt).toFixed(2))+'</td><td>'+(open.limit_px==null?'—':Number(open.limit_px).toFixed(2))+'</td><td>'+bar(open.entry_ts)+'</td><td>'+(open.fill_status||'SUBMITTED')+'</td></tr>'
+    : '<tr><td colspan="8" class="muted">Không có lệnh mở</td></tr>';
+  const rows = (d.recent||[]).filter(x => x.status !== 'open');
+  document.getElementById('recent').innerHTML = rows.length
+    ? rows.map(row =>
+        '<tr><td>'+bar(row.closed_at ? Date.parse(row.closed_at+'Z') : row.entry_ts)+'</td><td>'+row.symbol+'</td><td>'+sideCell(row.side)+'</td><td>'+(row.timeframe||'')+'</td><td>'+Number(row.stake||0).toFixed(2)+'</td><td>'+resultOf(row)+'</td><td>'+pnl(row.pnl)+'</td><td class="muted">'+(row.reason||'')+'</td></tr>'
+      ).join('')
+    : '<tr><td colspan="8" class="muted">Chưa có lệnh đóng</td></tr>';
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

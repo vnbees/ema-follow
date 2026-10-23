@@ -8,9 +8,9 @@ Dashboard `/`. Sổ SMC cũ `/so-lenh`. Donchian `/donchian`.
 
 ---
 
-# Bot Prediction 5m / 15m / 1h BTC/ETH/BNB — không chạy
+# Bot Prediction 5m / 15m / 1h BTC/ETH/BNB
 
-Code `src/predict5m`. **Tắt mặc định** (`PREDICT5M_ENABLED=false`, `PREDICT5M_TRADING_ENABLED=false`). Không gắn vòng live `cycle.py`. Không đặt cược cho đến khi bật tay. Luồng quote/place **LIMIT GTC** (wei, ví Prediction, `priceLimit` lãi ≥ 2× vốn) và vòng chờ **đúng mở nến** của từng khung đã gắn sẵn — chỉ chạy khi bật flag (`python -m src.predict5m.runtime`).
+Code `src/predict5m`. Bật bằng `PREDICT5M_ENABLED` + `PREDICT5M_TRADING_ENABLED`. Gắn vòng live `cycle.py` (ưu tiên hơn fade/trend/SMC). Dashboard `/` và `/predict`. Discord **chỉ khi thắng**, khi ví không đủ (dừng 1h), hoặc khi lỗi.
 
 Ba khung **5m, 15m, 1h**. BTCUSDT / ETHUSDT / BNBUSDT trên Binance Prediction Markets (Up/Down). **Cùng lúc một** cược mở (mọi khung). Cùng lúc có tín hiệu thì ưu tiên khung nhỏ: 5m rồi 15m rồi 1h. Coin đầu tiên có tín hiệu trong khung được chọn. Luật tín hiệu giống nhau trên nến **đã đóng** của đúng khung đó (`closeTime < now`) — nến đang chạy không được đánh giá. Đủ điều kiện trên nến đóng rồi đặt **ngay mở nến kế** (cửa Prediction), không lấy nến đang mở làm tín hiệu:
 
@@ -19,7 +19,7 @@ Ba khung **5m, 15m, 1h**. BTCUSDT / ETHUSDT / BNBUSDT trên Binance Prediction M
 3. Hist cùng phía nhãn (xanh lime/green với nhãn xanh; đỏ red/maroon với nhãn đỏ).
 4. Nến vừa đóng là nến **ngược** (nhãn xanh + nến đỏ, hoặc nhãn đỏ + nến xanh).
 
-Tín hiệu đúng thì treo **LIMIT** tại giá share sao cho **thắng lãi ≥ 2 lần vốn** (`price ≈ (1−fee)/3`, làm tròn xuống tick). Không khớp market giá mở cửa. Hết cửa bot đọc trạng thái lệnh: **chưa khớp** thì **không đổi target** (sàn tự hủy LIMIT khi đóng cửa, bot không hủy); đã khớp thì lấy nến cùng khung quyết thắng/thua. Vốn: target lãi mặc định **2 USDT** (`PREDICT5M_TARGET_USDT`, tối thiểu để vốn vào ≥ 1 USDT sàn). Vốn vào = target / 2 vì LIMIT lời 2×. Thua (đã khớp): target sau = **lỗ lũy kế + 2** (thắng gỡ hết lỗ rồi còn đúng 2 USDT). Thắng hoặc hết ví thì reset target 2. Dùng chung mọi khung. Trước mỗi lệnh bot đọc số dư ví Prediction (CeDeFi). **Không đủ tiền** thì **dừng 1 giờ**. Discord khi vào lệnh, khi khớp/thắng/thua/không khớp, khi lỗi, khi dừng 1h và khi chạy lại.
+Tín hiệu đúng thì treo **LIMIT** tại giá share sao cho **thắng lãi ≥ 2 lần vốn** (`price ≈ (1−fee)/3`, làm tròn xuống tick). Không khớp market giá mở cửa. Hết cửa bot đọc trạng thái lệnh: **chưa khớp** thì **không đổi target** (sàn tự hủy LIMIT khi đóng cửa, bot không hủy); đã khớp thì lấy nến cùng khung quyết thắng/thua. Vốn: target lãi mặc định **2 USDT** (`PREDICT5M_TARGET_USDT`, tối thiểu để vốn vào ≥ 1 USDT sàn). Vốn vào = target / 2 vì LIMIT lời 2×. Thua (đã khớp): target sau = **lỗ lũy kế + 2** (thắng gỡ hết lỗ rồi còn đúng 2 USDT). Thắng hoặc hết ví thì reset target 2. Dùng chung mọi khung. Trước mỗi lệnh bot đọc số dư ví Prediction (CeDeFi). **Không đủ tiền** thì **dừng 1 giờ**. Discord khi thắng, khi lỗi, hoặc khi dừng 1h vì hết ví. Lãi lỗ và lịch sử lệnh xem trên dashboard.
 
 ---
 

@@ -146,7 +146,7 @@ class TestDiscordNotify(unittest.TestCase):
             )
             mock_send.assert_not_called()
 
-    def test_predict5m_open_pause_resume(self) -> None:
+    def test_predict5m_discord_win_and_pause_only(self) -> None:
         mock_resp = MagicMock(ok=True, status_code=204, text="")
         with (
             patch.object(notify, "DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/test/token"),
@@ -155,16 +155,6 @@ class TestDiscordNotify(unittest.TestCase):
             notify.notify_predict5m_open(
                 "BNBUSDT", "DOWN", stake=2, step=1, window_start_ms=0, limit_px=0.32
             )
-            notify.notify_predict5m_open(
-                "BNBUSDT",
-                "UP",
-                stake=1,
-                step=0,
-                window_start_ms=0,
-                limit_px=0.32,
-                interval="15m",
-            )
-            notify.notify_predict5m_pause(hours=1, until_ms=0)
             notify.notify_predict5m_resume(stake=1)
             notify.notify_predict5m_result(
                 "BNBUSDT",
@@ -175,13 +165,32 @@ class TestDiscordNotify(unittest.TestCase):
                 pnl=0,
                 reason="unfilled:EXPIRED",
             )
-            self.assertEqual(mock_post.call_count, 5)
+            notify.notify_predict5m_result(
+                "BNBUSDT",
+                "UP",
+                won=False,
+                filled=True,
+                stake=1,
+                pnl=-1,
+                reason="lose",
+            )
+            self.assertEqual(mock_post.call_count, 0)
+            notify.notify_predict5m_pause(hours=1, until_ms=0)
+            notify.notify_predict5m_result(
+                "ETHUSDT",
+                "UP",
+                won=True,
+                filled=True,
+                stake=1,
+                pnl=2.06,
+                reason="win",
+                interval="15m",
+                next_target=2,
+            )
+            self.assertEqual(mock_post.call_count, 2)
             titles = [c.kwargs["json"]["content"] for c in mock_post.call_args_list]
-            self.assertTrue(any("Prediction 5m" in t and "DOWN" in t for t in titles))
-            self.assertTrue(any("Prediction 15m" in t and "UP" in t for t in titles))
             self.assertTrue(any("dừng 1h" in t for t in titles))
-            self.assertTrue(any("không khớp" in t for t in titles))
-            self.assertTrue(any("chạy lại" in t for t in titles))
+            self.assertTrue(any("ETHUSDT UP thắng" in t and "Prediction 15m" in t for t in titles))
 
 
 if __name__ == "__main__":

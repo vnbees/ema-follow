@@ -1133,8 +1133,15 @@ def _smc_payload() -> dict:
 @app.get("/", response_class=HTMLResponse)
 def signal_dashboard(request: Request) -> HTMLResponse:
     from src.fade5m.config import ENABLED as FADE5M_ENABLED
+    from src.predict5m.config import ENABLED as PREDICT5M_ENABLED
     from src.trend4h.config import ENABLED as TREND4H_ENABLED
 
+    if PREDICT5M_ENABLED:
+        return templates.TemplateResponse(
+            request,
+            "predict5m.html",
+            {"exchange_name": EXCHANGE_DISPLAY_NAME},
+        )
     if FADE5M_ENABLED:
         return templates.TemplateResponse(
             request,
@@ -1152,6 +1159,22 @@ def signal_dashboard(request: Request) -> HTMLResponse:
         "signals.html",
         {"exchange_name": EXCHANGE_DISPLAY_NAME},
     )
+
+
+@app.get("/predict", response_class=HTMLResponse)
+def predict_dashboard(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request,
+        "predict5m.html",
+        {"exchange_name": EXCHANGE_DISPLAY_NAME},
+    )
+
+
+@app.get("/api/predict5m")
+def api_predict5m() -> dict:
+    from src.predict5m.runtime import snapshot
+
+    return snapshot()
 
 
 @app.get("/api/fade5m")

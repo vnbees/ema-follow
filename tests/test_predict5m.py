@@ -332,6 +332,59 @@ class TimeframeTests(unittest.TestCase):
                 self.assertEqual(reset.target, TARGET_USDT)
                 self.assertEqual(reset.streak_loss, 0)
 
+    def test_summary_and_recent_bets(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from src.predict5m import store as pstore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "predict.db"
+            with patch("src.database.DATABASE_PATH", path):
+                pstore.ensure_schema()
+                pstore.insert_open(
+                    symbol="BTCUSDT",
+                    side="UP",
+                    stake=1,
+                    bar_ts=1,
+                    entry_ts=2,
+                    market_topic_id=1,
+                    timeframe="5m",
+                    target_usdt=2,
+                )
+                pstore.close_bet(1, won=True, pnl=2.06, reason="win", fill_status="FILLED")
+                pstore.insert_open(
+                    symbol="ETHUSDT",
+                    side="DOWN",
+                    stake=1,
+                    bar_ts=3,
+                    entry_ts=4,
+                    market_topic_id=2,
+                    timeframe="15m",
+                )
+                pstore.close_bet(2, won=False, pnl=-1, reason="lose", fill_status="FILLED")
+                pstore.insert_open(
+                    symbol="BNBUSDT",
+                    side="UP",
+                    stake=1,
+                    bar_ts=5,
+                    entry_ts=6,
+                    market_topic_id=3,
+                    timeframe="5m",
+                )
+                pstore.close_bet(3, won=None, pnl=0, reason="unfilled", fill_status="EXPIRED")
+                stats = pstore.summary()
+                self.assertEqual(stats["wins"], 1)
+                self.assertEqual(stats["losses"], 1)
+                self.assertEqual(stats["unfilled"], 1)
+                self.assertEqual(stats["filled"], 2)
+                self.assertAlmostEqual(stats["pnl"], 1.06)
+                self.assertAlmostEqual(stats["winrate"], 0.5)
+                recent = pstore.recent_bets(10)
+                self.assertEqual(len(recent), 3)
+                self.assertEqual(recent[0]["symbol"], "BNBUSDT")
+
     def test_scan_all_prefers_smaller_timeframe(self):
         from unittest.mock import patch
 

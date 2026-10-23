@@ -957,7 +957,11 @@ def main() -> None:
         from src.config import EXCHANGE
         from src.exchange.binance_ws import start_binance_ws
 
-        if EXCHANGE == "binance" and has_credentials():
+        from src.predict5m.config import ENABLED as PREDICT5M_ENABLED
+
+        if PREDICT5M_ENABLED:
+            logging.info("Predict5m on — skip futures WS")
+        elif EXCHANGE == "binance" and has_credentials():
             _maybe_clear_stale_rate_limit()
             start_binance_ws()
             _wait_binance_ws_ready()
@@ -995,15 +999,16 @@ def main() -> None:
         notify_error("Binance WS start", str(exc))
 
     from src.fade5m.config import ENABLED as FADE5M_ENABLED
+    from src.predict5m.config import ENABLED as PREDICT5M_ENABLED
     from src.trend4h.config import ENABLED as TREND4H_ENABLED
 
     smc_on = os.getenv("SMC_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-    if FADE5M_ENABLED or TREND4H_ENABLED:
+    if FADE5M_ENABLED or TREND4H_ENABLED or PREDICT5M_ENABLED:
         smc_on = False
-    if not smc_on and not TREND4H_ENABLED and not FADE5M_ENABLED:
+    if not smc_on and not TREND4H_ENABLED and not FADE5M_ENABLED and not PREDICT5M_ENABLED:
         start_watcher()
 
-    if not TREND4H_ENABLED and not FADE5M_ENABLED:
+    if not TREND4H_ENABLED and not FADE5M_ENABLED and not PREDICT5M_ENABLED:
         logging.info("%s Donchian Parallel-Trend bot started", EXCHANGE_DISPLAY_NAME)
         logging.info("Dashboard: http://localhost:%d", WEB_PORT)
         logging.info(
@@ -1045,6 +1050,14 @@ def main() -> None:
             SPOT_TRANSFER_DD_PAUSE_PCT * 100,
             SPOT_TRANSFER_EXECUTE_HHMM,
         )
+
+    if PREDICT5M_ENABLED:
+        logging.info("%s Prediction 5m/15m/1h bot started", EXCHANGE_DISPLAY_NAME)
+        logging.info("Dashboard: http://localhost:%d  (sổ Prediction: /predict)", WEB_PORT)
+        from src.predict5m.runtime import run_forever
+
+        run_forever()
+        return
 
     if FADE5M_ENABLED:
         logging.info("%s 5m fade vs 4h color bot started", EXCHANGE_DISPLAY_NAME)
